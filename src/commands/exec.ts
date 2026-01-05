@@ -20,6 +20,12 @@ export function registerExecCommand(program: Command): void {
     .option('--no-inherit', 'Do not inherit current environment variables')
     .argument('[command...]', 'Command to execute')
     .addHelpText('after', `
+Secret Mapping Formats:
+  ENV_VAR=alias:path/to/secret       Entire secret as JSON
+  ENV_VAR=alias:path/to/secret.key   Specific field from secret
+  ENV_VAR=api-key:name               Managed API key (binds and gets current value)
+  ENV_VAR=literal:value              Literal value (no vault fetch)
+
 Examples:
   # Run node with database password
   zn-vault-agent exec -s DB_PASSWORD=alias:db/prod.password -- node server.js
@@ -30,6 +36,11 @@ Examples:
     -s DB_PASSWORD=alias:db/prod.password \\
     -s API_KEY=alias:api/key.value \\
     -- ./start.sh
+
+  # Use a managed API key (auto-rotating)
+  zn-vault-agent exec \\
+    -s ZINC_CONFIG_VAULT_API_KEY=api-key:my-api-key \\
+    -- ./my-app
 
   # Export to env file
   zn-vault-agent exec \\

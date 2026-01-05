@@ -10,7 +10,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
 import { writeFileSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 import { AgentRunner, createTempOutputDir } from '../helpers/agent-runner.js';
-import { VaultTestClient } from '../helpers/vault-client.js';
+import { VaultTestClient, type ManagedApiKey } from '../helpers/vault-client.js';
 import { TEST_ENV, getVaultClient } from '../setup.js';
 
 describe('Exec Mode', () => {
@@ -351,6 +351,197 @@ describe('Exec Mode', () => {
       } finally {
         await vault.deleteSecret(multilineSecret.id);
       }
+    });
+  });
+
+  describe('Managed API Key Injection (api-key: format)', () => {
+    let managedKey: ManagedApiKey | null = null;
+
+    beforeAll(async () => {
+      // Create a managed API key for testing
+      // Only use permissions that the test API key itself has
+      managedKey = await vault.createManagedApiKey({
+        name: `exec-managed-test-${Date.now()}`,
+        tenantId: TEST_ENV.tenantId,
+        rotationMode: 'on-bind',
+        gracePeriod: '5m',
+        permissions: [
+          'secret:read:metadata',
+          'secret:read:value',
+        ],
+      });
+    });
+
+    afterAll(async () => {
+      if (managedKey) {
+        try {
+          await vault.deleteManagedApiKey(managedKey.id);
+        } catch { /* ignore */ }
+      }
+    });
+
+    it('EXEC-MKEY-01: should inject managed API key as environment variable', async () => {
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo "$VAULT_KEY" | head -c 4'],
+        map: [`VAULT_KEY=api-key:${managedKey!.name}`],
+      });
+
+      expect(result.exitCode).toBe(0);
+      // Managed keys have znv_ prefix
+      expect(result.stdout.trim()).toBe('znv_');
+    });
+
+    it('EXEC-MKEY-02: should inject managed API key with full value', async () => {
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo -n "$API_KEY" | wc -c'],
+        map: [`API_KEY=api-key:${managedKey!.name}`],
+      });
+
+      expect(result.exitCode).toBe(0);
+      // API keys are 36+ characters (znv_ prefix + 32 char value)
+      const length = parseInt(result.stdout.trim());
+      expect(length).toBeGreaterThanOrEqual(36);
+    });
+
+    it('EXEC-MKEY-03: should fail for nonexistent managed key', async () => {
+      const result = await agent.exec({
+        command: ['echo', 'test'],
+        map: ['VAR=api-key:nonexistent-managed-key-12345'],
+      });
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr.toLowerCase()).toMatch(/not found|error/);
+    });
+
+    it('EXEC-MKEY-04: should fail for empty api-key name', async () => {
+      const result = await agent.exec({
+        command: ['echo', 'test'],
+        map: ['VAR=api-key:'],
+      });
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr.toLowerCase()).toMatch(/invalid|format|api-key/);
+    });
+  });
+
+  describe('Mixed Format Injection (secrets + api-keys + literals)', () => {
+    let managedKey: ManagedApiKey | null = null;
+
+    beforeAll(async () => {
+      managedKey = await vault.createManagedApiKey({
+        name: `exec-mixed-test-${Date.now()}`,
+        tenantId: TEST_ENV.tenantId,
+        rotationMode: 'on-bind',
+        permissions: [
+          'secret:read:metadata',
+          'secret:read:value',
+        ],
+      });
+    });
+
+    afterAll(async () => {
+      if (managedKey) {
+        try {
+          await vault.deleteManagedApiKey(managedKey.id);
+        } catch { /* ignore */ }
+      }
+    });
+
+    it('EXEC-MIX-01: should inject secrets, API keys, and literals together', async () => {
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo "$DB_HOST|$ENV_NAME|$API_KEY_PREFIX"'],
+        map: [
+          `DB_HOST=alias:${testSecret2!.alias}.host`,
+          'ENV_NAME=literal:production',
+          `API_KEY_PREFIX=api-key:${managedKey!.name}`,
+        ],
+      });
+
+      expect(result.exitCode).toBe(0);
+      const parts = result.stdout.trim().split('|');
+
+      expect(parts[0]).toBe('localhost');       // Secret value
+      expect(parts[1]).toBe('production');      // Literal value
+      expect(parts[2].startsWith('znv_')).toBe(true);  // API key starts with prefix
+    });
+
+    it('EXEC-MIX-02: should write mixed formats to env file', async () => {
+      const envFilePath = resolve(outputDir, 'mixed.env');
+
+      const result = await agent.exec({
+        command: [],
+        map: [
+          `SECRET_VAL=alias:${testSecret1!.alias}.key`,
+          'LITERAL_VAL=literal:my-literal-value',
+          `API_KEY=api-key:${managedKey!.name}`,
+        ],
+        envFile: envFilePath,
+      });
+
+      expect(result.exitCode).toBe(0);
+
+      const content = readFileSync(envFilePath, 'utf-8');
+      expect(content).toContain('SECRET_VAL="sk-test-12345"');
+      expect(content).toContain('LITERAL_VAL="my-literal-value"');
+      expect(content).toMatch(/API_KEY="znv_[^"]+"/);
+    });
+
+    it('EXEC-MIX-03: should handle same managed key referenced multiple times', async () => {
+      // Same managed key bound to different env vars should get same value (cached)
+      const result = await agent.exec({
+        command: ['sh', '-c', 'test "$KEY1" = "$KEY2" && echo "MATCH" || echo "DIFFERENT"'],
+        map: [
+          `KEY1=api-key:${managedKey!.name}`,
+          `KEY2=api-key:${managedKey!.name}`,
+        ],
+      });
+
+      expect(result.exitCode).toBe(0);
+      // Note: on-bind mode may return different keys, but within single exec they should be cached
+      expect(result.stdout.trim()).toBe('MATCH');
+    });
+  });
+
+  describe('Literal Value Injection', () => {
+    it('EXEC-LIT-01: should inject literal value', async () => {
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo "$MY_VAR"'],
+        map: ['MY_VAR=literal:hello-world'],
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('hello-world');
+    });
+
+    it('EXEC-LIT-02: should handle literal with special characters', async () => {
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo "$CONFIG"'],
+        map: ['CONFIG=literal:host=localhost;port=5432;ssl=true'],
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('host=localhost;port=5432;ssl=true');
+    });
+
+    it('EXEC-LIT-03: should handle empty literal value', async () => {
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo "[$EMPTY]"'],
+        map: ['EMPTY=literal:'],
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('[]');
+    });
+
+    it('EXEC-LIT-04: should not fetch from vault for literal values', async () => {
+      // Using a literal that looks like an alias should not try to fetch it
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo "$VAR"'],
+        map: ['VAR=literal:alias:fake/path.key'],
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('alias:fake/path.key');
     });
   });
 });

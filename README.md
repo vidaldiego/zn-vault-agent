@@ -466,17 +466,59 @@ zn-vault-agent exec \
 zn-vault-agent exec \
   -s CONFIG=alias:app/config \
   -- node -e "console.log(JSON.parse(process.env.CONFIG))"
+
+# Use a managed API key (auto-rotating)
+zn-vault-agent exec \
+  -s VAULT_API_KEY=api-key:my-service-key \
+  -- ./my-app
+
+# Mix secrets, managed keys, and literal values
+zn-vault-agent exec \
+  -s DB_PASSWORD=alias:db/prod.password \
+  -s VAULT_KEY=api-key:my-managed-key \
+  -s ENV_NAME=literal:production \
+  -- ./start.sh
 ```
 
-### Mapping Format
+### Mapping Formats
 
+| Format | Description | Example |
+|--------|-------------|---------|
+| `alias:path/to/secret` | Entire secret as JSON | `CONFIG=alias:app/config` |
+| `alias:path/to/secret.key` | Specific field from secret | `DB_PASS=alias:db/creds.password` |
+| `uuid.key` | UUID with specific field | `DB_PASS=abc123.password` |
+| `api-key:name` | Managed API key (binds and gets current value) | `VAULT_KEY=api-key:my-key` |
+| `literal:value` | Literal value (no vault fetch) | `ENV=literal:production` |
+
+#### Managed API Keys (`api-key:`)
+
+Managed API keys are auto-rotating keys created in the vault. When you use `api-key:name`:
+
+1. The agent calls the vault's `/auth/api-keys/managed/:name/bind` endpoint
+2. Returns the current key value based on rotation mode (scheduled, on-use, on-bind)
+3. The key is injected as an environment variable
+
+This is useful for applications that need to authenticate with the vault themselves:
+
+```bash
+# Your app gets a fresh vault API key at startup
+zn-vault-agent exec \
+  -s ZINC_CONFIG_VAULT_API_KEY=api-key:my-app-key \
+  -- ./my-app
 ```
-ENV_VAR=secret-id[.key]
 
-Examples:
-  DB_PASS=alias:db/credentials.password    # Specific key
-  DB_PASS=abc123.password                  # UUID with key
-  CONFIG=alias:app/config                  # Entire secret as JSON
+#### Literal Values (`literal:`)
+
+Literal values are passed through without any vault fetch. Useful for:
+- Static configuration values
+- Feature flags
+- Environment identifiers
+
+```bash
+zn-vault-agent exec \
+  -s DEBUG=literal:true \
+  -s ENV=literal:production \
+  -- ./my-app
 ```
 
 ### Export to File
@@ -485,6 +527,8 @@ Examples:
 # Write secrets to env file (without running a command)
 zn-vault-agent exec \
   -s DB_PASSWORD=alias:db/prod.password \
+  -s VAULT_KEY=api-key:my-key \
+  -s ENV=literal:prod \
   -o /tmp/secrets.env
 ```
 

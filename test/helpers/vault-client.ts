@@ -42,6 +42,28 @@ export interface ApiKey {
   expiresAt: string;
 }
 
+export interface ManagedApiKey {
+  id: string;
+  name: string;
+  prefix: string;
+  tenantId: string;
+  rotationMode: 'scheduled' | 'on-use' | 'on-bind';
+  enabled: boolean;
+}
+
+export interface ManagedApiKeyBindResponse {
+  id: string;
+  key: string;
+  prefix: string;
+  name: string;
+  expiresAt: string;
+  gracePeriod: string;
+  graceExpiresAt?: string;
+  rotationMode: 'scheduled' | 'on-use' | 'on-bind';
+  permissions: string[];
+  nextRotationAt?: string;
+}
+
 export class VaultTestClient {
   private baseUrl: string;
   private accessToken: string | null = null;
@@ -233,6 +255,50 @@ export class VaultTestClient {
    * Delete an API key
    */
   async deleteApiKey(id: string): Promise<void> {
+    await this.request('DELETE', `/auth/api-keys/${id}`);
+  }
+
+  /**
+   * Create a managed API key
+   */
+  async createManagedApiKey(opts: {
+    name: string;
+    permissions?: string[];
+    tenantId?: string;
+    rotationMode?: 'scheduled' | 'on-use' | 'on-bind';
+    rotationInterval?: string;
+    gracePeriod?: string;
+  }): Promise<ManagedApiKey> {
+    const query = opts.tenantId ? `?tenantId=${opts.tenantId}` : '';
+    const response = await this.request<{ apiKey: ManagedApiKey }>('POST', `/auth/api-keys${query}`, {
+      name: opts.name,
+      permissions: opts.permissions || [
+        'secret:read:metadata',
+        'secret:read:value',
+        'apikey:read',
+      ],
+      managed: {
+        rotationMode: opts.rotationMode || 'on-bind',
+        rotationInterval: opts.rotationInterval || '24h',
+        gracePeriod: opts.gracePeriod || '5m',
+      },
+    });
+
+    return response.apiKey;
+  }
+
+  /**
+   * Bind to a managed API key to get its current value
+   */
+  async bindManagedApiKey(name: string, tenantId?: string): Promise<ManagedApiKeyBindResponse> {
+    const query = tenantId ? `?tenantId=${tenantId}` : '';
+    return await this.request('POST', `/auth/api-keys/managed/${encodeURIComponent(name)}/bind${query}`, {});
+  }
+
+  /**
+   * Delete a managed API key (same endpoint as regular keys)
+   */
+  async deleteManagedApiKey(id: string): Promise<void> {
     await this.request('DELETE', `/auth/api-keys/${id}`);
   }
 

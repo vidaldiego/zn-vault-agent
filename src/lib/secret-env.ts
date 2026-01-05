@@ -1,7 +1,7 @@
 // Path: src/lib/secret-env.ts
 // Shared secret fetching and environment variable building for exec mode
 
-import { getSecret } from './api.js';
+import { getSecret, bindManagedApiKey } from './api.js';
 
 /**
  * Parsed secret mapping from CLI or config
@@ -10,6 +10,8 @@ export interface SecretMapping {
   envVar: string;
   secretId: string;
   key?: string;
+  /** For managed API key references (api-key:name format) */
+  apiKeyName?: string;
 }
 
 /**
@@ -29,6 +31,7 @@ export interface ExecSecret {
  *   ENV_VAR=uuid                        -> entire secret as JSON
  *   ENV_VAR=uuid.key                    -> specific key from secret
  *   ENV_VAR=literal:value               -> literal value (no vault fetch)
+ *   ENV_VAR=api-key:name                -> bind to managed API key, get key value
  */
 export function parseSecretMapping(mapping: string): SecretMapping & { literal?: string } {
   const eqIndex = mapping.indexOf('=');
@@ -49,6 +52,19 @@ export function parseSecretMapping(mapping: string): SecretMapping & { literal?:
       envVar,
       secretId: '',
       literal: secretPath.substring(8), // Remove 'literal:' prefix
+    };
+  }
+
+  // Check for api-key: prefix (managed API key binding)
+  if (secretPath.startsWith('api-key:')) {
+    const apiKeyName = secretPath.substring(8); // Remove 'api-key:' prefix
+    if (!apiKeyName) {
+      throw new Error(`Invalid api-key format: ${mapping}. Expected: ENV_VAR=api-key:name`);
+    }
+    return {
+      envVar,
+      secretId: '',
+      apiKeyName,
     };
   }
 
@@ -107,7 +123,7 @@ export function parseSecretMappingFromConfig(config: ExecSecret): SecretMapping 
 
 /**
  * Fetch secrets and build environment variables
- * Handles both vault secrets and literal values
+ * Handles vault secrets, literal values, and managed API keys
  */
 export async function buildSecretEnv(
   mappings: (SecretMapping & { literal?: string })[]
@@ -116,6 +132,8 @@ export async function buildSecretEnv(
 
   // Group by secretId to minimize API calls
   const secretCache = new Map<string, Record<string, unknown>>();
+  // Cache API key bindings by name
+  const apiKeyCache = new Map<string, string>();
 
   for (const mapping of mappings) {
     // Handle literal values (no vault fetch)
@@ -124,6 +142,21 @@ export async function buildSecretEnv(
       continue;
     }
 
+    // Handle managed API key references
+    if (mapping.apiKeyName) {
+      let keyValue = apiKeyCache.get(mapping.apiKeyName);
+
+      if (!keyValue) {
+        const bindResponse = await bindManagedApiKey(mapping.apiKeyName);
+        keyValue = bindResponse.key;
+        apiKeyCache.set(mapping.apiKeyName, keyValue);
+      }
+
+      env[mapping.envVar] = keyValue;
+      continue;
+    }
+
+    // Handle vault secrets
     let data = secretCache.get(mapping.secretId);
 
     if (!data) {
@@ -150,14 +183,28 @@ export async function buildSecretEnv(
 
 /**
  * Extract unique secret IDs from mappings (for WebSocket subscription)
- * Excludes literal values since they don't need vault subscription
+ * Excludes literal values and API key references since they don't need vault subscription
  */
 export function extractSecretIds(mappings: (SecretMapping & { literal?: string })[]): string[] {
   const ids = new Set<string>();
   for (const mapping of mappings) {
-    if (mapping.secretId && !mapping.literal) {
+    // Skip literals and API key references
+    if (mapping.secretId && !mapping.literal && !mapping.apiKeyName) {
       ids.add(mapping.secretId);
     }
   }
   return Array.from(ids);
+}
+
+/**
+ * Extract unique API key names from mappings (for potential future renewal tracking)
+ */
+export function extractApiKeyNames(mappings: (SecretMapping & { literal?: string })[]): string[] {
+  const names = new Set<string>();
+  for (const mapping of mappings) {
+    if (mapping.apiKeyName) {
+      names.add(mapping.apiKeyName);
+    }
+  }
+  return Array.from(names);
 }

@@ -1,57 +1,25 @@
 // Path: src/commands/exec.test.ts
 // Unit tests for exec mode functionality
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  parseSecretMapping,
+  buildSecretEnv,
+  extractSecretIds,
+  extractApiKeyNames,
+  type SecretMapping,
+} from '../lib/secret-env.js';
 
-// Test the secret mapping parser logic
-// Recreate the parsing function for testing (since it's internal to the command)
+// Mock the api module
+vi.mock('../lib/api.js', () => ({
+  getSecret: vi.fn(),
+  bindManagedApiKey: vi.fn(),
+}));
 
-interface SecretMapping {
-  envVar: string;
-  secretId: string;
-  key?: string;
-}
+import { getSecret, bindManagedApiKey } from '../lib/api.js';
 
-function parseSecretMapping(mapping: string): SecretMapping {
-  const eqIndex = mapping.indexOf('=');
-  if (eqIndex === -1) {
-    throw new Error(`Invalid mapping format: ${mapping}. Expected: ENV_VAR=secret-id[.key]`);
-  }
-
-  const envVar = mapping.substring(0, eqIndex);
-  let secretPath = mapping.substring(eqIndex + 1);
-
-  if (!envVar || !secretPath) {
-    throw new Error(`Invalid mapping format: ${mapping}. Expected: ENV_VAR=secret-id[.key]`);
-  }
-
-  let key: string | undefined;
-
-  if (secretPath.startsWith('alias:')) {
-    // Handle alias:path/to/secret.key
-    const lastDotIndex = secretPath.lastIndexOf('.');
-    if (lastDotIndex > secretPath.indexOf(':') + 1) {
-      const potentialKey = secretPath.substring(lastDotIndex + 1);
-      if (potentialKey && !potentialKey.includes('/')) {
-        key = potentialKey;
-        secretPath = secretPath.substring(0, lastDotIndex);
-      }
-    }
-  } else {
-    // Handle uuid.key or uuid
-    const dotIndex = secretPath.indexOf('.');
-    if (dotIndex !== -1) {
-      key = secretPath.substring(dotIndex + 1);
-      secretPath = secretPath.substring(0, dotIndex);
-    }
-  }
-
-  return {
-    envVar,
-    secretId: secretPath,
-    key,
-  };
-}
+const mockGetSecret = vi.mocked(getSecret);
+const mockBindManagedApiKey = vi.mocked(bindManagedApiKey);
 
 describe('parseSecretMapping', () => {
   describe('basic parsing', () => {
@@ -60,6 +28,8 @@ describe('parseSecretMapping', () => {
       expect(result.envVar).toBe('DB_HOST');
       expect(result.secretId).toBe('abc123');
       expect(result.key).toBeUndefined();
+      expect(result.apiKeyName).toBeUndefined();
+      expect(result.literal).toBeUndefined();
     });
 
     it('should parse UUID with key', () => {
@@ -88,6 +58,62 @@ describe('parseSecretMapping', () => {
       expect(result.envVar).toBe('PASSWORD');
       expect(result.secretId).toBe('alias:db/prod/main');
       expect(result.key).toBe('password');
+    });
+  });
+
+  describe('api-key format parsing', () => {
+    it('should parse api-key:name format', () => {
+      const result = parseSecretMapping('VAULT_API_KEY=api-key:my-managed-key');
+      expect(result.envVar).toBe('VAULT_API_KEY');
+      expect(result.secretId).toBe('');
+      expect(result.apiKeyName).toBe('my-managed-key');
+      expect(result.key).toBeUndefined();
+      expect(result.literal).toBeUndefined();
+    });
+
+    it('should parse api-key with hyphenated name', () => {
+      const result = parseSecretMapping('API_KEY=api-key:prod-service-key');
+      expect(result.envVar).toBe('API_KEY');
+      expect(result.apiKeyName).toBe('prod-service-key');
+    });
+
+    it('should parse api-key with underscored name', () => {
+      const result = parseSecretMapping('MY_KEY=api-key:my_service_key');
+      expect(result.envVar).toBe('MY_KEY');
+      expect(result.apiKeyName).toBe('my_service_key');
+    });
+
+    it('should parse api-key with numeric suffix', () => {
+      const result = parseSecretMapping('KEY=api-key:service-key-v2');
+      expect(result.envVar).toBe('KEY');
+      expect(result.apiKeyName).toBe('service-key-v2');
+    });
+
+    it('should throw for empty api-key name', () => {
+      expect(() => parseSecretMapping('VAR=api-key:')).toThrow('Invalid api-key format');
+      expect(() => parseSecretMapping('VAR=api-key:')).toThrow('Expected: ENV_VAR=api-key:name');
+    });
+  });
+
+  describe('literal format parsing', () => {
+    it('should parse literal:value format', () => {
+      const result = parseSecretMapping('MY_VAR=literal:some-value');
+      expect(result.envVar).toBe('MY_VAR');
+      expect(result.secretId).toBe('');
+      expect(result.literal).toBe('some-value');
+      expect(result.apiKeyName).toBeUndefined();
+    });
+
+    it('should parse literal with special characters', () => {
+      const result = parseSecretMapping('CONFIG=literal:host=localhost;port=5432');
+      expect(result.envVar).toBe('CONFIG');
+      expect(result.literal).toBe('host=localhost;port=5432');
+    });
+
+    it('should handle empty literal value', () => {
+      const result = parseSecretMapping('EMPTY=literal:');
+      expect(result.envVar).toBe('EMPTY');
+      expect(result.literal).toBe('');
     });
   });
 
@@ -127,110 +153,288 @@ describe('parseSecretMapping', () => {
   });
 });
 
-describe('Environment Building', () => {
-  // Simulate building environment from secrets
-  async function buildSecretEnv(
-    mappings: SecretMapping[],
-    secretFetcher: (id: string) => Promise<{ data: Record<string, unknown> }>
-  ): Promise<Record<string, string>> {
-    const env: Record<string, string> = {};
-    const secretCache = new Map<string, Record<string, unknown>>();
-
-    for (const mapping of mappings) {
-      let data = secretCache.get(mapping.secretId);
-
-      if (!data) {
-        const secret = await secretFetcher(mapping.secretId);
-        data = secret.data;
-        secretCache.set(mapping.secretId, data);
-      }
-
-      if (mapping.key) {
-        const value = data[mapping.key];
-        if (value === undefined) {
-          throw new Error(`Key "${mapping.key}" not found in secret "${mapping.secretId}"`);
-        }
-        env[mapping.envVar] = typeof value === 'string' ? value : JSON.stringify(value);
-      } else {
-        env[mapping.envVar] = JSON.stringify(data);
-      }
-    }
-
-    return env;
-  }
-
-  it('should build environment from single secret', async () => {
-    const fetcher = vi.fn().mockResolvedValue({
-      data: { host: 'localhost', port: 5432 },
-    });
-
-    const mappings: SecretMapping[] = [
-      { envVar: 'DB_HOST', secretId: 'db-secret', key: 'host' },
+describe('extractSecretIds', () => {
+  it('should extract secret IDs excluding literals and api-keys', () => {
+    const mappings = [
+      { envVar: 'A', secretId: 'secret-1' },
+      { envVar: 'B', secretId: '', literal: 'value' },
+      { envVar: 'C', secretId: '', apiKeyName: 'my-key' },
+      { envVar: 'D', secretId: 'alias:path/secret' },
     ];
-
-    const env = await buildSecretEnv(mappings, fetcher);
-    expect(env.DB_HOST).toBe('localhost');
-    expect(fetcher).toHaveBeenCalledTimes(1);
+    const ids = extractSecretIds(mappings);
+    expect(ids).toEqual(['secret-1', 'alias:path/secret']);
   });
 
-  it('should build environment from multiple keys of same secret', async () => {
-    const fetcher = vi.fn().mockResolvedValue({
-      data: { host: 'localhost', port: 5432, password: 'secret' },
-    });
-
-    const mappings: SecretMapping[] = [
-      { envVar: 'DB_HOST', secretId: 'db-secret', key: 'host' },
-      { envVar: 'DB_PORT', secretId: 'db-secret', key: 'port' },
-      { envVar: 'DB_PASS', secretId: 'db-secret', key: 'password' },
+  it('should deduplicate secret IDs', () => {
+    const mappings = [
+      { envVar: 'A', secretId: 'secret-1', key: 'host' },
+      { envVar: 'B', secretId: 'secret-1', key: 'port' },
     ];
+    const ids = extractSecretIds(mappings);
+    expect(ids).toEqual(['secret-1']);
+  });
+});
 
-    const env = await buildSecretEnv(mappings, fetcher);
-    expect(env.DB_HOST).toBe('localhost');
-    expect(env.DB_PORT).toBe('5432'); // Number converted to string
-    expect(env.DB_PASS).toBe('secret');
-    // Should only fetch once due to caching
-    expect(fetcher).toHaveBeenCalledTimes(1);
+describe('extractApiKeyNames', () => {
+  it('should extract API key names', () => {
+    const mappings = [
+      { envVar: 'A', secretId: 'secret-1' },
+      { envVar: 'B', secretId: '', apiKeyName: 'key-1' },
+      { envVar: 'C', secretId: '', apiKeyName: 'key-2' },
+    ];
+    const names = extractApiKeyNames(mappings);
+    expect(names).toEqual(['key-1', 'key-2']);
   });
 
-  it('should return entire secret as JSON when no key specified', async () => {
-    const fetcher = vi.fn().mockResolvedValue({
-      data: { host: 'localhost', port: 5432 },
-    });
-
-    const mappings: SecretMapping[] = [
-      { envVar: 'CONFIG', secretId: 'config-secret' },
+  it('should deduplicate API key names', () => {
+    const mappings = [
+      { envVar: 'A', secretId: '', apiKeyName: 'shared-key' },
+      { envVar: 'B', secretId: '', apiKeyName: 'shared-key' },
     ];
-
-    const env = await buildSecretEnv(mappings, fetcher);
-    expect(env.CONFIG).toBe('{"host":"localhost","port":5432}');
+    const names = extractApiKeyNames(mappings);
+    expect(names).toEqual(['shared-key']);
   });
 
-  it('should throw for missing key', async () => {
-    const fetcher = vi.fn().mockResolvedValue({
-      data: { host: 'localhost' },
-    });
-
-    const mappings: SecretMapping[] = [
-      { envVar: 'DB_PORT', secretId: 'db-secret', key: 'port' },
+  it('should return empty array when no API keys', () => {
+    const mappings = [
+      { envVar: 'A', secretId: 'secret-1' },
+      { envVar: 'B', secretId: '', literal: 'value' },
     ];
+    const names = extractApiKeyNames(mappings);
+    expect(names).toEqual([]);
+  });
+});
 
-    await expect(buildSecretEnv(mappings, fetcher)).rejects.toThrow('Key "port" not found');
+describe('buildSecretEnv', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
   });
 
-  it('should fetch multiple secrets when IDs differ', async () => {
-    const fetcher = vi.fn()
-      .mockResolvedValueOnce({ data: { host: 'localhost' } })
-      .mockResolvedValueOnce({ data: { key: 'api-key-value' } });
+  describe('vault secrets', () => {
+    it('should build environment from single secret', async () => {
+      mockGetSecret.mockResolvedValue({
+        id: 'test-id',
+        alias: 'test',
+        type: 'generic',
+        version: 1,
+        data: { host: 'localhost', port: 5432 },
+      });
 
-    const mappings: SecretMapping[] = [
-      { envVar: 'DB_HOST', secretId: 'db-secret', key: 'host' },
-      { envVar: 'API_KEY', secretId: 'api-secret', key: 'key' },
-    ];
+      const mappings = [
+        { envVar: 'DB_HOST', secretId: 'db-secret', key: 'host' },
+      ];
 
-    const env = await buildSecretEnv(mappings, fetcher);
-    expect(env.DB_HOST).toBe('localhost');
-    expect(env.API_KEY).toBe('api-key-value');
-    expect(fetcher).toHaveBeenCalledTimes(2);
+      const env = await buildSecretEnv(mappings);
+      expect(env.DB_HOST).toBe('localhost');
+      expect(mockGetSecret).toHaveBeenCalledTimes(1);
+      expect(mockGetSecret).toHaveBeenCalledWith('db-secret');
+    });
+
+    it('should cache and reuse secrets', async () => {
+      mockGetSecret.mockResolvedValue({
+        id: 'test-id',
+        alias: 'test',
+        type: 'generic',
+        version: 1,
+        data: { host: 'localhost', port: 5432, password: 'secret' },
+      });
+
+      const mappings = [
+        { envVar: 'DB_HOST', secretId: 'db-secret', key: 'host' },
+        { envVar: 'DB_PORT', secretId: 'db-secret', key: 'port' },
+        { envVar: 'DB_PASS', secretId: 'db-secret', key: 'password' },
+      ];
+
+      const env = await buildSecretEnv(mappings);
+      expect(env.DB_HOST).toBe('localhost');
+      expect(env.DB_PORT).toBe('5432');
+      expect(env.DB_PASS).toBe('secret');
+      // Should only fetch once due to caching
+      expect(mockGetSecret).toHaveBeenCalledTimes(1);
+    });
+
+    it('should return entire secret as JSON when no key specified', async () => {
+      mockGetSecret.mockResolvedValue({
+        id: 'test-id',
+        alias: 'config',
+        type: 'generic',
+        version: 1,
+        data: { host: 'localhost', port: 5432 },
+      });
+
+      const mappings = [{ envVar: 'CONFIG', secretId: 'config-secret' }];
+
+      const env = await buildSecretEnv(mappings);
+      expect(env.CONFIG).toBe('{"host":"localhost","port":5432}');
+    });
+
+    it('should throw for missing key', async () => {
+      mockGetSecret.mockResolvedValue({
+        id: 'test-id',
+        alias: 'db',
+        type: 'generic',
+        version: 1,
+        data: { host: 'localhost' },
+      });
+
+      const mappings = [{ envVar: 'DB_PORT', secretId: 'db-secret', key: 'port' }];
+
+      await expect(buildSecretEnv(mappings)).rejects.toThrow('Key "port" not found');
+    });
+  });
+
+  describe('literal values', () => {
+    it('should use literal value directly', async () => {
+      const mappings = [
+        { envVar: 'MY_VALUE', secretId: '', literal: 'hardcoded-value' },
+      ];
+
+      const env = await buildSecretEnv(mappings);
+      expect(env.MY_VALUE).toBe('hardcoded-value');
+      expect(mockGetSecret).not.toHaveBeenCalled();
+      expect(mockBindManagedApiKey).not.toHaveBeenCalled();
+    });
+
+    it('should handle empty literal value', async () => {
+      const mappings = [{ envVar: 'EMPTY', secretId: '', literal: '' }];
+
+      const env = await buildSecretEnv(mappings);
+      expect(env.EMPTY).toBe('');
+    });
+  });
+
+  describe('managed API keys', () => {
+    it('should bind and get API key value', async () => {
+      mockBindManagedApiKey.mockResolvedValue({
+        id: 'key-id-123',
+        key: 'znv_abc123xyz789',
+        prefix: 'znv_abc',
+        name: 'my-managed-key',
+        expiresAt: '2024-12-31T23:59:59Z',
+        gracePeriod: 'PT1H',
+        rotationMode: 'scheduled',
+        permissions: ['secrets:read', 'secrets:list'],
+      });
+
+      const mappings = [
+        { envVar: 'VAULT_API_KEY', secretId: '', apiKeyName: 'my-managed-key' },
+      ];
+
+      const env = await buildSecretEnv(mappings);
+      expect(env.VAULT_API_KEY).toBe('znv_abc123xyz789');
+      expect(mockBindManagedApiKey).toHaveBeenCalledTimes(1);
+      expect(mockBindManagedApiKey).toHaveBeenCalledWith('my-managed-key');
+      expect(mockGetSecret).not.toHaveBeenCalled();
+    });
+
+    it('should cache API key bindings', async () => {
+      mockBindManagedApiKey.mockResolvedValue({
+        id: 'key-id-123',
+        key: 'znv_abc123xyz789',
+        prefix: 'znv_abc',
+        name: 'shared-key',
+        expiresAt: '2024-12-31T23:59:59Z',
+        gracePeriod: 'PT1H',
+        rotationMode: 'on-bind',
+        permissions: ['secrets:read'],
+      });
+
+      const mappings = [
+        { envVar: 'KEY_1', secretId: '', apiKeyName: 'shared-key' },
+        { envVar: 'KEY_2', secretId: '', apiKeyName: 'shared-key' },
+      ];
+
+      const env = await buildSecretEnv(mappings);
+      expect(env.KEY_1).toBe('znv_abc123xyz789');
+      expect(env.KEY_2).toBe('znv_abc123xyz789');
+      // Should only call bind once due to caching
+      expect(mockBindManagedApiKey).toHaveBeenCalledTimes(1);
+    });
+
+    it('should handle API key bind error', async () => {
+      mockBindManagedApiKey.mockRejectedValue(new Error('Key not found'));
+
+      const mappings = [
+        { envVar: 'API_KEY', secretId: '', apiKeyName: 'nonexistent-key' },
+      ];
+
+      await expect(buildSecretEnv(mappings)).rejects.toThrow('Key not found');
+    });
+  });
+
+  describe('mixed formats', () => {
+    it('should handle secrets, literals, and API keys together', async () => {
+      mockGetSecret.mockResolvedValue({
+        id: 'secret-id',
+        alias: 'db/creds',
+        type: 'generic',
+        version: 1,
+        data: { password: 'db-password-123' },
+      });
+
+      mockBindManagedApiKey.mockResolvedValue({
+        id: 'key-id',
+        key: 'znv_managed_key_value',
+        prefix: 'znv_man',
+        name: 'vault-key',
+        expiresAt: '2024-12-31T23:59:59Z',
+        gracePeriod: 'PT30M',
+        rotationMode: 'scheduled',
+        permissions: ['secrets:read'],
+      });
+
+      const mappings = [
+        { envVar: 'DB_PASSWORD', secretId: 'alias:db/creds', key: 'password' },
+        { envVar: 'ENV_NAME', secretId: '', literal: 'production' },
+        { envVar: 'VAULT_KEY', secretId: '', apiKeyName: 'vault-key' },
+      ];
+
+      const env = await buildSecretEnv(mappings);
+
+      expect(env.DB_PASSWORD).toBe('db-password-123');
+      expect(env.ENV_NAME).toBe('production');
+      expect(env.VAULT_KEY).toBe('znv_managed_key_value');
+
+      expect(mockGetSecret).toHaveBeenCalledTimes(1);
+      expect(mockBindManagedApiKey).toHaveBeenCalledTimes(1);
+    });
+
+    it('should handle multiple different API keys', async () => {
+      mockBindManagedApiKey
+        .mockResolvedValueOnce({
+          id: 'key-1',
+          key: 'znv_first_key',
+          prefix: 'znv_fir',
+          name: 'first-key',
+          expiresAt: '2024-12-31T23:59:59Z',
+          gracePeriod: 'PT1H',
+          rotationMode: 'scheduled',
+          permissions: ['secrets:read'],
+        })
+        .mockResolvedValueOnce({
+          id: 'key-2',
+          key: 'znv_second_key',
+          prefix: 'znv_sec',
+          name: 'second-key',
+          expiresAt: '2024-12-31T23:59:59Z',
+          gracePeriod: 'PT1H',
+          rotationMode: 'on-use',
+          permissions: ['kms:encrypt'],
+        });
+
+      const mappings = [
+        { envVar: 'KEY_A', secretId: '', apiKeyName: 'first-key' },
+        { envVar: 'KEY_B', secretId: '', apiKeyName: 'second-key' },
+      ];
+
+      const env = await buildSecretEnv(mappings);
+
+      expect(env.KEY_A).toBe('znv_first_key');
+      expect(env.KEY_B).toBe('znv_second_key');
+      expect(mockBindManagedApiKey).toHaveBeenCalledTimes(2);
+      expect(mockBindManagedApiKey).toHaveBeenNthCalledWith(1, 'first-key');
+      expect(mockBindManagedApiKey).toHaveBeenNthCalledWith(2, 'second-key');
+    });
   });
 });
 

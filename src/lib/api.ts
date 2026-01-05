@@ -79,6 +79,20 @@ export interface DecryptedSecret {
   data: Record<string, unknown>;
 }
 
+export interface ManagedApiKeyBindResponse {
+  id: string;
+  key: string;
+  prefix: string;
+  name: string;
+  expiresAt: string;
+  gracePeriod: string;
+  graceExpiresAt?: string;
+  rotationMode: 'scheduled' | 'on-use' | 'on-bind';
+  permissions: string[];
+  nextRotationAt?: string;
+  _notice?: string;
+}
+
 // Token cache
 let cachedToken: string | null = null;
 let tokenExpiry: number = 0;
@@ -455,4 +469,19 @@ export function clearToken(): void {
  */
 export function hasValidToken(): boolean {
   return cachedToken !== null && Date.now() < tokenExpiry;
+}
+
+/**
+ * Bind to a managed API key and get the current key value
+ * @param name - Managed API key name (e.g., "my-api-key")
+ * @returns The current API key value
+ */
+export async function bindManagedApiKey(name: string): Promise<ManagedApiKeyBindResponse> {
+  log.debug({ name }, 'Binding to managed API key');
+
+  return await request({
+    method: 'POST',
+    path: `/auth/api-keys/managed/${encodeURIComponent(name)}/bind`,
+    body: {},
+  });
 }

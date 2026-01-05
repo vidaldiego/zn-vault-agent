@@ -22,6 +22,7 @@ export default defineConfig({
     poolOptions: {
       forks: {
         singleFork: false, // Enable parallel test files
+        minForks: 1,
         maxForks: 4, // Limit concurrent files to avoid overwhelming the vault
       },
     },
