@@ -48,6 +48,14 @@
   ],
   "author": "ZincApp",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vidaldiego/zn-vault-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vidaldiego/zn-vault-agent/issues"
+  },
+  "homepage": "https://github.com/vidaldiego/zn-vault-agent#readme",
   "dependencies": {
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
