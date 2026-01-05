@@ -1,0 +1,75 @@
+[Unit]
+Description=ZN-Vault Certificate Agent
+Documentation=https://github.com/zincapp/zn-vault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zn-vault-agent
+Group=zn-vault-agent
+
+# Working directory
+WorkingDirectory=/var/lib/zn-vault-agent
+
+# Main executable
+ExecStart=/usr/local/bin/zn-vault-agent start --health-port 9100
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=5
+
+# Environment
+EnvironmentFile=/etc/zn-vault-agent/agent.env
+EnvironmentFile=-/etc/zn-vault-agent/secrets.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zn-vault-agent
+
+# Shutdown
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# Allow writing certificates and logs
+ReadWritePaths=/etc/ssl/znvault
+ReadWritePaths=/var/lib/zn-vault-agent
+ReadWritePaths=/var/log/zn-vault-agent
+
+# Network access
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# System call filter
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallArchitectures=native
+
+# Capabilities
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Resource limits
+MemoryHigh=256M
+MemoryMax=512M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+/var/log/zn-vault-agent/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 zn-vault-agent zn-vault-agent
+    sharedscripts
+    postrotate
+        # Signal the agent to reopen log files
+        systemctl kill -s USR1 zn-vault-agent.service 2>/dev/null || true
+    endscript
+}

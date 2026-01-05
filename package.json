@@ -1,0 +1,74 @@
+{
+  "name": "@zincapp/zn-vault-agent",
+  "version": "1.3.0",
+  "description": "ZN-Vault Certificate Agent - Real-time certificate distribution",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "zn-vault-agent": "./dist/index.js"
+  },
+  "files": [
+    "dist/",
+    "!dist/**/*.test.js",
+    "!dist/**/*.test.js.map",
+    "!dist/**/*.test.d.ts",
+    "!dist/**/*.test.d.ts.map",
+    "!dist/*.cjs",
+    "!dist/*.cjs.map",
+    "deploy/systemd/zn-vault-agent.service",
+    "deploy/logrotate.d/"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:bundle": "node scripts/bundle.mjs",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "start:bundle": "node dist/zn-vault-agent.cjs",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
+    "test": "../scripts/sdk-test-run.sh npm run test:all",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:unit": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration:watch": "vitest --config vitest.integration.config.ts",
+    "test:all": "npm run test:unit && npm run test:integration"
+  },
+  "keywords": [
+    "znvault",
+    "certificates",
+    "ssl",
+    "tls",
+    "agent"
+  ],
+  "author": "ZincApp",
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "conf": "^13.0.1",
+    "inquirer": "^9.3.7",
+    "ora": "^8.1.1",
+    "pino": "^9.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/inquirer": "^9.0.7",
+    "@types/node": "^20.17.10",
+    "@types/ws": "^8.5.13",
+    "@vitest/coverage-v8": "^2.0.0",
+    "esbuild": "^0.24.0",
+    "pino-pretty": "^11.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

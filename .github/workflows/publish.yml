@@ -1,0 +1,68 @@
+# Publish to npm when a version tag is pushed
+# Uses OIDC trusted publishing - no NPM_TOKEN needed!
+#
+# One-time setup on npmjs.com (after first manual publish):
+#   1. Go to package settings → Trusted publisher → GitHub Actions
+#   2. Configure: org=zincapp, repo=zn-vault-agent, workflow=publish.yml
+#   3. Click "Set up connection"
+#
+# Usage: git tag v1.3.0 && git push origin v1.3.0
+
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write  # Required for OIDC authentication
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'  # Node 24+ includes npm with OIDC support
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm run test:unit
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify version matches tag
+        run: |
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Error: Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
+            exit 1
+          fi
+          echo "Version: $PKG_VERSION"
+
+      - name: Publish to npm (OIDC)
+        run: npm publish --provenance --access public
+        # No NODE_AUTH_TOKEN needed - uses OIDC trusted publishing
+
+      - name: Tag beta/next if pre-release
+        if: contains(github.ref, '-beta') || contains(github.ref, '-alpha') || contains(github.ref, '-rc')
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          if [[ "$VERSION" == *"-beta"* ]]; then
+            npm dist-tag add @zincapp/zn-vault-agent@$VERSION beta
+          elif [[ "$VERSION" == *"-alpha"* ]] || [[ "$VERSION" == *"-rc"* ]]; then
+            npm dist-tag add @zincapp/zn-vault-agent@$VERSION next
+          fi
