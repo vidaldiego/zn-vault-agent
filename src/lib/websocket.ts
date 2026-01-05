@@ -2,7 +2,7 @@
 // WebSocket client for real-time certificate and secret updates (unified mode)
 
 import WebSocket from 'ws';
-import { loadConfig } from './config.js';
+import { loadConfig, type ExecConfig } from './config.js';
 import { deployCertificate, deployAllCertificates } from './deployer.js';
 import { deploySecret, deployAllSecrets, findSecretTarget } from './secret-deployer.js';
 import { wsLogger as log } from './logger.js';
@@ -14,9 +14,12 @@ import {
   stopHealthServer,
   updateCertStatus,
   updateSecretStatus,
+  setChildProcessManager,
 } from './health.js';
 import { flushLogs, setupLogRotation } from './logger.js';
 import { startApiKeyRenewal, stopApiKeyRenewal } from '../services/api-key-renewal.js';
+import { ChildProcessManager } from '../services/child-process-manager.js';
+import { extractSecretIds, parseSecretMappingFromConfig } from './secret-env.js';
 
 export interface CertificateEvent {
   event: 'certificate.rotated' | 'certificate.created' | 'certificate.deleted';
@@ -83,8 +86,10 @@ export interface UnifiedWebSocketClient {
  * - certificates: certificate rotation events
  * - secrets: secret update events
  * - updates: agent update availability events
+ *
+ * @param additionalSecretIds - Additional secret IDs to subscribe to (e.g., exec secrets)
  */
-export function createUnifiedWebSocketClient(): UnifiedWebSocketClient {
+export function createUnifiedWebSocketClient(additionalSecretIds: string[] = []): UnifiedWebSocketClient {
   let ws: WebSocket | null = null;
   let reconnectAttempts = 0;
   let reconnectTimer: NodeJS.Timeout | null = null;
@@ -117,13 +122,16 @@ export function createUnifiedWebSocketClient(): UnifiedWebSocketClient {
     // Build initial subscription query params
     const certIds = config.targets.map(t => t.certId);
     const secretTargets = config.secretTargets || [];
-    const secretIds = secretTargets.map(t => t.secretId);
+    const secretTargetIds = secretTargets.map(t => t.secretId);
+
+    // Combine secret target IDs with additional exec secret IDs
+    const allSecretIds = [...new Set([...secretTargetIds, ...additionalSecretIds])];
 
     if (certIds.length > 0) {
       url.searchParams.set('certIds', certIds.join(','));
     }
-    if (secretIds.length > 0) {
-      url.searchParams.set('secretIds', secretIds.join(','));
+    if (allSecretIds.length > 0) {
+      url.searchParams.set('secretIds', allSecretIds.join(','));
     }
     // Subscribe to stable update channel by default
     url.searchParams.set('updateChannel', 'stable');
@@ -197,16 +205,16 @@ export function createUnifiedWebSocketClient(): UnifiedWebSocketClient {
           const event = message.data as CertificateEvent;
           log.info({ event: event.event, certId: event.certificateId }, 'Received certificate event');
           setWebSocketStatus(true, new Date());
-          certEventHandlers.forEach(h => h(event));
+          certEventHandlers.forEach(h => { h(event); });
         } else if (message.topic === 'secrets' && message.data) {
           const event = message.data as SecretEvent;
           log.info({ event: event.event, secretId: event.secretId }, 'Received secret event');
           setSecretWebSocketStatus(true, new Date());
-          secretEventHandlers.forEach(h => h(event));
+          secretEventHandlers.forEach(h => { h(event); });
         } else if (message.topic === 'updates' && message.data) {
           const event = message.data as AgentUpdateEvent;
           log.info({ version: event.version, channel: event.channel }, 'Received update event');
-          updateEventHandlers.forEach(h => h(event));
+          updateEventHandlers.forEach(h => { h(event); });
         }
         break;
 
@@ -227,7 +235,7 @@ export function createUnifiedWebSocketClient(): UnifiedWebSocketClient {
     if (!config.vaultUrl) {
       const err = new Error('Vault URL not configured');
       log.error({ ws: 'unified' }, 'Cannot connect');
-      errorHandlers.forEach(h => h(err));
+      errorHandlers.forEach(h => { h(err); });
       return;
     }
 
@@ -261,7 +269,7 @@ export function createUnifiedWebSocketClient(): UnifiedWebSocketClient {
 
           // Fire connect handlers when we get registered
           if (message.type === 'registered' && registeredAgentId) {
-            connectHandlers.forEach(h => h(registeredAgentId!));
+            connectHandlers.forEach(h => { h(registeredAgentId!); });
           }
         } catch (err) {
           log.warn({ ws: 'unified', err, data: data.toString().substring(0, 100) }, 'Failed to parse message');
@@ -276,18 +284,18 @@ export function createUnifiedWebSocketClient(): UnifiedWebSocketClient {
         registeredAgentId = null;
         const reasonStr = reason?.toString() || `Code: ${code}`;
         log.warn({ ws: 'unified', code, reason: reasonStr }, 'WebSocket disconnected');
-        disconnectHandlers.forEach(h => h(reasonStr));
+        disconnectHandlers.forEach(h => { h(reasonStr); });
         scheduleReconnect();
       });
 
       ws.on('error', (err) => {
         log.error({ ws: 'unified', err }, 'WebSocket error');
-        errorHandlers.forEach(h => h(err));
+        errorHandlers.forEach(h => { h(err); });
       });
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       log.error({ ws: 'unified', err: error }, 'Failed to create WebSocket');
-      errorHandlers.forEach(h => h(error));
+      errorHandlers.forEach(h => { h(error); });
       scheduleReconnect();
     }
   }
@@ -356,6 +364,7 @@ export function createUnifiedWebSocketClient(): UnifiedWebSocketClient {
 export async function startDaemon(options: {
   verbose?: boolean;
   healthPort?: number;
+  exec?: ExecConfig;
 } = {}): Promise<void> {
   const config = loadConfig();
   const secretTargets = config.secretTargets || [];
@@ -366,11 +375,49 @@ export async function startDaemon(options: {
   // Setup log rotation handler
   setupLogRotation();
 
+  // Extract exec secret IDs for WebSocket subscription
+  let execSecretIds: string[] = [];
+  if (options.exec) {
+    const mappings = options.exec.secrets.map(parseSecretMappingFromConfig);
+    execSecretIds = extractSecretIds(mappings);
+  }
+
   log.info({
     vault: config.vaultUrl,
     certTargets: config.targets.length,
     secretTargets: secretTargets.length,
+    execSecrets: execSecretIds.length,
+    execCommand: options.exec?.command.join(' '),
   }, 'Starting ZN-Vault Agent');
+
+  // Initialize child process manager if exec config provided
+  let childManager: ChildProcessManager | null = null;
+  if (options.exec) {
+    childManager = new ChildProcessManager(options.exec);
+
+    // Register with health module for status reporting
+    setChildProcessManager(childManager);
+
+    childManager.on('started', (pid) => {
+      log.info({ pid }, 'Child process started');
+    });
+
+    childManager.on('stopped', (code, signal) => {
+      log.info({ code, signal }, 'Child process stopped');
+    });
+
+    childManager.on('restarting', (reason) => {
+      log.info({ reason }, 'Restarting child process');
+    });
+
+    childManager.on('maxRestartsExceeded', () => {
+      log.error('Child process max restarts exceeded, entering degraded state');
+    });
+
+    childManager.on('error', (err) => {
+      log.error({ err }, 'Child process error');
+    });
+  }
 
   // Start health server if port specified
   if (options.healthPort) {
@@ -384,8 +431,8 @@ export async function startDaemon(options: {
   // Update tracked metrics
   metrics.setCertsTracked(config.targets.length);
 
-  // Create unified WebSocket client
-  const unifiedClient = createUnifiedWebSocketClient();
+  // Create unified WebSocket client with exec secret IDs
+  const unifiedClient = createUnifiedWebSocketClient(execSecretIds);
 
   // Handle certificate events
   unifiedClient.onCertificateEvent(async (event) => {
@@ -403,6 +450,11 @@ export async function startDaemon(options: {
 
         if (result.success) {
           log.info({ name: target.name, fingerprint: result.fingerprint }, 'Certificate deployed');
+
+          // Restart child process if configured
+          if (childManager && options.exec?.restartOnChange) {
+            await childManager.restart('certificate rotated');
+          }
         } else {
           log.error({ name: target.name, error: result.message }, 'Certificate deployment failed');
         }
@@ -421,6 +473,10 @@ export async function startDaemon(options: {
       return;
     }
 
+    let deployedSecretTarget = false;
+    let isExecSecret = false;
+
+    // Check if this is a secret target (file deployment)
     const target = findSecretTarget(event.secretId) || findSecretTarget(event.alias);
     if (target) {
       activeDeployments++;
@@ -430,13 +486,31 @@ export async function startDaemon(options: {
 
         if (result.success) {
           log.info({ name: target.name, version: result.version }, 'Secret deployed');
+          deployedSecretTarget = true;
         } else {
           log.error({ name: target.name, error: result.message }, 'Secret deployment failed');
         }
       } finally {
         activeDeployments--;
       }
-    } else {
+    }
+
+    // Check if this is an exec secret (for child process)
+    if (execSecretIds.includes(event.secretId) || execSecretIds.includes(event.alias)) {
+      isExecSecret = true;
+    }
+
+    // Restart child process if:
+    // 1. A secret target was deployed and restartOnChange is true, OR
+    // 2. An exec secret was updated
+    if (childManager && options.exec?.restartOnChange) {
+      if (deployedSecretTarget || isExecSecret) {
+        const reason = isExecSecret ? 'exec secret updated' : 'secret file updated';
+        await childManager.restart(reason);
+      }
+    }
+
+    if (!target && !isExecSecret) {
       log.debug({ secretId: event.secretId, alias: event.alias }, 'Received event for untracked secret');
     }
   });
@@ -483,6 +557,17 @@ export async function startDaemon(options: {
     const secretErrors = secretResults.filter(r => !r.success).length;
     updateSecretStatus(secretSuccess, secretErrors);
     log.info({ total: secretResults.length, success: secretSuccess, errors: secretErrors }, 'Secret sync complete');
+  }
+
+  // Start child process after initial sync (if exec mode)
+  if (childManager) {
+    log.info('Starting child process');
+    try {
+      await childManager.start();
+    } catch (err) {
+      log.error({ err }, 'Failed to start child process');
+      // Continue running daemon even if child fails to start
+    }
   }
 
   // Set up polling interval as fallback
@@ -538,6 +623,17 @@ export async function startDaemon(options: {
     clearInterval(pollTimer);
     unifiedClient.disconnect();
     stopApiKeyRenewal();
+
+    // Stop child process first (it needs to exit before we can)
+    if (childManager) {
+      log.info('Stopping child process');
+      try {
+        await childManager.stop();
+        log.info('Child process stopped');
+      } catch (err) {
+        log.error({ err }, 'Error stopping child process');
+      }
+    }
 
     // Wait for active deployments to complete (max 30 seconds)
     const startTime = Date.now();

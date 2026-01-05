@@ -2,6 +2,7 @@ import Conf from 'conf';
 import fs from 'node:fs';
 import path from 'node:path';
 import { configLogger as log } from './logger.js';
+import type { ExecSecret } from './secret-env.js';
 
 /**
  * Certificate target configuration
@@ -69,6 +70,40 @@ export interface SecretTarget {
 }
 
 /**
+ * Exec mode configuration for running child process with secrets
+ */
+export interface ExecConfig {
+  /** Command to execute (as array) */
+  command: string[];
+  /** Secret mappings for environment variables */
+  secrets: ExecSecret[];
+  /** Inherit current environment variables (default: true) */
+  inheritEnv?: boolean;
+  /** Restart child process on cert/secret changes (default: true) */
+  restartOnChange?: boolean;
+  /** Delay in ms before restarting child (default: 5000) */
+  restartDelayMs?: number;
+  /** Maximum restarts within window before entering degraded state (default: 10) */
+  maxRestarts?: number;
+  /** Time window in ms for counting restarts (default: 300000 = 5 minutes) */
+  restartWindowMs?: number;
+}
+
+/**
+ * Default exec configuration values
+ */
+export const DEFAULT_EXEC_CONFIG: Required<Omit<ExecConfig, 'command' | 'secrets'>> = {
+  inheritEnv: true,
+  restartOnChange: true,
+  restartDelayMs: 5000,
+  maxRestarts: 10,
+  restartWindowMs: 300000,
+};
+
+// Re-export ExecSecret for convenience
+export type { ExecSecret } from './secret-env.js';
+
+/**
  * Agent configuration
  */
 export interface AgentConfig {
@@ -90,6 +125,8 @@ export interface AgentConfig {
   targets: CertTarget[];
   /** Secret targets */
   secretTargets?: SecretTarget[];
+  /** Exec mode configuration (run child process with secrets as env vars) */
+  exec?: ExecConfig;
   /** Global reload command (if not set per-target) */
   globalReloadCmd?: string;
   /** Polling interval in seconds (fallback if WebSocket disconnects) */

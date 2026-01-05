@@ -39,7 +39,7 @@ function parsePemBundle(pemData: string): {
   const keyRegex = /-----BEGIN (?:RSA |EC |ENCRYPTED )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |ENCRYPTED )?PRIVATE KEY-----/;
 
   const certs = pemData.match(certRegex) || [];
-  const keyMatch = pemData.match(keyRegex);
+  const keyMatch = keyRegex.exec(pemData);
 
   log.debug({
     certsFound: certs.length,

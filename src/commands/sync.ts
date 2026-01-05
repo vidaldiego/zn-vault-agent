@@ -1,4 +1,4 @@
-import { Command } from 'commander';
+import type { Command } from 'commander';
 import ora from 'ora';
 import chalk from 'chalk';
 import { isConfigured, getTargets } from '../lib/config.js';

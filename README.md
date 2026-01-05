@@ -21,6 +21,12 @@ Real-time certificate distribution agent for ZN-Vault. Automatically syncs TLS c
 - **No file writes**: Secrets exist only in process memory
 - **Signal forwarding**: Graceful shutdown of child processes
 
+### Combined Mode (NEW)
+- **Daemon + Exec**: Single instance handles both cert sync and child process management
+- **Auto-restart**: Child process restarts automatically when certs or secrets change
+- **Crash recovery**: Automatic restart with rate limiting on child crashes
+- **Unified health**: Single health endpoint showing daemon and child status
+
 ### General
 - **Prometheus metrics**: Full observability via `/metrics` endpoint
 - **Graceful shutdown**: Completes in-flight deployments before exit
@@ -370,10 +376,15 @@ Environment variables override config file values:
 zn-vault-agent start [options]
 
 Options:
-  -v, --verbose         Enable debug logging
-  --health-port <port>  Enable health/metrics HTTP server
-  --validate            Validate config before starting
-  --auto-update         Enable automatic updates
+  -v, --verbose              Enable debug logging
+  --health-port <port>       Enable health/metrics HTTP server
+  --validate                 Validate config before starting
+  --auto-update              Enable automatic updates
+  --exec <command>           Command to execute (combined mode)
+  -s, --secret <mapping>     Secret mapping for exec (repeatable)
+  --restart-on-change        Restart child on cert/secret changes
+  --restart-delay <ms>       Delay before restart (default: 5000)
+  --max-restarts <n>         Max restarts in window (default: 10)
 ```
 
 ## Secret Sync
@@ -475,6 +486,43 @@ zn-vault-agent exec \
   -s DB_PASSWORD=alias:db/prod.password \
   -o /tmp/secrets.env
 ```
+
+## Combined Mode
+
+Run the daemon (cert/secret sync) AND manage a child process with injected secrets in a single instance. This eliminates the need for two separate services.
+
+### Quick Start
+
+```bash
+# Combined mode: daemon + exec in one
+zn-vault-agent start \
+  --exec "payara start-domain domain1" \
+  -s ZINC_CONFIG_USE_VAULT=literal:true \
+  -s ZINC_CONFIG_API_KEY=alias:infra/prod.apiKey \
+  --restart-on-change \
+  --health-port 9100
+```
+
+### Benefits
+
+- **Single WebSocket connection** to vault (reduced load)
+- **Automatic child restart** when certs or exec secrets change
+- **Unified health endpoint** showing both daemon and child status
+- **Simpler systemd config** (one service instead of two)
+- **Signal forwarding** to child process
+- **Crash recovery** with rate limiting
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--exec <cmd>` | - | Command to execute with secrets |
+| `-s <mapping>` | - | Secret mapping (repeatable) |
+| `--restart-on-change` | true | Restart child on changes |
+| `--restart-delay <ms>` | 5000 | Delay before restart |
+| `--max-restarts <n>` | 10 | Max restarts in window |
+
+See [Combined Mode in GUIDE.md](docs/GUIDE.md#combined-mode) for complete documentation.
 
 ### CLI Commands (`znvault agent`)
 

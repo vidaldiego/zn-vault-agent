@@ -5,6 +5,7 @@ import http from 'node:http';
 import { healthLogger as log } from './logger.js';
 import { exportMetrics } from './metrics.js';
 import { loadConfig, getTargets, isConfigured } from './config.js';
+import type { ChildProcessManager, ChildProcessState } from '../services/child-process-manager.js';
 
 export interface HealthStatus {
   status: 'healthy' | 'degraded' | 'unhealthy';
@@ -29,6 +30,7 @@ export interface HealthStatus {
     synced: number;
     errors: number;
   };
+  childProcess?: ChildProcessState;
 }
 
 // Track health state
@@ -42,6 +44,7 @@ let certErrors = 0;
 let syncedSecrets = 0;
 let secretErrors = 0;
 let server: http.Server | null = null;
+let childProcessManager: ChildProcessManager | null = null;
 
 /**
  * Update WebSocket connection status for certificates
@@ -87,6 +90,13 @@ export function updateSecretStatus(synced: number, errors: number): void {
 }
 
 /**
+ * Set child process manager for health status reporting
+ */
+export function setChildProcessManager(manager: ChildProcessManager | null): void {
+  childProcessManager = manager;
+}
+
+/**
  * Get current health status
  */
 export function getHealthStatus(): HealthStatus {
@@ -111,7 +121,23 @@ export function getHealthStatus(): HealthStatus {
     status = 'unhealthy';
   }
 
-  return {
+  // Child process status affects overall health
+  let childProcessState: ChildProcessState | undefined;
+  if (childProcessManager) {
+    childProcessState = childProcessManager.getState();
+
+    // Degraded if child is restarting or max restarts exceeded
+    if (childProcessManager.isDegraded()) {
+      status = 'degraded';
+    }
+
+    // Unhealthy if child process failed to start and never ran
+    if (childProcessState.status === 'crashed' && childProcessState.lastStartTime === null) {
+      status = 'unhealthy';
+    }
+  }
+
+  const result: HealthStatus = {
     status,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
@@ -141,6 +167,13 @@ export function getHealthStatus(): HealthStatus {
       errors: secretErrors,
     },
   };
+
+  // Only include childProcess if we have exec mode configured
+  if (childProcessState) {
+    result.childProcess = childProcessState;
+  }
+
+  return result;
 }
 
 /**

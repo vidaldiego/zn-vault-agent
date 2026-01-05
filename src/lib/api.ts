@@ -151,18 +151,18 @@ async function request<T>(options: RequestOptions): Promise<T> {
 
   // Add authentication
   if (options.token && options.token !== 'skip') {
-    headers['Authorization'] = `Bearer ${options.token}`;
+    headers.Authorization = `Bearer ${options.token}`;
   } else if (options.token !== 'skip') {
     if (config.auth.apiKey) {
       headers['X-API-Key'] = config.auth.apiKey;
     } else if (cachedToken && Date.now() < tokenExpiry) {
-      headers['Authorization'] = `Bearer ${cachedToken}`;
+      headers.Authorization = `Bearer ${cachedToken}`;
     } else if (config.auth.username && config.auth.password) {
       // Need to login first
       log.debug('Token expired or missing, logging in');
       await login(config.auth.username, config.auth.password);
       if (cachedToken) {
-        headers['Authorization'] = `Bearer ${cachedToken}`;
+        headers.Authorization = `Bearer ${cachedToken}`;
       }
     }
   }
@@ -312,7 +312,7 @@ export async function login(username: string, password: string): Promise<LoginRe
  */
 export async function listCertificates(): Promise<{ items: CertificateMetadata[]; total: number }> {
   log.debug('Listing certificates');
-  return request({
+  return await request({
     method: 'GET',
     path: '/v1/certificates',
   });
@@ -323,7 +323,7 @@ export async function listCertificates(): Promise<{ items: CertificateMetadata[]
  */
 export async function getCertificate(certId: string): Promise<CertificateMetadata> {
   log.debug({ certId }, 'Getting certificate metadata');
-  return request({
+  return await request({
     method: 'GET',
     path: `/v1/certificates/${certId}`,
   });
@@ -334,7 +334,7 @@ export async function getCertificate(certId: string): Promise<CertificateMetadat
  */
 export async function decryptCertificate(certId: string, purpose: string): Promise<DecryptedCertificate> {
   log.debug({ certId, purpose }, 'Decrypting certificate');
-  return request({
+  return await request({
     method: 'POST',
     path: `/v1/certificates/${certId}/decrypt`,
     body: { purpose },
@@ -393,7 +393,7 @@ export async function getSecret(secretId: string): Promise<DecryptedSecret> {
   }
 
   // Decrypt using UUID
-  return request({
+  return await request({
     method: 'POST',
     path: `/v1/secrets/${id}/decrypt`,
     body: {},  // Empty body required for POST
@@ -409,14 +409,14 @@ export async function getSecretMetadata(secretId: string): Promise<SecretMetadat
   // Handle alias format
   if (secretId.startsWith('alias:')) {
     const aliasPath = secretId.substring(6); // Remove "alias:" prefix
-    return request({
+    return await request({
       method: 'GET',
       path: `/v1/secrets/alias/${encodeURIComponent(aliasPath)}`,
     });
   }
 
   // Use UUID metadata endpoint
-  return request({
+  return await request({
     method: 'GET',
     path: `/v1/secrets/${secretId}/meta`,
   });

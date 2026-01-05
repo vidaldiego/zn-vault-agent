@@ -1,105 +1,11 @@
 // Path: src/commands/exec.ts
 // Exec mode - run a command with secrets as environment variables
 
-import { Command } from 'commander';
+import type { Command } from 'commander';
 import chalk from 'chalk';
 import { spawn } from 'node:child_process';
 import { isConfigured } from '../lib/config.js';
-import { getSecret } from '../lib/api.js';
-
-interface SecretMapping {
-  envVar: string;
-  secretId: string;
-  key?: string;
-}
-
-/**
- * Parse secret mapping from CLI argument
- * Formats:
- *   ENV_VAR=alias:secret/path           -> entire secret as JSON
- *   ENV_VAR=alias:secret/path.key       -> specific key from secret
- *   ENV_VAR=uuid                        -> entire secret as JSON
- *   ENV_VAR=uuid.key                    -> specific key from secret
- */
-function parseSecretMapping(mapping: string): SecretMapping {
-  const eqIndex = mapping.indexOf('=');
-  if (eqIndex === -1) {
-    throw new Error(`Invalid mapping format: ${mapping}. Expected: ENV_VAR=secret-id[.key]`);
-  }
-
-  const envVar = mapping.substring(0, eqIndex);
-  let secretPath = mapping.substring(eqIndex + 1);
-
-  if (!envVar || !secretPath) {
-    throw new Error(`Invalid mapping format: ${mapping}. Expected: ENV_VAR=secret-id[.key]`);
-  }
-
-  // Check if there's a key after the secret ID
-  // For alias format: alias:path/to/secret.key
-  // For UUID format: uuid.key
-  let key: string | undefined;
-
-  if (secretPath.startsWith('alias:')) {
-    // Handle alias:path/to/secret.key
-    const lastDotIndex = secretPath.lastIndexOf('.');
-    if (lastDotIndex > secretPath.indexOf(':') + 1) {
-      // There's a dot after the alias prefix
-      const potentialKey = secretPath.substring(lastDotIndex + 1);
-      // Check if this looks like a key (not a file extension or path segment)
-      if (potentialKey && !potentialKey.includes('/')) {
-        key = potentialKey;
-        secretPath = secretPath.substring(0, lastDotIndex);
-      }
-    }
-  } else {
-    // Handle uuid.key or uuid
-    const dotIndex = secretPath.indexOf('.');
-    if (dotIndex !== -1) {
-      key = secretPath.substring(dotIndex + 1);
-      secretPath = secretPath.substring(0, dotIndex);
-    }
-  }
-
-  return {
-    envVar,
-    secretId: secretPath,
-    key,
-  };
-}
-
-/**
- * Fetch secrets and build environment variables
- */
-async function buildSecretEnv(mappings: SecretMapping[]): Promise<Record<string, string>> {
-  const env: Record<string, string> = {};
-
-  // Group by secretId to minimize API calls
-  const secretCache = new Map<string, Record<string, unknown>>();
-
-  for (const mapping of mappings) {
-    let data = secretCache.get(mapping.secretId);
-
-    if (!data) {
-      const secret = await getSecret(mapping.secretId);
-      data = secret.data;
-      secretCache.set(mapping.secretId, data);
-    }
-
-    if (mapping.key) {
-      // Get specific key
-      const value = data[mapping.key];
-      if (value === undefined) {
-        throw new Error(`Key "${mapping.key}" not found in secret "${mapping.secretId}"`);
-      }
-      env[mapping.envVar] = typeof value === 'string' ? value : JSON.stringify(value);
-    } else {
-      // Get entire secret as JSON
-      env[mapping.envVar] = JSON.stringify(data);
-    }
-  }
-
-  return env;
-}
+import { parseSecretMapping, buildSecretEnv, type SecretMapping } from '../lib/secret-env.js';
 
 export function registerExecCommand(program: Command): void {
   program

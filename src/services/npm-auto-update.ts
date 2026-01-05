@@ -24,7 +24,7 @@ const PACKAGE_NAME = '@zincapp/zn-vault-agent';
 export class NpmAutoUpdateService {
   private checkInterval: NodeJS.Timeout | null = null;
   private initialCheckTimeout: NodeJS.Timeout | null = null;
-  private config: UpdateConfig;
+  private readonly config: UpdateConfig;
 
   constructor(config: Partial<UpdateConfig> = {}) {
     this.config = { ...DEFAULT_UPDATE_CONFIG, ...config };

@@ -297,9 +297,9 @@ export const metrics = {
   },
 
   // WebSocket
-  wsConnected: () => setGauge('znvault_agent_connected', 1),
-  wsDisconnected: () => setGauge('znvault_agent_connected', 0),
-  wsReconnect: () => incCounter('znvault_agent_websocket_reconnects_total'),
+  wsConnected: () => { setGauge('znvault_agent_connected', 1); },
+  wsDisconnected: () => { setGauge('znvault_agent_connected', 0); },
+  wsReconnect: () => { incCounter('znvault_agent_websocket_reconnects_total'); },
 
   // API
   apiRequest: (method: string, status: number, durationMs: number) => {
@@ -308,7 +308,7 @@ export const metrics = {
   },
 
   // Certificate tracking
-  setCertsTracked: (count: number) => setGauge('znvault_agent_certs_tracked', count),
+  setCertsTracked: (count: number) => { setGauge('znvault_agent_certs_tracked', count); },
   setCertExpiry: (certId: string, certName: string, days: number) => {
     setGauge('znvault_agent_cert_expiry_days', days, { cert_id: certId, cert_name: certName });
   },
@@ -324,7 +324,7 @@ export const metrics = {
       setGauge('znvault_agent_last_sync_timestamp', Date.now() / 1000, { secret_name: secretName });
     }
   },
-  setSecretsTracked: (count: number) => setGauge('znvault_agent_secrets_tracked', count),
+  setSecretsTracked: (count: number) => { setGauge('znvault_agent_secrets_tracked', count); },
 
   // Auto-update
   updateCheck: (status: 'success' | 'error') => {

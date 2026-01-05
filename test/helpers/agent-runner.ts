@@ -14,6 +14,16 @@ import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'fs';
 const AGENT_BIN = resolve(__dirname, '../../dist/index.js');
 const TEST_CONFIG_DIR = resolve(__dirname, '../.test-config');
 
+// Auto-assign unique ports for daemon health endpoints
+// Uses process.pid as base offset to avoid conflicts between parallel test forks
+// Each fork gets a unique range: PID * 100 + counter (mod 10000) + 20000
+// This gives each fork 100 unique ports before potential overlap
+const portBase = 20000 + ((process.pid % 100) * 100);
+let portCounter = 0;
+function getNextDaemonPort(): number {
+  return portBase + (portCounter++ % 100);
+}
+
 export interface AgentRunResult {
   exitCode: number;
   stdout: string;
@@ -375,18 +385,49 @@ export class AgentRunner {
     healthPort?: number;
     metricsEnabled?: boolean;
     pollInterval?: number;
+    // Combined mode options
+    exec?: string;
+    secrets?: string[];
+    restartOnChange?: boolean;
+    restartDelay?: number;
+    maxRestarts?: number;
+    restartWindow?: number;
   }): Promise<DaemonHandle> {
-    const healthPort = opts?.healthPort ?? 0;  // 0 = random port
+    // Always assign a health port so waitForReady() works
+    // Use || instead of ?? so that explicit 0 also triggers auto-assignment
+    const healthPort = opts?.healthPort || getNextDaemonPort();
 
     const args = ['start'];
-    if (healthPort) {
-      args.push('--health-port', String(healthPort));
-    }
+    args.push('--health-port', String(healthPort));
     if (opts?.metricsEnabled) {
       args.push('--metrics');
     }
     if (opts?.pollInterval) {
       args.push('--poll-interval', String(opts.pollInterval));
+    }
+
+    // Combined mode options
+    if (opts?.exec) {
+      args.push('--exec', opts.exec);
+    }
+    if (opts?.secrets) {
+      for (const secret of opts.secrets) {
+        args.push('--secret', secret);
+      }
+    }
+    if (opts?.restartOnChange === false) {
+      args.push('--no-restart-on-change');
+    } else if (opts?.restartOnChange === true) {
+      args.push('--restart-on-change');
+    }
+    if (opts?.restartDelay !== undefined) {
+      args.push('--restart-delay', String(opts.restartDelay));
+    }
+    if (opts?.maxRestarts !== undefined) {
+      args.push('--max-restarts', String(opts.maxRestarts));
+    }
+    if (opts?.restartWindow !== undefined) {
+      args.push('--restart-window', String(opts.restartWindow));
     }
 
     const env: Record<string, string> = {
@@ -401,15 +442,7 @@ export class AgentRunner {
       detached: false,
     });
 
-    let actualPort = healthPort;
-
-    // Try to extract port from output if not specified
-    proc.stdout?.on('data', (data) => {
-      const match = data.toString().match(/health server listening on port (\d+)/i);
-      if (match) {
-        actualPort = parseInt(match[1], 10);
-      }
-    });
+    // Note: We always specify a port now, so no need for dynamic detection
 
     const stop = async (): Promise<void> => {
       return new Promise((resolve) => {
@@ -427,24 +460,26 @@ export class AgentRunner {
 
     const waitForReady = async (): Promise<void> => {
       // Wait for health endpoint to respond
-      const maxAttempts = 30;
+      // Poll every 200ms for up to 10 seconds (50 attempts)
+      const maxAttempts = 50;
+      const pollInterval = 200;
       for (let i = 0; i < maxAttempts; i++) {
         try {
-          const response = await fetch(`http://127.0.0.1:${actualPort}/health`);
+          const response = await fetch(`http://127.0.0.1:${healthPort}/health`);
           if (response.ok) {
             return;
           }
         } catch {
           // Not ready yet
         }
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        await new Promise((resolve) => setTimeout(resolve, pollInterval));
       }
-      throw new Error('Daemon not ready after 15 seconds');
+      throw new Error(`Daemon not ready after ${(maxAttempts * pollInterval) / 1000} seconds (port ${healthPort})`);
     };
 
     return {
       process: proc,
-      healthPort: actualPort,
+      healthPort,
       stop,
       waitForReady,
     };

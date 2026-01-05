@@ -150,7 +150,7 @@ export const healthLogger = createLogger({ module: 'health' });
  * Call this before process exit for clean shutdown
  */
 export async function flushLogs(): Promise<void> {
-  return new Promise((resolve) => {
+  await new Promise((resolve) => {
     logger.flush();
     // Give some time for async writes to complete
     setTimeout(resolve, 100);

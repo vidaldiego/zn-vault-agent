@@ -11,6 +11,7 @@ Comprehensive documentation for the ZN-Vault Certificate Agent.
 - [CLI Commands](#cli-commands)
 - [Secrets Sync](#secrets-sync)
 - [Exec Mode](#exec-mode)
+- [Combined Mode](#combined-mode)
 - [WebSocket Protocol](#websocket-protocol)
 - [High Availability](#high-availability)
 - [Auto-Update System](#auto-update-system)
@@ -351,6 +352,13 @@ Options:
   --health-port <port>       Enable health/metrics HTTP server
   --validate                 Validate config before starting
   --auto-update              Enable automatic updates
+  --exec <command>           Command to execute (combined mode)
+  -s, --secret <mapping>     Secret mapping for exec (repeatable)
+  --restart-on-change        Restart child on cert/secret changes
+  --no-restart-on-change     Don't restart on changes
+  --restart-delay <ms>       Delay before restart (default: 5000)
+  --max-restarts <n>         Max restarts in window (default: 10)
+  --restart-window <ms>      Restart count window (default: 300000)
 ```
 
 Additional commands:
@@ -641,6 +649,295 @@ CMD ["node", "server.js"]
 ```bash
 # .envrc (with direnv)
 eval "$(zn-vault-agent exec -s DB_URL=alias:db/dev.url -e /dev/stdout)"
+```
+
+## Combined Mode
+
+Combined mode runs certificate/secret sync AND manages a child process with injected environment variables in a single agent instance. This eliminates the need for two separate services.
+
+### Why Combined Mode?
+
+**Before (2 services):**
+```
+┌─────────────────────────────┐     ┌─────────────────────────────┐
+│ zn-vault-agent.service      │     │ payara.service              │
+│ (daemon mode)               │     │ ExecStart: zn-vault-agent   │
+│                             │     │   exec -s VAR=secret ...    │
+│ • Syncs certificates        │     │   -- payara start           │
+│ • Writes to disk            │     │                             │
+│ • Watches for changes       │     │ • Injects env vars          │
+│ • 1st WebSocket connection  │     │ • Spawns Payara             │
+└─────────────────────────────┘     └─────────────────────────────┘
+         │                                    │
+         └────────── 2 connections ───────────┘
+```
+
+**After (combined mode):**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ zn-vault-agent.service (combined mode)                          │
+│                                                                 │
+│  ┌─────────────────────┐    ┌─────────────────────────────────┐│
+│  │ Daemon Core         │    │ Child Process Manager           ││
+│  │                     │    │                                 ││
+│  │ • WebSocket conn    │───►│ • Spawn with env vars           ││
+│  │ • Cert/secret sync  │    │ • Restart on change             ││
+│  │ • Health endpoint   │    │ • Signal forwarding             ││
+│  │ • Auto-update       │    │ • Crash recovery                ││
+│  └─────────────────────┘    └─────────────────────────────────┘│
+│                                        │                        │
+│                                        ▼                        │
+│                              ┌─────────────────┐                │
+│                              │ Payara Process  │                │
+│                              │ (with env vars) │                │
+│                              └─────────────────┘                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Benefits:**
+- Single WebSocket connection (reduced vault load)
+- Automatic child restart when certs or exec secrets change
+- Unified health endpoint showing both daemon and child status
+- Simpler systemd configuration (one service instead of two)
+- Proper signal forwarding to child process
+
+### CLI Usage
+
+```bash
+# Combined mode: daemon + exec
+zn-vault-agent start \
+  --exec "payara start-domain domain1" \
+  -s ZINC_CONFIG_USE_VAULT=literal:true \
+  -s ZINC_CONFIG_API_KEY=alias:infra/prod.apiKey \
+  -s ZINC_CONFIG_SECRET=alias:infra/prod.secretPath \
+  --restart-on-change \
+  --restart-delay 5000 \
+  --health-port 9100
+```
+
+**Options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--exec <command>` | - | Command to execute with secrets |
+| `-s, --secret <mapping>` | - | Secret mapping (repeatable) |
+| `--restart-on-change` | `true` | Restart child on cert/secret changes |
+| `--no-restart-on-change` | - | Don't restart on changes |
+| `--restart-delay <ms>` | `5000` | Delay before restart (milliseconds) |
+| `--max-restarts <n>` | `10` | Max restarts within window |
+| `--restart-window <ms>` | `300000` | Restart count window (5 minutes) |
+
+**Secret mapping format:**
+
+```
+ENV_VAR=type:value
+ENV_VAR=alias:path.key
+ENV_VAR=uuid.key
+```
+
+| Type | Example | Description |
+|------|---------|-------------|
+| `literal` | `USE_VAULT=literal:true` | Literal string value |
+| `alias` | `API_KEY=alias:db/prod.apiKey` | Vault secret by alias |
+| UUID | `PASS=abc123.password` | Vault secret by UUID |
+
+### Config File
+
+Combined mode can also be configured via the config file:
+
+```json
+{
+  "vaultUrl": "https://vault.example.com",
+  "tenantId": "production",
+  "auth": { "apiKey": "znv_..." },
+
+  "targets": [
+    {
+      "certId": "alias:certs/haproxy",
+      "name": "haproxy-cert",
+      "outputs": { "combined": "/etc/haproxy/certs/frontend.pem" },
+      "reloadCmd": "systemctl reload haproxy"
+    }
+  ],
+
+  "exec": {
+    "command": ["payara", "start-domain", "domain1"],
+    "secrets": [
+      { "env": "ZINC_CONFIG_USE_VAULT", "literal": "true" },
+      { "env": "ZINC_CONFIG_API_KEY", "secret": "alias:infra/prod.apiKey" },
+      { "env": "ZINC_CONFIG_SECRET", "secret": "alias:infra/prod.secretPath" }
+    ],
+    "inheritEnv": true,
+    "restartOnChange": true,
+    "restartDelayMs": 5000,
+    "maxRestarts": 10,
+    "restartWindowMs": 300000
+  }
+}
+```
+
+When `exec` is configured, the agent will:
+1. Start the daemon (cert/secret sync, WebSocket connection)
+2. After initial sync, spawn the child process with secrets injected
+3. Restart the child when certs or exec secrets change
+
+### Behavior
+
+| Scenario | Behavior |
+|----------|----------|
+| **Startup** | Sync all certs/secrets → fetch exec secrets → spawn child |
+| **Cert changes** | Update file → run reload command → restart child |
+| **Secret file changes** | Update file → run reload command → restart child |
+| **Exec secret changes** | Fetch new values → restart child with new env |
+| **Child crashes** | Wait `restartDelayMs` → respawn (with rate limiting) |
+| **SIGTERM received** | Kill child with SIGTERM → wait for exit → shutdown daemon |
+| **SIGINT received** | Kill child with SIGINT → wait for exit → shutdown daemon |
+| **Max restarts exceeded** | Log error, enter degraded state, keep daemon running |
+
+### Health Status
+
+The `/health` endpoint includes child process status:
+
+```json
+{
+  "status": "healthy",
+  "timestamp": "2025-01-05T12:00:00Z",
+  "uptime": 3600,
+  "version": "1.4.0",
+  "websocket": {
+    "certificates": { "connected": true },
+    "secrets": { "connected": true }
+  },
+  "vault": { "url": "https://vault.example.com", "reachable": true },
+  "certificates": { "total": 1, "synced": 1, "errors": 0 },
+  "secrets": { "total": 2, "synced": 2, "errors": 0 },
+  "childProcess": {
+    "status": "running",
+    "pid": 12345,
+    "restartCount": 0,
+    "lastStartTime": "2025-01-05T11:00:00Z",
+    "lastExitCode": null,
+    "lastExitTime": null
+  }
+}
+```
+
+**Child process states:**
+
+| State | Health Impact | Description |
+|-------|---------------|-------------|
+| `running` | healthy | Child is running normally |
+| `starting` | healthy | Child is starting up |
+| `restarting` | degraded | Child is restarting |
+| `crashed` | degraded | Child crashed, will auto-restart |
+| `stopped` | healthy | Child was intentionally stopped |
+| `max_restarts_exceeded` | degraded | Too many restarts, auto-restart disabled |
+
+### Systemd Service (Combined Mode)
+
+```ini
+[Unit]
+Description=ZN-Vault Agent (Combined Mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/zn-vault-agent start \
+    --health-port 9100 \
+    --exec "payara start-domain domain1" \
+    -s ZINC_CONFIG_USE_VAULT=literal:true \
+    -s ZINC_CONFIG_API_KEY=alias:infra/prod.apiKey \
+    --restart-on-change \
+    --restart-delay 5000
+Restart=always
+RestartSec=10
+EnvironmentFile=/etc/zn-vault-agent/secrets.env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Migration from 2-Service Setup
+
+**Before (2 services):**
+
+```ini
+# /etc/systemd/system/zn-vault-agent.service
+[Service]
+ExecStart=/usr/local/bin/zn-vault-agent start
+
+# /etc/systemd/system/payara.service
+[Service]
+ExecStart=/usr/local/bin/zn-vault-agent exec \
+    -s ZINC_CONFIG_USE_VAULT=literal:true \
+    -s ZINC_CONFIG_API_KEY=alias:infra/prod.apiKey \
+    -- payara start-domain domain1
+```
+
+**After (combined mode):**
+
+```ini
+# /etc/systemd/system/zn-vault-agent.service (replaces both)
+[Service]
+ExecStart=/usr/local/bin/zn-vault-agent start \
+    --exec "payara start-domain domain1" \
+    -s ZINC_CONFIG_USE_VAULT=literal:true \
+    -s ZINC_CONFIG_API_KEY=alias:infra/prod.apiKey \
+    --restart-on-change
+```
+
+**Migration steps:**
+
+1. Stop both services:
+   ```bash
+   sudo systemctl stop payara zn-vault-agent
+   ```
+
+2. Update zn-vault-agent.service with combined mode config
+
+3. Disable the old payara service:
+   ```bash
+   sudo systemctl disable payara
+   ```
+
+4. Reload and start:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl start zn-vault-agent
+   ```
+
+5. Verify:
+   ```bash
+   curl http://localhost:9100/health | jq '.childProcess'
+   ```
+
+### Crash Recovery
+
+The child process manager implements crash recovery with rate limiting:
+
+1. **On crash**: Wait `restartDelayMs` before restarting
+2. **Rate limiting**: Track restarts within `restartWindowMs`
+3. **Max restarts**: If `maxRestarts` exceeded within window, enter degraded state
+4. **Window reset**: Restart counter resets after window expires
+5. **Manual recovery**: Call `/health` to check status, restart daemon to reset
+
+**Example timeline:**
+
+```
+T+0s:    Child crashes (restart count: 1)
+T+5s:    Auto-restart child
+T+10s:   Child crashes (restart count: 2)
+T+15s:   Auto-restart child
+...
+T+50s:   Child crashes (restart count: 11)
+         → Max restarts exceeded, enter degraded state
+         → Agent continues running, but won't restart child
+         → Health endpoint shows "max_restarts_exceeded"
+
+T+300s:  Window expires, restart count resets
+         → If daemon is restarted, child will auto-start
 ```
 
 ## WebSocket Protocol

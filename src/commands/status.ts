@@ -1,4 +1,4 @@
-import { Command } from 'commander';
+import type { Command } from 'commander';
 import chalk from 'chalk';
 import { isConfigured, loadConfig, getTargets, getConfigPath } from '../lib/config.js';
 

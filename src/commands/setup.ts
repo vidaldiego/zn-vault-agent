@@ -7,7 +7,7 @@
  * for running zn-vault-agent as a system daemon.
  */
 
-import { Command } from 'commander';
+import type { Command } from 'commander';
 import chalk from 'chalk';
 import { execSync } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, copyFileSync } from 'fs';

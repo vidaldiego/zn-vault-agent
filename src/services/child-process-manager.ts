@@ -1,0 +1,405 @@
+// Path: src/services/child-process-manager.ts
+// Manages child process for combined daemon + exec mode
+
+import type { ChildProcess } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { logger } from '../lib/logger.js';
+import {
+  parseSecretMappingFromConfig,
+  buildSecretEnv,
+  type SecretMapping,
+} from '../lib/secret-env.js';
+import { type ExecConfig, DEFAULT_EXEC_CONFIG } from '../lib/config.js';
+
+const log = logger.child({ module: 'child-process-manager' });
+
+/**
+ * Child process status
+ */
+export type ChildProcessStatus =
+  | 'stopped'
+  | 'starting'
+  | 'running'
+  | 'restarting'
+  | 'crashed'
+  | 'max_restarts_exceeded';
+
+/**
+ * Child process state information for health endpoint
+ */
+export interface ChildProcessState {
+  status: ChildProcessStatus;
+  pid: number | null;
+  restartCount: number;
+  lastExitCode: number | null;
+  lastExitSignal: string | null;
+  lastExitTime: string | null;
+  lastStartTime: string | null;
+}
+
+/**
+ * Events emitted by ChildProcessManager
+ */
+export interface ChildProcessManagerEvents {
+  started: (pid: number) => void;
+  stopped: (code: number | null, signal: string | null) => void;
+  restarting: (reason: string) => void;
+  maxRestartsExceeded: () => void;
+  error: (error: Error) => void;
+}
+
+/**
+ * Manages a child process with secrets as environment variables.
+ * Handles restart on changes, crash recovery with backoff, and signal forwarding.
+ */
+export class ChildProcessManager extends EventEmitter {
+  private child: ChildProcess | null = null;
+  private readonly config: Required<Omit<ExecConfig, 'command' | 'secrets'>> & Pick<ExecConfig, 'command' | 'secrets'>;
+  private readonly mappings: (SecretMapping & { literal?: string })[];
+  private isShuttingDown = false;
+  private restartCount = 0;
+  private restartWindowStart = 0;
+  private restartTimeout: NodeJS.Timeout | null = null;
+  private status: ChildProcessStatus = 'stopped';
+  private lastExitCode: number | null = null;
+  private lastExitSignal: string | null = null;
+  private lastExitTime: string | null = null;
+  private lastStartTime: string | null = null;
+  private readonly signalHandlers = new Map<NodeJS.Signals, () => void>();
+
+  constructor(execConfig: ExecConfig) {
+    super();
+
+    // Merge with defaults
+    this.config = {
+      ...DEFAULT_EXEC_CONFIG,
+      ...execConfig,
+    };
+
+    // Parse secret mappings from config format
+    this.mappings = this.config.secrets.map(parseSecretMappingFromConfig);
+
+    log.debug(
+      {
+        command: this.config.command,
+        secretCount: this.config.secrets.length,
+        restartOnChange: this.config.restartOnChange,
+      },
+      'ChildProcessManager initialized'
+    );
+  }
+
+  /**
+   * Start the child process
+   */
+  async start(): Promise<void> {
+    if (this.child) {
+      log.warn('Child process already running, ignoring start request');
+      return;
+    }
+
+    if (this.isShuttingDown) {
+      log.warn('Manager is shutting down, ignoring start request');
+      return;
+    }
+
+    this.status = 'starting';
+    log.info({ command: this.config.command.join(' ') }, 'Starting child process');
+
+    try {
+      // Fetch secrets and build environment
+      const secretEnv = await buildSecretEnv(this.mappings);
+      const env = this.config.inheritEnv
+        ? { ...process.env, ...secretEnv }
+        : secretEnv;
+
+      // Spawn the child process
+      const [cmd, ...args] = this.config.command;
+      this.child = spawn(cmd, args, {
+        env,
+        stdio: 'inherit',
+        shell: process.platform === 'win32',
+      });
+
+      this.lastStartTime = new Date().toISOString();
+      this.status = 'running';
+
+      this.setupSignalForwarding();
+      this.setupChildEventHandlers();
+
+      log.info({ pid: this.child.pid }, 'Child process started');
+      this.emit('started', this.child.pid);
+    } catch (err) {
+      this.status = 'crashed';
+      const error = err instanceof Error ? err : new Error(String(err));
+      log.error({ err: error }, 'Failed to start child process');
+      this.emit('error', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Stop the child process gracefully
+   */
+  async stop(): Promise<void> {
+    this.isShuttingDown = true;
+
+    // Clear any pending restart
+    if (this.restartTimeout) {
+      clearTimeout(this.restartTimeout);
+      this.restartTimeout = null;
+    }
+
+    // Remove signal handlers
+    this.cleanupSignalHandlers();
+
+    if (!this.child) {
+      this.status = 'stopped';
+      return;
+    }
+
+    const childToStop = this.child;
+    log.info({ pid: childToStop.pid }, 'Stopping child process');
+
+    await new Promise<void>((resolve) => {
+      const child = childToStop;
+
+      // Set up exit handler
+      const onExit = (): void => {
+        this.child = null;
+        this.status = 'stopped';
+        resolve();
+      };
+
+      // If already dead
+      if (child.exitCode !== null || child.signalCode !== null) {
+        onExit();
+        return;
+      }
+
+      child.once('exit', onExit);
+
+      // Send SIGTERM first
+      child.kill('SIGTERM');
+
+      // Force kill after 10 seconds
+      setTimeout(() => {
+        if (this.child) {
+          log.warn({ pid: this.child.pid }, 'Child did not exit, sending SIGKILL');
+          this.child.kill('SIGKILL');
+        }
+      }, 10000);
+    });
+  }
+
+  /**
+   * Restart the child process (e.g., after cert/secret change)
+   */
+  async restart(reason: string): Promise<void> {
+    if (this.isShuttingDown) {
+      log.warn('Manager is shutting down, ignoring restart request');
+      return;
+    }
+
+    if (!this.config.restartOnChange) {
+      log.debug({ reason }, 'Restart requested but restartOnChange is disabled');
+      return;
+    }
+
+    log.info({ reason }, 'Restarting child process');
+    this.status = 'restarting';
+    this.emit('restarting', reason);
+
+    // Stop current process
+    if (this.child) {
+      this.isShuttingDown = false; // Don't prevent restart
+      await this.stopChild();
+    }
+
+    // Start with fresh secrets
+    await this.start();
+  }
+
+  /**
+   * Get current process state for health endpoint
+   */
+  getState(): ChildProcessState {
+    return {
+      status: this.status,
+      pid: this.child?.pid ?? null,
+      restartCount: this.restartCount,
+      lastExitCode: this.lastExitCode,
+      lastExitSignal: this.lastExitSignal,
+      lastExitTime: this.lastExitTime,
+      lastStartTime: this.lastStartTime,
+    };
+  }
+
+  /**
+   * Check if process is in a healthy state
+   */
+  isHealthy(): boolean {
+    return this.status === 'running';
+  }
+
+  /**
+   * Check if process is in a degraded state (restarting or max restarts exceeded)
+   */
+  isDegraded(): boolean {
+    return this.status === 'restarting' || this.status === 'max_restarts_exceeded';
+  }
+
+  /**
+   * Stop child without setting shutdown flag
+   */
+  private async stopChild(): Promise<void> {
+    const childToStop = this.child;
+    if (!childToStop) return;
+
+    await new Promise<void>((resolve) => {
+      const child = childToStop;
+
+      // Remove signal handlers during restart
+      this.cleanupSignalHandlers();
+
+      const onExit = (): void => {
+        this.child = null;
+        resolve();
+      };
+
+      if (child.exitCode !== null || child.signalCode !== null) {
+        onExit();
+        return;
+      }
+
+      child.once('exit', onExit);
+      child.kill('SIGTERM');
+
+      setTimeout(() => {
+        if (this.child === child) {
+          child.kill('SIGKILL');
+        }
+      }, 5000);
+    });
+  }
+
+  /**
+   * Set up signal forwarding from parent to child
+   */
+  private setupSignalForwarding(): void {
+    const signals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+
+    for (const signal of signals) {
+      const handler = (): void => {
+        if (this.child) {
+          log.debug({ signal, pid: this.child.pid }, 'Forwarding signal to child');
+          this.child.kill(signal);
+        }
+      };
+      this.signalHandlers.set(signal, handler);
+      process.on(signal, handler);
+    }
+  }
+
+  /**
+   * Clean up signal handlers
+   */
+  private cleanupSignalHandlers(): void {
+    for (const [signal, handler] of this.signalHandlers) {
+      process.off(signal, handler);
+    }
+    this.signalHandlers.clear();
+  }
+
+  /**
+   * Set up event handlers for child process
+   */
+  private setupChildEventHandlers(): void {
+    if (!this.child) return;
+
+    this.child.on('exit', (code, signal) => {
+      this.lastExitCode = code;
+      this.lastExitSignal = signal?.toString() ?? null;
+      this.lastExitTime = new Date().toISOString();
+
+      log.info({ code, signal, pid: this.child?.pid }, 'Child process exited');
+      this.emit('stopped', code, signal?.toString() ?? null);
+
+      this.child = null;
+      this.cleanupSignalHandlers();
+
+      // Handle crash recovery if not shutting down
+      if (!this.isShuttingDown) {
+        this.handleCrash(code, signal?.toString() ?? null);
+      } else {
+        this.status = 'stopped';
+      }
+    });
+
+    this.child.on('error', (err) => {
+      log.error({ err }, 'Child process error');
+      this.emit('error', err);
+    });
+  }
+
+  /**
+   * Handle child process crash with rate limiting
+   */
+  private handleCrash(code: number | null, signal: string | null): void {
+    const now = Date.now();
+
+    // Reset counter if outside restart window
+    if (now - this.restartWindowStart > this.config.restartWindowMs) {
+      this.restartCount = 0;
+      this.restartWindowStart = now;
+    }
+
+    this.restartCount++;
+
+    // Check if max restarts exceeded
+    if (this.restartCount > this.config.maxRestarts) {
+      log.error(
+        {
+          restartCount: this.restartCount,
+          maxRestarts: this.config.maxRestarts,
+          windowMs: this.config.restartWindowMs,
+        },
+        'Max restarts exceeded, entering degraded state'
+      );
+      this.status = 'max_restarts_exceeded';
+      this.emit('maxRestartsExceeded');
+      return;
+    }
+
+    // Schedule restart with delay
+    this.status = 'crashed';
+    log.info(
+      {
+        code,
+        signal,
+        restartCount: this.restartCount,
+        delayMs: this.config.restartDelayMs,
+      },
+      'Child crashed, scheduling restart'
+    );
+
+    this.restartTimeout = setTimeout(() => {
+      this.restartTimeout = null;
+      this.start().catch((err: unknown) => {
+        log.error({ err }, 'Failed to restart child process');
+      });
+    }, this.config.restartDelayMs);
+  }
+
+  /**
+   * Reset restart counter (call after successful manual restart)
+   */
+  resetRestartCount(): void {
+    this.restartCount = 0;
+    this.restartWindowStart = Date.now();
+    if (this.status === 'max_restarts_exceeded') {
+      this.status = 'stopped';
+    }
+  }
+}
