@@ -385,6 +385,7 @@ Options:
   --restart-on-change        Restart child on cert/secret changes
   --restart-delay <ms>       Delay before restart (default: 5000)
   --max-restarts <n>         Max restarts in window (default: 10)
+  --restart-window <ms>      Restart count window (default: 300000)
 ```
 
 ## Secret Sync
@@ -521,6 +522,7 @@ zn-vault-agent start \
 | `--restart-on-change` | true | Restart child on changes |
 | `--restart-delay <ms>` | 5000 | Delay before restart |
 | `--max-restarts <n>` | 10 | Max restarts in window |
+| `--restart-window <ms>` | 300000 | Restart count reset window (5 min) |
 
 See [Combined Mode in GUIDE.md](docs/GUIDE.md#combined-mode) for complete documentation.
 
