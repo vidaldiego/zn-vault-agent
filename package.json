@@ -1,7 +1,7 @@
 {
   "name": "@zincapp/zn-vault-agent",
   "version": "1.3.0",
-  "description": "ZN-Vault Certificate Agent - Real-time certificate distribution",
+  "description": "ZN-Vault Certificate Agent - Real-time certificate and secret distribution",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
