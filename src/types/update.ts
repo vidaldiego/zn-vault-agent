@@ -1,10 +1,7 @@
 // Path: zn-vault-agent/src/types/update.ts
 
 /**
- * Simplified Update Types for npm-based Auto-Update
- *
- * Replaces the complex S3/GPG update system (~170 lines) with
- * a simple npm-based approach (~30 lines).
+ * Update Types for npm-based Auto-Update
  */
 
 export interface NpmVersionInfo {

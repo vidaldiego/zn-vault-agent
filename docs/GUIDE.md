@@ -21,6 +21,7 @@ Comprehensive documentation for the ZN-Vault Certificate Agent.
 - [API Key Auto-Renewal](#api-key-auto-renewal)
 - [Security Considerations](#security-considerations)
 - [Best Practices](#best-practices)
+- [Development](#development)
 
 ## Introduction
 
@@ -1283,3 +1284,66 @@ curl -sk -X POST https://vault.example.com/auth/api-keys/self/rotate \
 5. **Backup State**: Back up agent state files as part of disaster recovery
 6. **Version Lock**: Use specific certificate IDs rather than aliases to avoid unexpected updates
 7. **Enable Metrics**: Use `--health-port` for observability in production
+
+## Development
+
+### Building from Source
+
+```bash
+git clone https://github.com/vidaldiego/zn-vault-agent.git
+cd zn-vault-agent
+npm install
+npm run build
+npm test
+```
+
+### Project Structure
+
+```
+zn-vault-agent/
+├── src/
+│   ├── commands/        # CLI command handlers
+│   ├── services/        # Core services (sync, websocket, auto-update)
+│   ├── lib/             # Shared utilities
+│   └── types/           # TypeScript type definitions
+├── test/
+│   ├── unit/            # Unit tests
+│   └── integration/     # Integration tests
+├── deploy/
+│   ├── install.sh       # Local installation script
+│   ├── systemd/         # Systemd service files
+│   └── logrotate.d/     # Log rotation config
+└── .github/workflows/   # CI/CD pipelines
+```
+
+### Release Process
+
+Releases use GitHub Actions with npm OIDC trusted publishing:
+
+```bash
+# 1. Update version
+npm version patch  # or minor/major
+
+# 2. Push with tags
+git push && git push --tags
+```
+
+GitHub Actions automatically:
+1. Runs tests on Node.js 18, 20, 22
+2. Builds the package
+3. Publishes to npm with provenance attestation
+4. Tags pre-releases as `beta` or `next`
+
+### Local Testing
+
+```bash
+# Build and link locally
+npm run build
+npm link
+
+# Test the CLI
+zn-vault-agent --help
+
+# Run with debug logging
+LOG_LEVEL=debug zn-vault-agent start
+```

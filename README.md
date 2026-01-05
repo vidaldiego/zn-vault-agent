@@ -696,6 +696,51 @@ npm test             # Test
 npm run test:coverage
 ```
 
+## Releases
+
+This package uses GitHub Actions for CI/CD with npm's OIDC trusted publishing.
+
+### CI Pipeline
+
+On every push to `main` or pull request:
+- Linting and type checking
+- Build verification
+- Unit tests on Node.js 18, 20, 22
+
+### Publishing to npm
+
+Releases are automated via git tags:
+
+```bash
+# 1. Bump version in package.json
+npm version patch   # or minor/major
+
+# 2. Push changes and tag
+git push && git push --tags
+
+# GitHub Actions will automatically:
+# - Run tests
+# - Build the package
+# - Publish to npm with provenance
+```
+
+**Available channels (npm dist-tags):**
+
+| Tag | Purpose | Install Command |
+|-----|---------|-----------------|
+| `latest` | Stable releases | `npm install -g @zincapp/zn-vault-agent` |
+| `beta` | Pre-release testing | `npm install -g @zincapp/zn-vault-agent@beta` |
+| `next` | Development builds | `npm install -g @zincapp/zn-vault-agent@next` |
+
+Pre-release versions (e.g., `1.3.0-beta.1`) are automatically tagged as `beta` or `next`.
+
+### Manual Release (if needed)
+
+```bash
+npm login
+npm publish --access public
+```
+
 ## License
 
 MIT
