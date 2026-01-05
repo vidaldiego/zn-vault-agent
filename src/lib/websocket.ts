@@ -18,6 +18,12 @@ import {
 } from './health.js';
 import { flushLogs, setupLogRotation } from './logger.js';
 import { startApiKeyRenewal, stopApiKeyRenewal } from '../services/api-key-renewal.js';
+import {
+  startManagedKeyRenewal,
+  stopManagedKeyRenewal,
+  onKeyChanged as onManagedKeyChanged,
+} from '../services/managed-key-renewal.js';
+import { isManagedKeyMode } from './config.js';
 import { ChildProcessManager } from '../services/child-process-manager.js';
 import { extractSecretIds, parseSecretMappingFromConfig } from './secret-env.js';
 
@@ -533,8 +539,31 @@ export async function startDaemon(options: {
     log.error({ err }, 'WebSocket error');
   });
 
-  // Start API key renewal service
-  startApiKeyRenewal();
+  // Start API key renewal service (managed or standard)
+  if (isManagedKeyMode()) {
+    log.info('Using managed API key mode');
+
+    // Set up callback for when managed key changes
+    onManagedKeyChanged((newKey) => {
+      log.info({ newKeyPrefix: newKey.substring(0, 8) }, 'Managed key changed, reconnecting WebSocket');
+      // Reconnect WebSocket with new key
+      unifiedClient.disconnect();
+      // Small delay to allow config to be saved
+      setTimeout(() => {
+        if (!isShuttingDown) {
+          unifiedClient.connect();
+        }
+      }, 500);
+    });
+
+    // Start managed key renewal service
+    startManagedKeyRenewal().catch(err => {
+      log.error({ err }, 'Failed to start managed key renewal service');
+    });
+  } else {
+    // Use standard API key renewal
+    startApiKeyRenewal();
+  }
 
   // Connect unified WebSocket
   unifiedClient.connect();
@@ -622,7 +651,13 @@ export async function startDaemon(options: {
     // Stop accepting new events
     clearInterval(pollTimer);
     unifiedClient.disconnect();
-    stopApiKeyRenewal();
+
+    // Stop API key renewal service (managed or standard)
+    if (isManagedKeyMode()) {
+      stopManagedKeyRenewal();
+    } else {
+      stopApiKeyRenewal();
+    }
 
     // Stop child process first (it needs to exit before we can)
     if (childManager) {

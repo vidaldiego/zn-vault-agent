@@ -220,6 +220,107 @@ The agent automatically renews API keys before they expire:
 
 **Note**: The renewal service only runs when the daemon is active. For environments where the daemon runs intermittently, consider checking key status via `znvault agent status` and rotating manually if needed.
 
+### Managed API Keys (Recommended)
+
+Managed API keys provide **automatic rotation** handled by the vault server. When you use a managed API key, the agent automatically detects it and handles rotation seamlessly.
+
+#### How It Works
+
+1. **Auto-Detection**: During `login`, the agent calls `/auth/api-keys/self` to check if the key is managed
+2. **Automatic Binding**: If managed, the agent binds to get the current key value and rotation metadata
+3. **Background Renewal**: The daemon automatically refreshes the key before each rotation
+4. **WebSocket Reconnection**: When the key rotates, the agent reconnects with the new key
+
+#### Rotation Modes
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| `scheduled` | Key rotates on a fixed schedule (e.g., every 24h) | Production services with predictable restarts |
+| `on-use` | Key rotates after first use, then stays stable | Services that start infrequently |
+| `on-bind` | Each bind returns a fresh key | Short-lived processes, CI/CD |
+
+#### Creating a Managed API Key
+
+```bash
+# Via znvault CLI
+znvault apikey create \
+  --name "agent-prod-server1" \
+  --tenant my-tenant \
+  --managed \
+  --rotation-mode scheduled \
+  --rotation-interval 24h \
+  --grace-period 5m \
+  --permissions certificate:read:metadata,certificate:read:value
+
+# Via API
+curl -sk -X POST https://vault.example.com/auth/api-keys \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "agent-prod-server1",
+    "permissions": ["certificate:read:metadata", "certificate:read:value"],
+    "managed": {
+      "rotationMode": "scheduled",
+      "rotationInterval": "24h",
+      "gracePeriod": "5m"
+    }
+  }'
+```
+
+#### Using Managed Keys with the Agent
+
+```bash
+# Just use the API key - agent auto-detects it's managed
+zn-vault-agent login \
+  --url https://vault.example.com \
+  --tenant my-tenant \
+  --api-key znv_managed_key_123...
+
+# Output shows managed key was detected:
+# ✓ Connection successful!
+# ✓ Configuration saved to: /etc/zn-vault-agent/config.json
+# ✓ Found 5 certificate(s) in vault
+# ✓ Managed API key detected and bound
+# ✓ Managed key: agent-prod-server1 (rotates: 1/6/2026, 10:00 AM)
+#   Auto-rotation enabled - key will refresh before expiration
+```
+
+#### Grace Period
+
+When a managed key rotates, both the old and new keys work during the **grace period** (default: 5 minutes). This ensures zero-downtime during rotation:
+
+```
+Time ──────────────────────────────────────────────────────────>
+
+      │◄─── Rotation ───►│
+      │                   │
+Key A ████████████████████░░░░░░░░  (grace period - both work)
+Key B                     ████████████████████████████████████
+
+      │                   │
+   rotation          grace expires
+    event            (old key invalid)
+```
+
+#### Log Output During Rotation
+
+```json
+{"level":"info","msg":"Managed key refresh scheduled","refreshInMinutes":55,"refreshAt":"2026-01-06T09:55:00Z"}
+{"level":"info","msg":"Binding to managed key","name":"agent-prod-server1"}
+{"level":"info","msg":"Managed key rotated","oldPrefix":"znv_abc1","newPrefix":"znv_xyz9","nextRotationAt":"2026-01-07T10:00:00Z"}
+{"level":"info","msg":"Managed key changed, reconnecting WebSocket"}
+```
+
+#### Benefits Over Static Keys
+
+| Feature | Static API Key | Managed API Key |
+|---------|---------------|-----------------|
+| Rotation | Manual (agent self-rotate) | Automatic (vault-managed) |
+| Grace Period | None (immediate invalidation) | Configurable overlap |
+| Audit Trail | Key rotation events | Full rotation history |
+| Coordination | Single agent | Multiple agents can share |
+| Expiration Handling | Agent must self-rotate | Vault handles expiration |
+
 ### Password Authentication (Development Only)
 
 Password auth stores credentials in the config file. **Not recommended for production.**

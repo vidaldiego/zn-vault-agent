@@ -3,7 +3,7 @@ import inquirer from 'inquirer';
 import ora from 'ora';
 import chalk from 'chalk';
 import { loadConfig, saveConfig, getConfigPath } from '../lib/config.js';
-import { login as apiLogin, listCertificates } from '../lib/api.js';
+import { login as apiLogin, listCertificates, getApiKeySelf, bindManagedApiKey } from '../lib/api.js';
 
 interface LoginOptions {
   url?: string;
@@ -46,7 +46,7 @@ export function registerLoginCommand(program: Command): void {
     .description('Configure vault connection and authenticate')
     .option('-u, --url <url>', 'Vault server URL')
     .option('-t, --tenant <id>', 'Tenant ID')
-    .option('-k, --api-key <key>', 'API key (alternative to username/password)')
+    .option('-k, --api-key <key>', 'API key (auto-detects managed keys)')
     .option('--username <user>', 'Username')
     .option('--password <pass>', 'Password')
     .option('--insecure', 'Skip TLS certificate verification')
@@ -57,7 +57,7 @@ Examples:
   # Interactive login (prompts for values)
   zn-vault-agent login
 
-  # Login with API key (recommended for automation)
+  # Login with API key (auto-detects managed keys for auto-rotation)
   zn-vault-agent login --url https://vault.example.com --tenant acme --api-key znv_abc123
 
   # Login with username/password
@@ -156,7 +156,7 @@ Examples:
             name: 'authMethod',
             message: 'Authentication method:',
             choices: [
-              { name: 'API Key (recommended for agents)', value: 'apiKey' },
+              { name: 'API Key (auto-detects managed keys)', value: 'apiKey' },
               { name: 'Username/Password', value: 'password' },
             ],
             default: options.apiKey ? 'apiKey' : (config.auth.apiKey ? 'apiKey' : 'password'),
@@ -209,11 +209,13 @@ Examples:
 
       if (authMethod === 'apiKey') {
         config.auth = { apiKey: apiKey! };
+        config.managedKey = undefined; // Clear until we detect
       } else {
         config.auth = {
           username: username!,
           password: password!,
         };
+        config.managedKey = undefined; // Clear managed key config
       }
 
       // Save config first (needed for API calls)
@@ -242,6 +244,46 @@ Examples:
         console.log();
         console.log(chalk.green('✓') + ` Configuration saved to: ${getConfigPath()}`);
         console.log(chalk.green('✓') + ` Found ${certs.total} certificate(s) in vault`);
+
+        // For API key auth, check if it's a managed key
+        if (authMethod === 'apiKey') {
+          spinner.start('Checking API key type...');
+          try {
+            const keyInfo = await getApiKeySelf();
+
+            if (keyInfo.isManaged && keyInfo.managedKeyName) {
+              spinner.text = 'Binding to managed API key...';
+
+              // Bind to get the current key value and metadata
+              const bindResponse = await bindManagedApiKey(keyInfo.managedKeyName);
+
+              // Update config with bound key and managed key metadata
+              config.auth.apiKey = bindResponse.key;
+              config.managedKey = {
+                name: keyInfo.managedKeyName,
+                nextRotationAt: bindResponse.nextRotationAt,
+                graceExpiresAt: bindResponse.graceExpiresAt,
+                rotationMode: bindResponse.rotationMode,
+                lastBind: new Date().toISOString(),
+              };
+              saveConfig(config);
+
+              spinner.succeed('Managed API key detected and bound');
+
+              const nextRotation = bindResponse.nextRotationAt
+                ? new Date(bindResponse.nextRotationAt).toLocaleString()
+                : 'unknown';
+              console.log(chalk.green('✓') + ` Managed key: ${keyInfo.managedKeyName} (rotates: ${nextRotation})`);
+              console.log(chalk.gray('  Auto-rotation enabled - key will refresh before expiration'));
+            } else {
+              spinner.succeed('Static API key configured');
+            }
+          } catch {
+            // If self endpoint doesn't exist or fails, just continue with static key
+            spinner.info('API key configured (could not detect managed key status)');
+          }
+        }
+
         console.log();
         console.log('Next steps:');
         console.log('  1. Add certificates to sync: ' + chalk.cyan('zn-vault-agent add'));

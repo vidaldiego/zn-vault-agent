@@ -104,6 +104,22 @@ export const DEFAULT_EXEC_CONFIG: Required<Omit<ExecConfig, 'command' | 'secrets
 export type { ExecSecret } from './secret-env.js';
 
 /**
+ * Managed API key configuration for automatic rotation
+ */
+export interface ManagedKeyConfig {
+  /** Managed key name in vault */
+  name: string;
+  /** When the next rotation will occur (ISO timestamp) */
+  nextRotationAt?: string;
+  /** When the grace period expires (ISO timestamp) */
+  graceExpiresAt?: string;
+  /** Rotation mode (for informational purposes) */
+  rotationMode?: 'scheduled' | 'on-use' | 'on-bind';
+  /** Last bind timestamp */
+  lastBind?: string;
+}
+
+/**
  * Agent configuration
  */
 export interface AgentConfig {
@@ -113,12 +129,14 @@ export interface AgentConfig {
   tenantId: string;
   /** Authentication */
   auth: {
-    /** API key (preferred) */
+    /** API key (current value - updated automatically for managed keys) */
     apiKey?: string;
     /** Or username/password */
     username?: string;
     password?: string;
   };
+  /** Managed API key configuration (enables auto-rotation) */
+  managedKey?: ManagedKeyConfig;
   /** Skip TLS verification */
   insecure?: boolean;
   /** Certificate targets */
@@ -415,6 +433,50 @@ export function updateSecretTargetVersion(secretId: string, version: number): vo
     target.lastSync = new Date().toISOString();
     saveConfig(config);
   }
+}
+
+/**
+ * Update managed key configuration after bind
+ * Stores the new key value and rotation metadata
+ */
+export function updateManagedKey(
+  newKey: string,
+  metadata: {
+    nextRotationAt?: string;
+    graceExpiresAt?: string;
+    rotationMode?: 'scheduled' | 'on-use' | 'on-bind';
+  }
+): void {
+  const config = loadConfig();
+
+  if (!config.managedKey?.name) {
+    log.warn('updateManagedKey called but no managed key configured');
+    return;
+  }
+
+  // Update the API key value
+  config.auth = config.auth || {};
+  config.auth.apiKey = newKey;
+
+  // Update managed key metadata
+  config.managedKey.nextRotationAt = metadata.nextRotationAt;
+  config.managedKey.graceExpiresAt = metadata.graceExpiresAt;
+  config.managedKey.rotationMode = metadata.rotationMode;
+  config.managedKey.lastBind = new Date().toISOString();
+
+  saveConfig(config);
+  log.info({
+    managedKeyName: config.managedKey.name,
+    nextRotationAt: metadata.nextRotationAt,
+  }, 'Managed key config updated');
+}
+
+/**
+ * Check if using managed key mode
+ */
+export function isManagedKeyMode(): boolean {
+  const config = loadConfig();
+  return !!config.managedKey?.name;
 }
 
 /**

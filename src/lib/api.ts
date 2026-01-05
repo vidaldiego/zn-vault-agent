@@ -485,3 +485,40 @@ export async function bindManagedApiKey(name: string): Promise<ManagedApiKeyBind
     body: {},
   });
 }
+
+/**
+ * API key self-info response
+ */
+export interface ApiKeySelfInfo {
+  id: string;
+  name: string;
+  prefix: string;
+  tenantId: string;
+  permissions: string[];
+  expiresAt: string;
+  expiresInDays: number;
+  isExpiringSoon: boolean;
+  /** True if this is a managed API key with auto-rotation */
+  isManaged?: boolean;
+  /** Managed key name (only present if isManaged is true) */
+  managedKeyName?: string;
+  /** Rotation mode (only for managed keys) */
+  rotationMode?: 'scheduled' | 'on-use' | 'on-bind';
+  /** Next rotation time (only for managed keys) */
+  nextRotationAt?: string;
+  /** Grace period expiry (only for managed keys) */
+  graceExpiresAt?: string;
+}
+
+/**
+ * Get info about the current API key (self)
+ * Also detects if the key is a managed key
+ */
+export async function getApiKeySelf(): Promise<ApiKeySelfInfo> {
+  log.debug('Getting API key self info');
+
+  return await request({
+    method: 'GET',
+    path: '/auth/api-keys/self',
+  });
+}

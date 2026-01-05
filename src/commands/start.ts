@@ -7,6 +7,7 @@ import {
   isConfigured,
   loadConfig,
   getTargets,
+  isManagedKeyMode,
   type ExecConfig,
   DEFAULT_EXEC_CONFIG,
 } from '../lib/config.js';
@@ -157,6 +158,19 @@ Examples:
       if (options.healthPort) {
         console.log(`  Health:      http://0.0.0.0:${options.healthPort}/health`);
         console.log(`  Metrics:     http://0.0.0.0:${options.healthPort}/metrics`);
+      }
+
+      // Auth mode status
+      if (isManagedKeyMode()) {
+        const nextRotation = config.managedKey?.nextRotationAt
+          ? new Date(config.managedKey.nextRotationAt).toLocaleString()
+          : 'unknown';
+        console.log(`  Auth:        ${chalk.cyan('Managed API Key')} (${config.managedKey?.name})`);
+        console.log(`  Key rotates: ${nextRotation}`);
+      } else if (config.auth.apiKey) {
+        console.log(`  Auth:        API Key`);
+      } else {
+        console.log(`  Auth:        Username/Password`);
       }
 
       // Auto-update status
