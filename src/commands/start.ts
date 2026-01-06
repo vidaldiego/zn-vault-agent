@@ -90,6 +90,9 @@ Examples:
             const parsed = parseSecretMapping(mapping);
             if (parsed.literal !== undefined) {
               secrets.push({ env: parsed.envVar, literal: parsed.literal });
+            } else if (parsed.apiKeyName) {
+              // Managed API key reference (api-key:name format)
+              secrets.push({ env: parsed.envVar, apiKey: parsed.apiKeyName });
             } else {
               // Reconstruct the secret reference (with key if present)
               const secretRef = parsed.key
@@ -199,7 +202,14 @@ Examples:
       if (execConfig && execConfig.secrets.length > 0) {
         console.log(chalk.gray('Exec environment variables:'));
         for (const s of execConfig.secrets) {
-          const source = s.literal !== undefined ? 'literal' : s.secret;
+          let source: string;
+          if (s.literal !== undefined) {
+            source = 'literal';
+          } else if (s.apiKey) {
+            source = `api-key:${s.apiKey}`;
+          } else {
+            source = s.secret || '(unknown)';
+          }
           console.log(`  - ${s.env} = ${source}`);
         }
         console.log();
