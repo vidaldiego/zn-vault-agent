@@ -116,12 +116,22 @@ export function createUnifiedWebSocketClient(additionalSecretIds: string[] = [])
   const disconnectHandlers: ((reason: string) => void)[] = [];
   const errorHandlers: ((error: Error) => void)[] = [];
 
-  const MAX_RECONNECT_DELAY = 60000;
-  const HEARTBEAT_INTERVAL = 30000;
+  // Aggressive reconnection settings
+  const MAX_RECONNECT_DELAY = 30000;      // Max 30 seconds between retries
+  const INITIAL_RECONNECT_DELAY = 500;    // Start with 500ms
+  const HEARTBEAT_INTERVAL = 15000;       // Send ping every 15 seconds
+  const PONG_TIMEOUT = 10000;             // Expect pong within 10 seconds
+
+  let lastPongReceived = Date.now();
+  let pongTimeoutTimer: NodeJS.Timeout | null = null;
 
   function getReconnectDelay(): number {
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
-    return delay + Math.random() * 1000;
+    // First retry is immediate (500ms), then exponential backoff
+    if (reconnectAttempts === 0) {
+      return INITIAL_RECONNECT_DELAY;
+    }
+    const delay = Math.min(INITIAL_RECONNECT_DELAY * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
+    return delay + Math.random() * 500; // Smaller jitter
   }
 
   function buildWebSocketUrl(): string {
@@ -164,12 +174,38 @@ export function createUnifiedWebSocketClient(additionalSecretIds: string[] = [])
 
   function startHeartbeat(): void {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (pongTimeoutTimer) clearTimeout(pongTimeoutTimer);
+
+    lastPongReceived = Date.now();
 
     heartbeatTimer = setInterval(() => {
       if (ws?.readyState === WebSocket.OPEN) {
-        // Use protocol ping message
+        // Check if we received a pong since last ping
+        const timeSinceLastPong = Date.now() - lastPongReceived;
+        if (timeSinceLastPong > PONG_TIMEOUT + HEARTBEAT_INTERVAL) {
+          // No pong received for too long - connection is stale
+          log.warn({
+            ws: 'unified',
+            timeSinceLastPong,
+            threshold: PONG_TIMEOUT + HEARTBEAT_INTERVAL
+          }, 'Connection stale - no pong received, forcing reconnect');
+          forceReconnect('pong_timeout');
+          return;
+        }
+
+        // Send ping and start pong timeout
         ws.send(JSON.stringify({ type: 'ping' }));
         log.trace({ ws: 'unified' }, 'Sending heartbeat ping');
+
+        // Set a timeout to check for pong response
+        if (pongTimeoutTimer) clearTimeout(pongTimeoutTimer);
+        pongTimeoutTimer = setTimeout(() => {
+          const elapsed = Date.now() - lastPongReceived;
+          if (elapsed > PONG_TIMEOUT && ws?.readyState === WebSocket.OPEN) {
+            log.warn({ ws: 'unified', elapsed }, 'Pong timeout - forcing reconnect');
+            forceReconnect('pong_timeout');
+          }
+        }, PONG_TIMEOUT);
       }
     }, HEARTBEAT_INTERVAL);
   }
@@ -179,6 +215,28 @@ export function createUnifiedWebSocketClient(additionalSecretIds: string[] = [])
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
     }
+    if (pongTimeoutTimer) {
+      clearTimeout(pongTimeoutTimer);
+      pongTimeoutTimer = null;
+    }
+  }
+
+  function forceReconnect(reason: string): void {
+    log.info({ ws: 'unified', reason }, 'Forcing WebSocket reconnect');
+    stopHeartbeat();
+
+    if (ws) {
+      try {
+        ws.terminate(); // Force close without waiting
+      } catch {
+        // Ignore errors during terminate
+      }
+      ws = null;
+    }
+
+    // Reset reconnect attempts for faster initial retry
+    reconnectAttempts = 0;
+    scheduleReconnect();
   }
 
   function scheduleReconnect(): void {
@@ -209,7 +267,12 @@ export function createUnifiedWebSocketClient(additionalSecretIds: string[] = [])
         break;
 
       case 'pong':
-        log.trace('Received heartbeat pong');
+        lastPongReceived = Date.now();
+        if (pongTimeoutTimer) {
+          clearTimeout(pongTimeoutTimer);
+          pongTimeoutTimer = null;
+        }
+        log.trace({ lastPongReceived }, 'Received heartbeat pong');
         break;
 
       case 'event':
