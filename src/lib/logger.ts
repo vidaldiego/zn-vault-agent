@@ -144,6 +144,7 @@ export const deployLogger = createLogger({ module: 'deployer' });
 export const configLogger = createLogger({ module: 'config' });
 export const metricsLogger = createLogger({ module: 'metrics' });
 export const healthLogger = createLogger({ module: 'health' });
+export const execLogger = createLogger({ module: 'exec' });
 
 /**
  * Flush logs and close file streams

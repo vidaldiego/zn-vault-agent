@@ -2,6 +2,7 @@
 // Shared secret fetching and environment variable building for exec mode
 
 import { getSecret, bindManagedApiKey } from './api.js';
+import { execLogger as log } from './logger.js';
 
 /**
  * Parsed secret mapping from CLI or config
@@ -157,15 +158,33 @@ export async function buildSecretEnv(
 
     // Handle managed API key references
     if (mapping.apiKeyName) {
+      log.debug({ envVar: mapping.envVar, apiKeyName: mapping.apiKeyName }, 'Processing api-key mapping');
+
       let keyValue = apiKeyCache.get(mapping.apiKeyName);
 
       if (!keyValue) {
+        log.debug({ apiKeyName: mapping.apiKeyName }, 'Binding to managed API key');
+
         const bindResponse = await bindManagedApiKey(mapping.apiKeyName);
         keyValue = bindResponse.key;
+
+        log.debug(
+          { apiKeyName: mapping.apiKeyName, hasKey: !!keyValue, prefix: bindResponse.prefix },
+          'Bind response received'
+        );
+
+        // Validate that we got a non-empty key value
+        if (!keyValue) {
+          throw new Error(
+            `Failed to bind managed API key "${mapping.apiKeyName}": Server returned empty key value`
+          );
+        }
+
         apiKeyCache.set(mapping.apiKeyName, keyValue);
       }
 
       env[mapping.envVar] = keyValue;
+      log.debug({ envVar: mapping.envVar, keyPrefix: keyValue.substring(0, 8) }, 'API key mapped to env var');
       continue;
     }
 
