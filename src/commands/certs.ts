@@ -76,7 +76,7 @@ Examples:
   program
     .command('add')
     .description('Add a certificate to sync')
-    .option('-c, --cert <id>', 'Certificate ID')
+    .option('-c, --cert <id>', 'Certificate ID or alias')
     .option('-n, --name <name>', 'Local name for this certificate')
     .option('--combined <path>', 'Path for combined cert+key file (HAProxy)')
     .option('--cert-file <path>', 'Path for certificate file')
@@ -87,31 +87,35 @@ Examples:
     .option('--mode <mode>', 'File permissions (e.g., 0640)')
     .option('--reload-cmd <cmd>', 'Command to reload service')
     .option('--health-cmd <cmd>', 'Health check command after reload')
+    .option('-y, --yes', 'Non-interactive mode (use defaults, skip prompts)')
     .addHelpText('after', `
 Examples:
   # Interactive mode (prompts for all options)
   zn-vault-agent add
 
-  # HAProxy: combined cert+key file
+  # Non-interactive: HAProxy combined cert+key file
   zn-vault-agent add --cert $CERT_ID \\
     --name haproxy-frontend \\
     --combined /etc/haproxy/certs/frontend.pem \\
     --owner haproxy:haproxy --mode 0640 \\
-    --reload-cmd "systemctl reload haproxy"
+    --reload-cmd "systemctl reload haproxy" \\
+    --yes
 
-  # Nginx: separate fullchain and key files
+  # Non-interactive: Nginx separate fullchain and key files
   zn-vault-agent add --cert $CERT_ID \\
     --name nginx-api \\
     --fullchain-file /etc/nginx/ssl/api-fullchain.pem \\
     --key-file /etc/nginx/ssl/api.key \\
-    --reload-cmd "nginx -t && systemctl reload nginx"
+    --reload-cmd "nginx -t && systemctl reload nginx" \\
+    --yes
 
   # With health check
   zn-vault-agent add --cert $CERT_ID \\
     --name app-server \\
     --combined /etc/ssl/app.pem \\
     --reload-cmd "systemctl restart app" \\
-    --health-cmd "curl -sf http://localhost:8080/health"
+    --health-cmd "curl -sf http://localhost:8080/health" \\
+    --yes
 `)
     .action(async (options) => {
       if (!isConfigured()) {
@@ -119,11 +123,19 @@ Examples:
         process.exit(1);
       }
 
+      // Determine if we can run non-interactively
+      const hasOutputPath = options.combined || options.certFile || options.keyFile || options.fullchainFile;
+      const nonInteractive = options.yes && options.cert && hasOutputPath;
+
       // If cert ID not provided, show selection
       let certId = options.cert;
-      let certAlias = '';
 
       if (!certId) {
+        if (options.yes) {
+          console.error(chalk.red('--cert is required in non-interactive mode'));
+          process.exit(1);
+        }
+
         const spinner = ora('Fetching certificates...').start();
         const result = await listCertificates();
         spinner.stop();
@@ -146,7 +158,6 @@ Examples:
         ]);
 
         certId = selectedCert;
-        certAlias = result.items.find(c => c.id === certId)?.alias || '';
       }
 
       // Get certificate details
@@ -154,87 +165,108 @@ Examples:
       const cert = await getCertificate(certId);
       spinner.stop();
 
-      console.log();
-      console.log(chalk.bold('Certificate:'), cert.alias);
-      console.log(chalk.gray(`Subject: ${cert.subjectCn}`));
-      console.log(chalk.gray(`Expires: ${cert.daysUntilExpiry} days`));
-      console.log();
+      if (!nonInteractive) {
+        console.log();
+        console.log(chalk.bold('Certificate:'), cert.alias);
+        console.log(chalk.gray(`Subject: ${cert.subjectCn}`));
+        console.log(chalk.gray(`Expires: ${cert.daysUntilExpiry} days`));
+        console.log();
+      }
 
-      // Gather output configuration
-      const answers = await inquirer.prompt([
-        {
-          type: 'input',
-          name: 'name',
-          message: 'Local name for this target:',
-          default: options.name || cert.alias.replace(/[^a-zA-Z0-9-_]/g, '-'),
-        },
-        {
-          type: 'list',
-          name: 'outputFormat',
-          message: 'Output format:',
-          choices: [
-            { name: 'Combined (cert+key in one file) - for HAProxy', value: 'combined' },
-            { name: 'Separate files (cert, key, chain)', value: 'separate' },
-            { name: 'Custom', value: 'custom' },
-          ],
-        },
-        {
-          type: 'input',
-          name: 'combined',
-          message: 'Combined file path:',
-          when: (ans) => ans.outputFormat === 'combined',
-          default: options.combined || `/etc/ssl/${cert.alias}.pem`,
-        },
-        {
-          type: 'input',
-          name: 'certFile',
-          message: 'Certificate file path:',
-          when: (ans) => ans.outputFormat === 'separate',
-          default: options.certFile || `/etc/ssl/certs/${cert.alias}.crt`,
-        },
-        {
-          type: 'input',
-          name: 'keyFile',
-          message: 'Private key file path:',
-          when: (ans) => ans.outputFormat === 'separate',
-          default: options.keyFile || `/etc/ssl/private/${cert.alias}.key`,
-        },
-        {
-          type: 'input',
-          name: 'chainFile',
-          message: 'CA chain file path (optional):',
-          when: (ans) => ans.outputFormat === 'separate',
-          default: options.chainFile || '',
-        },
-        {
-          type: 'input',
-          name: 'owner',
-          message: 'File ownership (user:group):',
-          default: options.owner || 'root:root',
-        },
-        {
-          type: 'input',
-          name: 'mode',
-          message: 'File permissions:',
-          default: options.mode || '0640',
-        },
-        {
-          type: 'input',
-          name: 'reloadCmd',
-          message: 'Reload command (run after cert update):',
-          default: options.reloadCmd || 'systemctl reload haproxy',
-        },
-        {
-          type: 'input',
-          name: 'healthCmd',
-          message: 'Health check command (optional):',
-          default: options.healthCmd || '',
-        },
-      ]);
+      // In non-interactive mode, use provided options directly
+      let answers: Record<string, string>;
+
+      if (nonInteractive) {
+        // Use defaults and provided options
+        answers = {
+          name: options.name || cert.alias.replace(/[^a-zA-Z0-9-_]/g, '-'),
+          outputFormat: options.combined ? 'combined' : 'separate',
+          combined: options.combined || '',
+          certFile: options.certFile || '',
+          keyFile: options.keyFile || '',
+          chainFile: options.chainFile || '',
+          owner: options.owner || 'root:root',
+          mode: options.mode || '0640',
+          reloadCmd: options.reloadCmd || '',
+          healthCmd: options.healthCmd || '',
+        };
+      } else {
+        // Gather output configuration interactively
+        answers = await inquirer.prompt([
+          {
+            type: 'input',
+            name: 'name',
+            message: 'Local name for this target:',
+            default: options.name || cert.alias.replace(/[^a-zA-Z0-9-_]/g, '-'),
+          },
+          {
+            type: 'list',
+            name: 'outputFormat',
+            message: 'Output format:',
+            choices: [
+              { name: 'Combined (cert+key in one file) - for HAProxy', value: 'combined' },
+              { name: 'Separate files (cert, key, chain)', value: 'separate' },
+              { name: 'Custom', value: 'custom' },
+            ],
+          },
+          {
+            type: 'input',
+            name: 'combined',
+            message: 'Combined file path:',
+            when: (ans) => ans.outputFormat === 'combined',
+            default: options.combined || `/etc/ssl/${cert.alias}.pem`,
+          },
+          {
+            type: 'input',
+            name: 'certFile',
+            message: 'Certificate file path:',
+            when: (ans) => ans.outputFormat === 'separate',
+            default: options.certFile || `/etc/ssl/certs/${cert.alias}.crt`,
+          },
+          {
+            type: 'input',
+            name: 'keyFile',
+            message: 'Private key file path:',
+            when: (ans) => ans.outputFormat === 'separate',
+            default: options.keyFile || `/etc/ssl/private/${cert.alias}.key`,
+          },
+          {
+            type: 'input',
+            name: 'chainFile',
+            message: 'CA chain file path (optional):',
+            when: (ans) => ans.outputFormat === 'separate',
+            default: options.chainFile || '',
+          },
+          {
+            type: 'input',
+            name: 'owner',
+            message: 'File ownership (user:group):',
+            default: options.owner || 'root:root',
+          },
+          {
+            type: 'input',
+            name: 'mode',
+            message: 'File permissions:',
+            default: options.mode || '0640',
+          },
+          {
+            type: 'input',
+            name: 'reloadCmd',
+            message: 'Reload command (run after cert update):',
+            default: options.reloadCmd || 'systemctl reload haproxy',
+          },
+          {
+            type: 'input',
+            name: 'healthCmd',
+            message: 'Health check command (optional):',
+            default: options.healthCmd || '',
+          },
+        ]);
+      }
 
       // Build target configuration
       const target: CertTarget = {
-        certId,
+        certId: cert.id, // Use resolved ID from getCertificate
         name: answers.name,
         outputs: {},
         owner: answers.owner,
@@ -259,8 +291,8 @@ Examples:
         target.outputs.fullchain = options.fullchainFile;
       }
 
-      // Handle custom output
-      if (answers.outputFormat === 'custom') {
+      // Handle custom output (only in interactive mode)
+      if (!nonInteractive && answers.outputFormat === 'custom') {
         const customAnswers = await inquirer.prompt([
           {
             type: 'input',
