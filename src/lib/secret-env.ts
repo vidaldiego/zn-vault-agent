@@ -21,6 +21,7 @@ export interface ExecSecret {
   env: string;
   secret?: string;  // alias:path.key format
   literal?: string; // literal value (no vault fetch)
+  apiKey?: string;  // managed API key name (binds and gets current value)
 }
 
 /**
@@ -113,11 +114,23 @@ export function parseSecretMappingFromConfig(config: ExecSecret): SecretMapping 
     };
   }
 
-  if (!config.secret) {
-    throw new Error(`ExecSecret must have either 'secret' or 'literal' property`);
+  // Handle dedicated apiKey property
+  if (config.apiKey !== undefined) {
+    if (!config.apiKey) {
+      throw new Error(`ExecSecret apiKey cannot be empty`);
+    }
+    return {
+      envVar: config.env,
+      secretId: '',
+      apiKeyName: config.apiKey,
+    };
   }
 
-  // Use the same parsing logic as CLI
+  if (!config.secret) {
+    throw new Error(`ExecSecret must have 'secret', 'literal', or 'apiKey' property`);
+  }
+
+  // Use the same parsing logic as CLI (handles api-key: prefix in secret value)
   return parseSecretMapping(`${config.env}=${config.secret}`);
 }
 

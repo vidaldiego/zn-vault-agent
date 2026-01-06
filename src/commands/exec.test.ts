@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   parseSecretMapping,
+  parseSecretMappingFromConfig,
   buildSecretEnv,
   extractSecretIds,
   extractApiKeyNames,
@@ -460,5 +461,54 @@ describe('Env File Generation', () => {
   it('should handle empty environment', () => {
     const content = generateEnvFile({});
     expect(content).toBe('\n');
+  });
+});
+
+describe('parseSecretMappingFromConfig', () => {
+  describe('secret property', () => {
+    it('should parse secret with alias format', () => {
+      const result = parseSecretMappingFromConfig({ env: 'DB_PASS', secret: 'alias:db/prod.password' });
+      expect(result.envVar).toBe('DB_PASS');
+      expect(result.secretId).toBe('alias:db/prod');
+      expect(result.key).toBe('password');
+    });
+
+    it('should parse secret with api-key prefix', () => {
+      const result = parseSecretMappingFromConfig({ env: 'API_KEY', secret: 'api-key:my-service-key' });
+      expect(result.envVar).toBe('API_KEY');
+      expect(result.secretId).toBe('');
+      expect(result.apiKeyName).toBe('my-service-key');
+    });
+  });
+
+  describe('literal property', () => {
+    it('should parse literal value', () => {
+      const result = parseSecretMappingFromConfig({ env: 'MODE', literal: 'production' });
+      expect(result.envVar).toBe('MODE');
+      expect(result.literal).toBe('production');
+      expect(result.secretId).toBe('');
+    });
+  });
+
+  describe('apiKey property', () => {
+    it('should parse dedicated apiKey property', () => {
+      const result = parseSecretMappingFromConfig({ env: 'VAULT_KEY', apiKey: 'my-managed-key' });
+      expect(result.envVar).toBe('VAULT_KEY');
+      expect(result.secretId).toBe('');
+      expect(result.apiKeyName).toBe('my-managed-key');
+      expect(result.literal).toBeUndefined();
+    });
+
+    it('should throw for empty apiKey', () => {
+      expect(() => parseSecretMappingFromConfig({ env: 'KEY', apiKey: '' }))
+        .toThrow('ExecSecret apiKey cannot be empty');
+    });
+  });
+
+  describe('error handling', () => {
+    it('should throw when no property is set', () => {
+      expect(() => parseSecretMappingFromConfig({ env: 'VAR' }))
+        .toThrow("ExecSecret must have 'secret', 'literal', or 'apiKey' property");
+    });
   });
 });
