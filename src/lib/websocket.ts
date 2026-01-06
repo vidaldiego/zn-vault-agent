@@ -562,10 +562,13 @@ export async function startDaemon(options: {
       }, 500);
     });
 
-    // Start managed key renewal service
-    startManagedKeyRenewal().catch(err => {
+    // Start managed key renewal service and AWAIT initial bind
+    // This ensures the key is rotated BEFORE we connect WebSocket or start child process
+    try {
+      await startManagedKeyRenewal();
+    } catch (err) {
       log.error({ err }, 'Failed to start managed key renewal service');
-    });
+    }
   } else {
     // Use standard API key renewal
     startApiKeyRenewal();

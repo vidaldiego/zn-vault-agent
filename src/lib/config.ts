@@ -438,6 +438,11 @@ export function updateSecretTargetVersion(secretId: string, version: number): vo
 /**
  * Update managed key configuration after bind
  * Stores the new key value and rotation metadata
+ *
+ * IMPORTANT: Also updates process.env.ZNVAULT_API_KEY to ensure that
+ * subsequent calls to loadConfig() return the new key, even if the
+ * agent was started with the env var set (which would otherwise override
+ * the config file value).
  */
 export function updateManagedKey(
   newKey: string,
@@ -465,6 +470,13 @@ export function updateManagedKey(
   config.managedKey.lastBind = new Date().toISOString();
 
   saveConfig(config);
+
+  // CRITICAL: Also update the environment variable so that subsequent
+  // loadConfig() calls return the new key. Without this, if the agent
+  // was started with ZNVAULT_API_KEY env var, loadConfig() would continue
+  // returning the old key even after saveConfig() writes the new one.
+  process.env.ZNVAULT_API_KEY = newKey;
+
   log.info({
     managedKeyName: config.managedKey.name,
     nextRotationAt: metadata.nextRotationAt,
@@ -483,6 +495,9 @@ export function isManagedKeyMode(): boolean {
  * Update API key in config file after rotation
  * This directly modifies the config file without going through loadConfig
  * to avoid environment variable overrides being persisted.
+ *
+ * Also updates process.env.ZNVAULT_API_KEY to ensure subsequent
+ * loadConfig() calls return the new key.
  */
 export function updateApiKey(newKey: string): void {
   let configPath: string;
@@ -500,6 +515,8 @@ export function updateApiKey(newKey: string): void {
     currentConfig.auth = currentConfig.auth || {};
     currentConfig.auth.apiKey = newKey;
     userConfig.store = currentConfig;
+    // Also update env var
+    process.env.ZNVAULT_API_KEY = newKey;
     log.info({ path: userConfig.path }, 'API key updated in user config');
     return;
   }
@@ -515,6 +532,9 @@ export function updateApiKey(newKey: string): void {
     const tempPath = `${configPath}.tmp`;
     fs.writeFileSync(tempPath, JSON.stringify(config, null, 2), { mode: 0o600 });
     fs.renameSync(tempPath, configPath);
+
+    // Also update env var so subsequent loadConfig() calls return new key
+    process.env.ZNVAULT_API_KEY = newKey;
 
     log.info({ path: configPath }, 'API key updated in config file');
   } catch (err) {
