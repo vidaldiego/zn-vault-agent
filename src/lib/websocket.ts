@@ -2,7 +2,13 @@
 // WebSocket client for real-time certificate and secret updates (unified mode)
 
 import WebSocket from 'ws';
+import os from 'node:os';
+import { createRequire } from 'node:module';
 import { loadConfig, type ExecConfig } from './config.js';
+
+// ESM-compatible way to read package.json
+const require = createRequire(import.meta.url);
+const packageJson = require('../../package.json') as { version: string };
 import { deployCertificate, deployAllCertificates } from './deployer.js';
 import { deploySecret, deployAllSecrets, findSecretTarget } from './secret-deployer.js';
 import { wsLogger as log } from './logger.js';
@@ -148,9 +154,9 @@ export function createUnifiedWebSocketClient(additionalSecretIds: string[] = [])
     }
 
     // Hostname for registration
-    const hostname = process.env.HOSTNAME || require('os').hostname();
+    const hostname = process.env.HOSTNAME || os.hostname();
     url.searchParams.set('hostname', hostname);
-    url.searchParams.set('version', require('../../package.json').version || 'unknown');
+    url.searchParams.set('version', packageJson.version || 'unknown');
     url.searchParams.set('platform', process.platform);
 
     return url.toString();
