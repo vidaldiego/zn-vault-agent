@@ -367,11 +367,12 @@ ReadWritePaths=${CONFIG_DIR}
 # Network access
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
-# System call filter
-# Note: @system-service covers most syscalls, but Node.js 18+ requires statx
-# which is not in @system-service. We add it explicitly on the same line.
-SystemCallFilter=@system-service statx
-SystemCallArchitectures=native
+# System call filter - DISABLED
+# Node.js uses syscalls not covered by @system-service (statx, rseq, etc.)
+# and the filtering is too fragile across different Node.js versions.
+# Other security hardening (NoNewPrivileges, ProtectSystem, etc.) still applies.
+# SystemCallFilter=@system-service
+# SystemCallArchitectures=native
 
 # Capabilities
 CapabilityBoundingSet=
