@@ -331,6 +331,8 @@ StartLimitBurst=5
 # Environment
 EnvironmentFile=${CONFIG_DIR}/agent.env
 EnvironmentFile=-${CONFIG_DIR}/secrets.env
+# Set HOME to data directory (required for conf package and Node.js)
+Environment=HOME=${DATA_DIR}
 
 # Logging
 StandardOutput=journal
@@ -356,17 +358,20 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
 
-# Allow writing certificates and logs
+# Allow writing certificates, logs, and config
 ReadWritePaths=${CERT_DIR}
 ReadWritePaths=${DATA_DIR}
 ReadWritePaths=${LOG_DIR}
+ReadWritePaths=${CONFIG_DIR}
 
 # Network access
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 # System call filter
+# Note: @system-service covers most syscalls, but Node.js 18+ requires statx
+# which is not in @system-service. We add it explicitly.
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
+SystemCallFilter=statx
 SystemCallArchitectures=native
 
 # Capabilities

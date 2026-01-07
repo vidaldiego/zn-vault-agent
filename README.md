@@ -827,6 +827,61 @@ sudo chown zn-vault-agent:zn-vault-agent /etc/ssl/znvault/
 # Agent runs as zn-vault-agent user, may need sudo rules
 ```
 
+### API Key Expired or Invalid
+
+If the agent shows "401 Unauthorized" errors, the API key may have expired or been rotated
+while the agent was offline:
+
+```bash
+# Check agent logs for 401 errors
+journalctl -u zn-vault-agent | grep -i "401\|Unauthorized\|RECOVERY REQUIRED"
+
+# Create a new API key (requires admin access to vault)
+znvault api-key create agent-recovery --tenant <tenant> \
+  --permissions "certificate:read:value,certificate:read:metadata,certificate:list"
+
+# Update the agent config with the new key
+sudo jq '.auth.apiKey = "znv_your_new_key_here"' \
+  /etc/zn-vault-agent/config.json > /tmp/config.json && \
+  sudo mv /tmp/config.json /etc/zn-vault-agent/config.json
+
+# Set correct permissions and restart
+sudo chown zn-vault-agent:zn-vault-agent /etc/zn-vault-agent/config.json
+sudo chmod 600 /etc/zn-vault-agent/config.json
+sudo systemctl restart zn-vault-agent
+```
+
+### Syscall Filter Errors (SIGSYS)
+
+If the agent crashes immediately with `signal=SYS` or `status=31`, the systemd syscall filter
+may be too restrictive for your Node.js version (18+):
+
+```bash
+# Check for syscall violations
+dmesg | grep -i seccomp
+journalctl -k | grep audit
+
+# The audit log shows which syscall was blocked (e.g., syscall=330 = statx)
+```
+
+**Fix**: Update the service file to allow the `statx` syscall:
+
+```bash
+# Edit the service file
+sudo systemctl edit zn-vault-agent
+
+# Add this override:
+[Service]
+SystemCallFilter=
+SystemCallFilter=@system-service statx
+```
+
+Or regenerate the service with the latest version:
+
+```bash
+sudo zn-vault-agent setup --force
+```
+
 ## Auto-Update
 
 The agent automatically updates itself via npm. Updates are checked every 5 minutes by default.

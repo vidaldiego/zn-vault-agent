@@ -20,6 +20,7 @@ const FALLBACK_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 let refreshTimer: NodeJS.Timeout | null = null;
 let isRunning = false;
 let currentKey: string | null = null;
+let staleKeyDetected = false;
 
 // Callback for when key changes (used to notify other parts of the system)
 let onKeyChangedCallback: ((newKey: string) => void) | null = null;
@@ -83,7 +84,28 @@ async function refreshManagedKey(): Promise<ManagedApiKeyBindResponse | null> {
 
     return bindResponse;
   } catch (err) {
-    log.error({ err, name: config.managedKey.name }, 'Failed to bind managed key');
+    const error = err as Error & { statusCode?: number };
+
+    // Detect authentication failures - key has expired or been revoked
+    if (error.statusCode === 401 || error.message?.includes('Unauthorized')) {
+      log.error({
+        name: config.managedKey.name,
+        keyPrefix: config.auth.apiKey?.substring(0, 8),
+      }, 'API key authentication failed - key may have expired while agent was offline');
+
+      // Log recovery instructions
+      log.error({}, 'RECOVERY REQUIRED: The stored API key is no longer valid.');
+      log.error({}, 'To recover, create a new API key and update the agent config:');
+      log.error({}, '  1. Create a new API key: znvault api-key create <name> --tenant <tenant> --permissions "certificate:read:value,certificate:read:metadata,certificate:list"');
+      log.error({}, '  2. Update /etc/zn-vault-agent/config.json with the new key');
+      log.error({}, '  3. Restart the agent: sudo systemctl restart zn-vault-agent');
+
+      // Mark as stale key for monitoring
+      staleKeyDetected = true;
+    } else {
+      log.error({ err, name: config.managedKey.name }, 'Failed to bind managed key');
+    }
+
     return null;
   }
 }
@@ -215,6 +237,7 @@ export function stopManagedKeyRenewal(): void {
   }
   isRunning = false;
   currentKey = null;
+  staleKeyDetected = false;
   onKeyChangedCallback = null;
   log.debug('Managed key renewal service stopped');
 }
@@ -241,6 +264,7 @@ export async function forceRefresh(): Promise<ManagedApiKeyBindResponse | null> 
 export function getManagedKeyStatus(): {
   isRunning: boolean;
   isManagedMode: boolean;
+  staleKeyDetected: boolean;
   managedKeyName?: string;
   currentKeyPrefix?: string;
   nextRotationAt?: string;
@@ -250,6 +274,7 @@ export function getManagedKeyStatus(): {
 
   return {
     isRunning,
+    staleKeyDetected,
     isManagedMode: isManagedKeyMode(),
     managedKeyName: config.managedKey?.name,
     currentKeyPrefix: currentKey ? currentKey.substring(0, 8) + '...' : undefined,

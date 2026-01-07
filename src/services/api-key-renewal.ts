@@ -128,7 +128,22 @@ async function checkApiKeyStatus(): Promise<ApiKeyStatus | null> {
     const status = await makeRequest<ApiKeyStatus>('GET', '/auth/api-keys/self');
     return status;
   } catch (err) {
-    log.error({ err }, 'Failed to check API key status');
+    const error = err as Error;
+
+    // Check for authentication failures
+    if (error.message?.includes('401') || error.message?.includes('Unauthorized')) {
+      log.error({
+        keyPrefix: config.auth.apiKey?.substring(0, 8),
+      }, 'API key authentication failed - key may have expired or been revoked');
+
+      log.error({}, 'RECOVERY REQUIRED: The stored API key is no longer valid.');
+      log.error({}, 'To recover, create a new API key and update the agent config:');
+      log.error({}, '  1. Create a new API key: znvault api-key create <name> --tenant <tenant> --permissions "certificate:read:value,certificate:read:metadata,certificate:list"');
+      log.error({}, '  2. Update /etc/zn-vault-agent/config.json with the new key');
+      log.error({}, '  3. Restart the agent: sudo systemctl restart zn-vault-agent');
+    } else {
+      log.error({ err }, 'Failed to check API key status');
+    }
     return null;
   }
 }
