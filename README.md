@@ -18,7 +18,8 @@ Real-time certificate distribution agent for ZN-Vault. Automatically syncs TLS c
 
 ### Exec Mode
 - **Zero-config injection**: Run any command with secrets as environment variables
-- **No file writes**: Secrets exist only in process memory
+- **Secure file mode**: Write secrets to files instead of env vars (prevents log exposure)
+- **No disk persistence**: Secrets stored on tmpfs, never touch disk
 - **Signal forwarding**: Graceful shutdown of child processes
 
 ### Combined Mode (NEW)
@@ -644,7 +645,8 @@ Run the daemon (cert/secret sync) AND manage a child process with injected secre
 zn-vault-agent start \
   --exec "payara start-domain domain1" \
   -s ZINC_CONFIG_USE_VAULT=literal:true \
-  -s ZINC_CONFIG_API_KEY=alias:infra/prod.apiKey \
+  -sf ZINC_CONFIG_API_KEY=api-key:my-managed-key \
+  -sf AWS_SECRET_ACCESS_KEY=alias:infra/prod.awsSecretKey \
   --restart-on-change \
   --health-port 9100
 ```
@@ -658,12 +660,43 @@ zn-vault-agent start \
 - **Signal forwarding** to child process
 - **Crash recovery** with rate limiting
 
+### Secure File Mode (v1.6.8+)
+
+For sensitive secrets, use `-sf` (secret-file) instead of `-s` to prevent credential exposure in logs:
+
+```bash
+# Sensitive secrets via file (recommended for production)
+zn-vault-agent start \
+  --exec "python server.py" \
+  -s CONFIG_ENV=literal:production \
+  -sf API_KEY=api-key:my-key \
+  -sf DB_PASSWORD=alias:db.password \
+  --health-port 9100
+```
+
+**How it works:**
+- Secrets are written to `/run/zn-vault-agent/secrets/<ENV_NAME>` (tmpfs, 0600 permissions)
+- Child receives `ENV_NAME_FILE=/path/to/secret` instead of `ENV_NAME=<secret-value>`
+- Secrets never appear in journald, sudo logs, or `ps aux`
+
+**Auto-detection:**
+```bash
+# Automatically use file mode for vars matching *PASSWORD*, *SECRET*, *API_KEY*, etc.
+zn-vault-agent start \
+  --exec "python server.py" \
+  -s API_KEY=api-key:my-key \
+  --secrets-to-files \
+  --health-port 9100
+```
+
 ### Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--exec <cmd>` | - | Command to execute with secrets |
-| `-s <mapping>` | - | Secret mapping (repeatable) |
+| `-s <mapping>` | - | Secret as env var (visible in logs) |
+| `-sf <mapping>` | - | Secret as file (secure, never in logs) |
+| `--secrets-to-files` | false | Auto-detect sensitive vars for file mode |
 | `--restart-on-change` | true | Restart child on changes |
 | `--restart-delay <ms>` | 5000 | Delay before restart |
 | `--max-restarts <n>` | 10 | Max restarts in window |
