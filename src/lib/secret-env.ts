@@ -3,6 +3,7 @@
 
 import { getSecret, bindManagedApiKey } from './api.js';
 import { execLogger as log } from './logger.js';
+import { getSecretFileManager, initializeSecretFiles } from './secret-file-manager.js';
 
 /**
  * Parsed secret mapping from CLI or config
@@ -23,6 +24,8 @@ export interface ExecSecret {
   secret?: string;  // alias:path.key format
   literal?: string; // literal value (no vault fetch)
   apiKey?: string;  // managed API key name (binds and gets current value)
+  /** If true, write to file instead of env var (avoids sudo logging) */
+  outputToFile?: boolean;
 }
 
 /**
@@ -239,4 +242,153 @@ export function extractApiKeyNames(mappings: (SecretMapping & { literal?: string
     }
   }
   return Array.from(names);
+}
+
+/**
+ * Result of building secret files
+ */
+export interface SecretFilesResult {
+  /** Environment variables to set (non-sensitive + file path pointers) */
+  env: Record<string, string>;
+  /** Paths to secret files that were written */
+  files: string[];
+  /** Secrets directory path */
+  secretsDir: string;
+}
+
+/**
+ * Fetch secrets and write to secure files instead of env vars
+ *
+ * This avoids secrets appearing in:
+ * - Process command line arguments
+ * - sudo logs (when using --preserve-env)
+ * - systemd journal
+ *
+ * For each secret with outputToFile=true:
+ * - Writes value to /run/zn-vault-agent/secrets/<ENV_NAME>
+ * - Sets <ENV_NAME>_FILE=/run/zn-vault-agent/secrets/<ENV_NAME> in env
+ *
+ * For secrets with outputToFile=false (default):
+ * - Sets <ENV_NAME>=<value> in env (traditional behavior)
+ */
+export async function buildSecretEnvWithFiles(
+  mappings: (SecretMapping & { literal?: string; outputToFile?: boolean })[]
+): Promise<SecretFilesResult> {
+  const env: Record<string, string> = {};
+  const files: string[] = [];
+
+  // Initialize secret file manager
+  const manager = await initializeSecretFiles();
+  const secretsDir = manager.getSecretsDir();
+
+  // Set the secrets directory env var for child process
+  env.ZNVAULT_SECRETS_DIR = secretsDir;
+
+  // Group by secretId to minimize API calls
+  const secretCache = new Map<string, Record<string, unknown>>();
+  // Cache API key bindings by name
+  const apiKeyCache = new Map<string, string>();
+
+  for (const mapping of mappings) {
+    let value: string;
+
+    // Handle literal values
+    if (mapping.literal !== undefined) {
+      value = mapping.literal;
+    }
+    // Handle managed API key references
+    else if (mapping.apiKeyName) {
+      log.debug({ envVar: mapping.envVar, apiKeyName: mapping.apiKeyName }, 'Processing api-key mapping');
+
+      let keyValue = apiKeyCache.get(mapping.apiKeyName);
+
+      if (!keyValue) {
+        log.debug({ apiKeyName: mapping.apiKeyName }, 'Binding to managed API key');
+        const bindResponse = await bindManagedApiKey(mapping.apiKeyName);
+        keyValue = bindResponse.key;
+
+        if (!keyValue) {
+          throw new Error(
+            `Failed to bind managed API key "${mapping.apiKeyName}": Server returned empty key value`
+          );
+        }
+
+        apiKeyCache.set(mapping.apiKeyName, keyValue);
+      }
+
+      value = keyValue;
+    }
+    // Handle vault secrets
+    else if (mapping.secretId) {
+      let data = secretCache.get(mapping.secretId);
+
+      if (!data) {
+        const secret = await getSecret(mapping.secretId);
+        data = secret.data;
+        secretCache.set(mapping.secretId, data);
+      }
+
+      if (mapping.key) {
+        const keyValue = data[mapping.key];
+        if (keyValue === undefined) {
+          throw new Error(`Key "${mapping.key}" not found in secret "${mapping.secretId}"`);
+        }
+        value = typeof keyValue === 'string' ? keyValue : JSON.stringify(keyValue);
+      } else {
+        value = JSON.stringify(data);
+      }
+    } else {
+      throw new Error(`Invalid mapping for ${mapping.envVar}: no source specified`);
+    }
+
+    // Decide whether to write to file or env var
+    if (mapping.outputToFile) {
+      // Write to file, set *_FILE env var
+      const filePath = await manager.writeSecret(mapping.envVar, value);
+      files.push(filePath);
+      env[`${mapping.envVar}_FILE`] = filePath;
+      log.debug(
+        { envVar: mapping.envVar, filePath },
+        'Wrote secret to file (avoiding env var exposure)'
+      );
+    } else {
+      // Traditional: set env var directly
+      env[mapping.envVar] = value;
+    }
+  }
+
+  return { env, files, secretsDir };
+}
+
+/**
+ * Mark specific environment variable names as requiring file output
+ * These are typically sensitive values that shouldn't appear in logs
+ */
+export const SENSITIVE_ENV_VARS = new Set([
+  'ZINC_CONFIG_VAULT_API_KEY',
+  'AWS_SECRET_ACCESS_KEY',
+  'DATABASE_PASSWORD',
+  'API_KEY',
+  'SECRET_KEY',
+  'PRIVATE_KEY',
+]);
+
+/**
+ * Check if an environment variable name is considered sensitive
+ */
+export function isSensitiveEnvVar(name: string): boolean {
+  // Check exact match
+  if (SENSITIVE_ENV_VARS.has(name)) return true;
+
+  // Check common patterns
+  const lowerName = name.toLowerCase();
+  return (
+    lowerName.includes('password') ||
+    lowerName.includes('secret') ||
+    lowerName.includes('api_key') ||
+    lowerName.includes('apikey') ||
+    lowerName.includes('private_key') ||
+    lowerName.includes('token') ||
+    lowerName.includes('credential')
+  );
 }

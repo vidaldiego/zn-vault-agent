@@ -15,7 +15,7 @@ import { validateConfig, formatValidationResult } from '../lib/validation.js';
 import { startDaemon } from '../lib/websocket.js';
 import { logger } from '../lib/logger.js';
 import { NpmAutoUpdateService, loadUpdateConfig } from '../services/npm-auto-update.js';
-import { parseSecretMapping, type ExecSecret } from '../lib/secret-env.js';
+import { parseSecretMapping, isSensitiveEnvVar, type ExecSecret } from '../lib/secret-env.js';
 
 // Helper to collect repeatable options
 function collect(value: string, previous: string[]): string[] {
@@ -35,6 +35,8 @@ export function registerStartCommand(program: Command): void {
     // Exec mode options
     .option('--exec <command>', 'Command to execute with secrets (combined mode)')
     .option('-s, --secret <mapping>', 'Secret mapping for exec (ENV=secret, repeatable)', collect, [])
+    .option('-sf, --secret-file <mapping>', 'Secret written to file instead of env var (ENV=secret, repeatable)', collect, [])
+    .option('--secrets-to-files', 'Auto-detect sensitive secrets and write to files instead of env vars')
     .option('--restart-on-change', 'Restart child on cert/secret changes (default: true)')
     .option('--no-restart-on-change', 'Do not restart child on cert/secret changes')
     .option('--restart-delay <ms>', 'Delay in ms before restarting child (default: 5000)', parseInt)
@@ -64,6 +66,23 @@ Examples:
     -s ZINC_CONFIG_API_KEY=alias:infra/prod.apiKey \\
     --health-port 9100
 
+  # SECURE MODE: Write sensitive secrets to files instead of env vars
+  # This prevents secrets from appearing in sudo logs or journald
+  zn-vault-agent start \\
+    --exec "python server.py" \\
+    -s ZINC_CONFIG_USE_VAULT=literal:true \\
+    -sf ZINC_CONFIG_VAULT_API_KEY=api-key:my-key \\
+    -sf AWS_SECRET_ACCESS_KEY=alias:aws.secretKey \\
+    --health-port 9100
+
+  # Auto-detect sensitive secrets and write to files
+  zn-vault-agent start \\
+    --exec "python server.py" \\
+    -s ZINC_CONFIG_USE_VAULT=literal:true \\
+    -s ZINC_CONFIG_VAULT_API_KEY=api-key:my-key \\
+    --secrets-to-files \\
+    --health-port 9100
+
   # Production setup (systemd)
   # See docs/GUIDE.md for systemd service file
 `)
@@ -83,25 +102,44 @@ Examples:
       if (options.exec) {
         // CLI options take precedence
         const secrets: ExecSecret[] = [];
+        const autoFileMode = options.secretsToFiles === true;
 
-        // Parse -s/--secret mappings
+        // Helper to create ExecSecret from parsed mapping
+        const createExecSecret = (mapping: string, forceFile: boolean): ExecSecret => {
+          const parsed = parseSecretMapping(mapping);
+          const shouldOutputToFile = forceFile || (autoFileMode && isSensitiveEnvVar(parsed.envVar));
+
+          if (parsed.literal !== undefined) {
+            return { env: parsed.envVar, literal: parsed.literal, outputToFile: shouldOutputToFile };
+          } else if (parsed.apiKeyName) {
+            // Managed API key reference (api-key:name format)
+            return { env: parsed.envVar, apiKey: parsed.apiKeyName, outputToFile: shouldOutputToFile };
+          } else {
+            // Reconstruct the secret reference (with key if present)
+            const secretRef = parsed.key
+              ? `${parsed.secretId}.${parsed.key}`
+              : parsed.secretId;
+            return { env: parsed.envVar, secret: secretRef, outputToFile: shouldOutputToFile };
+          }
+        };
+
+        // Parse -s/--secret mappings (env vars by default, or files if --secrets-to-files)
         for (const mapping of options.secret as string[]) {
           try {
-            const parsed = parseSecretMapping(mapping);
-            if (parsed.literal !== undefined) {
-              secrets.push({ env: parsed.envVar, literal: parsed.literal });
-            } else if (parsed.apiKeyName) {
-              // Managed API key reference (api-key:name format)
-              secrets.push({ env: parsed.envVar, apiKey: parsed.apiKeyName });
-            } else {
-              // Reconstruct the secret reference (with key if present)
-              const secretRef = parsed.key
-                ? `${parsed.secretId}.${parsed.key}`
-                : parsed.secretId;
-              secrets.push({ env: parsed.envVar, secret: secretRef });
-            }
+            secrets.push(createExecSecret(mapping, false));
           } catch (err) {
             console.error(chalk.red('Invalid secret mapping:'), mapping);
+            console.error(err instanceof Error ? err.message : String(err));
+            process.exit(1);
+          }
+        }
+
+        // Parse -sf/--secret-file mappings (always write to files)
+        for (const mapping of options.secretFile as string[]) {
+          try {
+            secrets.push(createExecSecret(mapping, true));
+          } catch (err) {
+            console.error(chalk.red('Invalid secret-file mapping:'), mapping);
             console.error(err instanceof Error ? err.message : String(err));
             process.exit(1);
           }
@@ -200,19 +238,40 @@ Examples:
       }
 
       if (execConfig && execConfig.secrets.length > 0) {
-        console.log(chalk.gray('Exec environment variables:'));
-        for (const s of execConfig.secrets) {
-          let source: string;
-          if (s.literal !== undefined) {
-            source = 'literal';
-          } else if (s.apiKey) {
-            source = `api-key:${s.apiKey}`;
-          } else {
-            source = s.secret || '(unknown)';
+        const fileSecrets = execConfig.secrets.filter(s => s.outputToFile);
+        const envSecrets = execConfig.secrets.filter(s => !s.outputToFile);
+
+        if (envSecrets.length > 0) {
+          console.log(chalk.gray('Exec environment variables:'));
+          for (const s of envSecrets) {
+            let source: string;
+            if (s.literal !== undefined) {
+              source = 'literal';
+            } else if (s.apiKey) {
+              source = `api-key:${s.apiKey}`;
+            } else {
+              source = s.secret || '(unknown)';
+            }
+            console.log(`  - ${s.env} = ${source}`);
           }
-          console.log(`  - ${s.env} = ${source}`);
+          console.log();
         }
-        console.log();
+
+        if (fileSecrets.length > 0) {
+          console.log(chalk.gray('Exec secrets (written to files for security):'));
+          for (const s of fileSecrets) {
+            let source: string;
+            if (s.literal !== undefined) {
+              source = 'literal';
+            } else if (s.apiKey) {
+              source = `api-key:${s.apiKey}`;
+            } else {
+              source = s.secret || '(unknown)';
+            }
+            console.log(`  - ${s.env}_FILE = ${source} ${chalk.green('(secure)')}`);
+          }
+          console.log();
+        }
       }
 
       console.log(chalk.gray('Starting daemon...'));

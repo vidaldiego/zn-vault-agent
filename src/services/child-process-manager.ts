@@ -8,8 +8,10 @@ import { logger } from '../lib/logger.js';
 import {
   parseSecretMappingFromConfig,
   buildSecretEnv,
+  buildSecretEnvWithFiles,
   type SecretMapping,
 } from '../lib/secret-env.js';
+import { getSecretFileManager } from '../lib/secret-file-manager.js';
 import { type ExecConfig, DEFAULT_EXEC_CONFIG } from '../lib/config.js';
 
 const log = logger.child({ module: 'child-process-manager' });
@@ -56,7 +58,8 @@ export interface ChildProcessManagerEvents {
 export class ChildProcessManager extends EventEmitter {
   private child: ChildProcess | null = null;
   private readonly config: Required<Omit<ExecConfig, 'command' | 'secrets'>> & Pick<ExecConfig, 'command' | 'secrets'>;
-  private readonly mappings: (SecretMapping & { literal?: string })[];
+  private readonly mappings: (SecretMapping & { literal?: string; outputToFile?: boolean })[];
+  private readonly useFileMode: boolean;
   private isShuttingDown = false;
   private restartCount = 0;
   private restartWindowStart = 0;
@@ -77,14 +80,25 @@ export class ChildProcessManager extends EventEmitter {
       ...execConfig,
     };
 
-    // Parse secret mappings from config format
-    this.mappings = this.config.secrets.map(parseSecretMappingFromConfig);
+    // Parse secret mappings from config format, preserving outputToFile flag
+    this.mappings = this.config.secrets.map(secret => {
+      const parsed = parseSecretMappingFromConfig(secret);
+      return {
+        ...parsed,
+        outputToFile: secret.outputToFile,
+      };
+    });
+
+    // Check if any secrets should be written to files
+    this.useFileMode = this.mappings.some(m => m.outputToFile);
 
     log.debug(
       {
         command: this.config.command,
         secretCount: this.config.secrets.length,
         restartOnChange: this.config.restartOnChange,
+        useFileMode: this.useFileMode,
+        fileSecrets: this.mappings.filter(m => m.outputToFile).map(m => m.envVar),
       },
       'ChildProcessManager initialized'
     );
@@ -105,11 +119,29 @@ export class ChildProcessManager extends EventEmitter {
     }
 
     this.status = 'starting';
-    log.info({ command: this.config.command.join(' ') }, 'Starting child process');
+    log.info({ command: this.config.command.join(' '), useFileMode: this.useFileMode }, 'Starting child process');
 
     try {
       // Fetch secrets and build environment
-      const secretEnv = await buildSecretEnv(this.mappings);
+      // Use file mode if any secrets are marked for file output
+      let secretEnv: Record<string, string>;
+
+      if (this.useFileMode) {
+        const result = await buildSecretEnvWithFiles(this.mappings);
+        secretEnv = result.env;
+        log.info(
+          {
+            secretsDir: result.secretsDir,
+            filesWritten: result.files.length,
+            envVars: Object.keys(result.env).filter(k => !k.endsWith('_FILE')).length,
+            fileVars: Object.keys(result.env).filter(k => k.endsWith('_FILE')).length,
+          },
+          'Secrets prepared (file mode enabled for sensitive values)'
+        );
+      } else {
+        secretEnv = await buildSecretEnv(this.mappings);
+      }
+
       const env = this.config.inheritEnv
         ? { ...process.env, ...secretEnv }
         : secretEnv;
@@ -153,6 +185,17 @@ export class ChildProcessManager extends EventEmitter {
 
     // Remove signal handlers
     this.cleanupSignalHandlers();
+
+    // Clean up secret files if we were using file mode
+    if (this.useFileMode) {
+      try {
+        const manager = getSecretFileManager();
+        await manager.cleanup();
+        log.debug('Cleaned up secret files');
+      } catch (err) {
+        log.warn({ err }, 'Failed to cleanup secret files');
+      }
+    }
 
     if (!this.child) {
       this.status = 'stopped';
