@@ -854,32 +854,34 @@ sudo systemctl restart zn-vault-agent
 ### Syscall Filter Errors (SIGSYS)
 
 If the agent crashes immediately with `signal=SYS` or `status=31`, the systemd syscall filter
-may be too restrictive for your Node.js version (18+):
+may be too restrictive for your Node.js version.
+
+> **Note**: v1.6.12+ disables SystemCallFilter by default. Upgrade to fix this issue:
+> ```bash
+> sudo npm install -g @zincapp/zn-vault-agent@latest
+> sudo cp /usr/lib/node_modules/@zincapp/zn-vault-agent/deploy/systemd/zn-vault-agent.service /etc/systemd/system/
+> sudo systemctl daemon-reload
+> sudo systemctl restart zn-vault-agent
+> ```
+
+**For older versions**, disable the syscall filter manually:
 
 ```bash
 # Check for syscall violations
 dmesg | grep -i seccomp
 journalctl -k | grep audit
 
-# The audit log shows which syscall was blocked (e.g., syscall=330 = statx)
-```
-
-**Fix**: Update the service file to allow the `statx` syscall:
-
-```bash
-# Edit the service file
+# Edit the service file to disable syscall filtering
 sudo systemctl edit zn-vault-agent
 
 # Add this override:
 [Service]
 SystemCallFilter=
-SystemCallFilter=@system-service statx
-```
+SystemCallArchitectures=
 
-Or regenerate the service with the latest version:
-
-```bash
-sudo zn-vault-agent setup --force
+# Reload and restart
+sudo systemctl daemon-reload
+sudo systemctl restart zn-vault-agent
 ```
 
 ## Auto-Update
