@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
+import { readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { registerLoginCommand } from './commands/login.js';
 import { registerCertsCommands } from './commands/certs.js';
 import { registerSecretsCommands } from './commands/secrets.js';
@@ -10,9 +13,19 @@ import { registerStatusCommand } from './commands/status.js';
 import { registerExecCommand } from './commands/exec.js';
 import { registerSetupCommand } from './commands/setup.js';
 
-// Version injected at build time by esbuild
-declare const __VERSION__: string;
-const version = typeof __VERSION__ !== 'undefined' ? __VERSION__ : '0.0.0-dev';
+// Read version from package.json at runtime
+function getVersion(): string {
+  try {
+    const __dirname = dirname(fileURLToPath(import.meta.url));
+    // Try dist/../package.json first (installed via npm)
+    const pkgPath = join(__dirname, '..', 'package.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+    return pkg.version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+const version = getVersion();
 
 const program = new Command();
 
