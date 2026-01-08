@@ -322,6 +322,82 @@ Key B                     ██████████████████
 | Coordination | Single agent | Multiple agents can share |
 | Expiration Handling | Agent must self-rotate | Vault handles expiration |
 
+#### Key Persistence & Recovery
+
+When using managed keys, the agent automatically persists new keys to the config file after each rotation. This ensures seamless recovery after restarts:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     AGENT RESTART RECOVERY FLOW                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+1. SYSTEMD STARTS AGENT
+   └── Reads /etc/zn-vault-agent/config.json
+       └── Contains: auth.apiKey + managedKey.name
+
+2. BIND TO MANAGED KEY
+   │   POST /auth/api-keys/managed/{name}/bind
+   │   Auth: Bearer <stored-api-key>
+   │   └── Returns current valid key (same or rotated)
+   │
+   ▼
+3. UPDATE CONFIG (if key changed)
+   │   config.json: auth.apiKey = <new-key>
+   │
+   ▼
+4. SYNC CERTIFICATES & SECRETS
+   │   Compare fingerprints/versions, sync if changed
+   │
+   ▼
+5. START CHILD PROCESS (if exec mode)
+   │   Inject secrets as env vars or files
+   │
+   ▼
+6. CONNECT WEBSOCKET
+   │   Subscribe to real-time rotation events
+   │
+   ▼
+7. SCHEDULE NEXT REFRESH
+       ├── Proactive: 30s before nextRotationAt
+       └── Safety poll: 50% into grace period
+```
+
+**What's stored in config.json:**
+
+```json
+{
+  "auth": {
+    "apiKey": "znv_current_valid_key..."   // Actual key value (updated on rotation)
+  },
+  "managedKey": {
+    "name": "my-service-key",              // Key name (never changes)
+    "rotationMode": "scheduled",
+    "nextRotationAt": "2026-01-08T20:00:00Z"
+  }
+}
+```
+
+**Recovery scenarios:**
+
+| Scenario | Behavior |
+|----------|----------|
+| Normal restart | Binds with stored key, gets current key, continues |
+| Restart after rotation | Stored key still valid (grace period), gets new key |
+| Restart after grace expired | Stored key is the new key (was persisted), works |
+| Vault unreachable | Uses cached certs/secrets, retries bind with backoff |
+
+**Log output during restart recovery:**
+```json
+{"level":"info","msg":"Starting ZN-Vault Agent"}
+{"level":"info","msg":"Using managed API key mode"}
+{"level":"info","msg":"Binding to managed key","name":"my-service-key"}
+{"level":"info","msg":"Managed key bound","prefix":"znv_abc1","nextRotationAt":"2026-01-08T20:00:00Z"}
+{"level":"info","msg":"WebSocket connected"}
+{"level":"info","msg":"Managed key refresh scheduled","refreshInMinutes":55}
+```
+
+The agent is **stateless** - it can restart at any time and recover automatically by binding to get the current valid key.
+
 ### Password Authentication (Development Only)
 
 Password auth stores credentials in the config file. **Not recommended for production.**
