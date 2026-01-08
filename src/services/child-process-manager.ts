@@ -57,7 +57,7 @@ export interface ChildProcessManagerEvents {
  */
 export class ChildProcessManager extends EventEmitter {
   private child: ChildProcess | null = null;
-  private readonly config: Required<Omit<ExecConfig, 'command' | 'secrets'>> & Pick<ExecConfig, 'command' | 'secrets'>;
+  private readonly config: Required<Omit<ExecConfig, 'command' | 'secrets' | 'envFile'>> & Pick<ExecConfig, 'command' | 'secrets' | 'envFile'>;
   private readonly mappings: (SecretMapping & { literal?: string; outputToFile?: boolean })[];
   private readonly useFileMode: boolean;
   private isShuttingDown = false;

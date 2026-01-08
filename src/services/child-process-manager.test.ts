@@ -70,6 +70,7 @@ describe('ChildProcessManager', () => {
     restartDelayMs: 100,
     maxRestarts: 3,
     restartWindowMs: 60000,
+    envFile: '/tmp/secrets.env',
   };
 
   beforeEach(() => {

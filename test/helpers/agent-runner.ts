@@ -189,6 +189,43 @@ export class AgentRunner {
   }
 
   /**
+   * Login with a managed API key (stores managed key metadata in config)
+   */
+  async loginWithManagedKey(opts: {
+    url: string;
+    tenantId: string;
+    apiKey: string;
+    managedKeyName: string;
+    insecure?: boolean;
+    skipTest?: boolean;
+  }): Promise<AgentRunResult> {
+    // First do a regular login with the API key
+    const result = await this.login({
+      url: opts.url,
+      tenantId: opts.tenantId,
+      apiKey: opts.apiKey,
+      insecure: opts.insecure,
+      skipTest: opts.skipTest,
+    });
+
+    if (result.exitCode !== 0) {
+      return result;
+    }
+
+    // Now update the config to add managed key metadata
+    const config = this.readConfig();
+    if (config) {
+      (config as AgentConfig & { managedKey?: { name: string; rotationMode?: string } }).managedKey = {
+        name: opts.managedKeyName,
+        rotationMode: 'scheduled',  // Default
+      };
+      this.writeConfig(config);
+    }
+
+    return result;
+  }
+
+  /**
    * Add certificate target
    */
   async addCertificate(opts: {
@@ -203,14 +240,31 @@ export class AgentRunner {
   }): Promise<AgentRunResult> {
     const args = [
       'add',
-      '--cert-id', opts.certId,
+      '--cert', opts.certId,
       '--name', opts.name,
-      '--output', opts.output,
+      '--yes',  // Non-interactive mode
     ];
 
-    if (opts.format) {
-      args.push('--format', opts.format);
+    // Use format-specific output options (default to combined)
+    const format = opts.format || 'combined';
+    switch (format) {
+      case 'combined':
+        args.push('--combined', opts.output);
+        break;
+      case 'cert':
+        args.push('--cert-file', opts.output);
+        break;
+      case 'key':
+        args.push('--key-file', opts.output);
+        break;
+      case 'chain':
+        args.push('--chain-file', opts.output);
+        break;
+      case 'fullchain':
+        args.push('--fullchain-file', opts.output);
+        break;
     }
+
     if (opts.owner) {
       args.push('--owner', opts.owner);
     }
@@ -221,7 +275,7 @@ export class AgentRunner {
       args.push('--reload-cmd', opts.reloadCmd);
     }
     if (opts.healthCheckCmd) {
-      args.push('--health-check-cmd', opts.healthCheckCmd);
+      args.push('--health-cmd', opts.healthCheckCmd);
     }
 
     return this.run(args);
@@ -399,12 +453,9 @@ export class AgentRunner {
 
     const args = ['start'];
     args.push('--health-port', String(healthPort));
-    if (opts?.metricsEnabled) {
-      args.push('--metrics');
-    }
-    if (opts?.pollInterval) {
-      args.push('--poll-interval', String(opts.pollInterval));
-    }
+    // Note: --metrics and --poll-interval flags don't exist in the CLI
+    // Metrics are enabled by default when --health-port is set
+    // Poll interval is configured via config file, not CLI flag
 
     // Combined mode options
     if (opts?.exec) {
@@ -442,7 +493,23 @@ export class AgentRunner {
       detached: false,
     });
 
-    // Note: We always specify a port now, so no need for dynamic detection
+    // Capture stdout/stderr for debugging on failure
+    let stdout = '';
+    let stderr = '';
+    proc.stdout?.on('data', (data) => {
+      stdout += data.toString();
+    });
+    proc.stderr?.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    // Track if process has exited
+    let exitCode: number | null = null;
+    let exitSignal: string | null = null;
+    proc.on('exit', (code, signal) => {
+      exitCode = code;
+      exitSignal = signal as string | null;
+    });
 
     const stop = async (): Promise<void> => {
       return new Promise((resolve) => {
@@ -460,10 +527,21 @@ export class AgentRunner {
 
     const waitForReady = async (): Promise<void> => {
       // Wait for health endpoint to respond
-      // Poll every 200ms for up to 10 seconds (50 attempts)
-      const maxAttempts = 50;
-      const pollInterval = 200;
+      // Poll every 250ms for up to 30 seconds (120 attempts)
+      const maxAttempts = 120;
+      const pollInterval = 250;
       for (let i = 0; i < maxAttempts; i++) {
+        // Check if process has exited early
+        if (exitCode !== null) {
+          const lastStderr = stderr.slice(-1000);
+          const lastStdout = stdout.slice(-1000);
+          throw new Error(
+            `Daemon process exited with code ${exitCode} (signal: ${exitSignal}) before becoming ready.\n` +
+            `Last stderr: ${lastStderr}\n` +
+            `Last stdout: ${lastStdout}`
+          );
+        }
+
         try {
           const response = await fetch(`http://127.0.0.1:${healthPort}/health`);
           if (response.ok) {
@@ -474,7 +552,14 @@ export class AgentRunner {
         }
         await new Promise((resolve) => setTimeout(resolve, pollInterval));
       }
-      throw new Error(`Daemon not ready after ${(maxAttempts * pollInterval) / 1000} seconds (port ${healthPort})`);
+
+      // On timeout, include daemon output for debugging
+      const lastStderr = stderr.slice(-500);
+      throw new Error(
+        `Daemon not ready after ${(maxAttempts * pollInterval) / 1000} seconds (port ${healthPort}).\n` +
+        `Process alive: ${exitCode === null}\n` +
+        `Last stderr: ${lastStderr}`
+      );
     };
 
     return {

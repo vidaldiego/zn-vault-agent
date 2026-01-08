@@ -626,13 +626,31 @@ zn-vault-agent exec \
 ### Export to File
 
 ```bash
-# Write secrets to env file (without running a command)
+# Write secrets to env file (one-shot)
 zn-vault-agent exec \
   -s DB_PASSWORD=alias:db/prod.password \
   -s VAULT_KEY=api-key:my-key \
   -s ENV=literal:prod \
   -o /tmp/secrets.env
 ```
+
+### Watch Mode
+
+Keep the env file updated when secrets or managed API keys rotate:
+
+```bash
+# Export to file and watch for changes (daemon mode)
+zn-vault-agent exec \
+  -s VAULT_API_KEY=api-key:my-rotating-key \
+  -s DB_PASSWORD=alias:db/prod.password \
+  --output /tmp/secrets.env --watch
+```
+
+The agent will:
+1. Write initial secrets to the env file
+2. Connect via WebSocket for rotation events
+3. Update the env file when subscribed secrets/keys rotate
+4. Run indefinitely until stopped (SIGTERM/SIGINT)
 
 ## Combined Mode
 

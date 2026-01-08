@@ -588,7 +588,7 @@ ENV_VAR=secret-id[.key]
 Generate an env file without running a command:
 
 ```bash
-# Export to file
+# Export to file (one-shot)
 zn-vault-agent exec \
   -s DB_HOST=alias:database/prod.host \
   -s DB_PASSWORD=alias:database/prod.password \
@@ -598,6 +598,29 @@ zn-vault-agent exec \
 source /tmp/db.env
 ./my-script.sh
 ```
+
+### Watch Mode (Continuous Updates)
+
+Use `--watch` with `--output` to keep the env file updated when secrets or managed API keys rotate:
+
+```bash
+# Export to file and watch for changes (daemon mode)
+zn-vault-agent exec \
+  -s VAULT_API_KEY=api-key:my-rotating-key \
+  -s DB_PASSWORD=alias:database/prod.password \
+  --output /tmp/secrets.env --watch
+```
+
+This is especially useful for:
+- **Managed API keys** with auto-rotation (on-bind, on-use, scheduled modes)
+- **Secrets** that may be updated while your application runs
+- **Sidecar patterns** where another process reads the env file
+
+The agent will:
+1. Write initial secrets to the env file
+2. Connect to vault via WebSocket
+3. Update the env file when subscribed secrets/keys rotate
+4. Run indefinitely until stopped (SIGTERM/SIGINT)
 
 ### Environment Inheritance
 
@@ -720,7 +743,9 @@ zn-vault-agent start \
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--exec <command>` | - | Command to execute with secrets |
-| `-s, --secret <mapping>` | - | Secret mapping (repeatable) |
+| `-s, --secret <mapping>` | - | Secret mapping as env var (repeatable) |
+| `-sf, --secret-file <mapping>` | - | Secret written to file instead of env var (repeatable) |
+| `--secrets-to-files` | `false` | Auto-detect sensitive secrets and write to files |
 | `--restart-on-change` | `true` | Restart child on cert/secret changes |
 | `--no-restart-on-change` | - | Don't restart on changes |
 | `--restart-delay <ms>` | `5000` | Delay before restart (milliseconds) |
@@ -740,6 +765,58 @@ ENV_VAR=uuid.key
 | `literal` | `USE_VAULT=literal:true` | Literal string value |
 | `alias` | `API_KEY=alias:db/prod.apiKey` | Vault secret by alias |
 | UUID | `PASS=abc123.password` | Vault secret by UUID |
+| `api-key` | `KEY=api-key:my-rotating-key` | Managed API key value |
+
+### Secure Mode: Secrets to Files
+
+For security-sensitive deployments, secrets can be written to files instead of environment variables. This prevents secrets from appearing in:
+- `/proc/<pid>/environ` (readable by same user)
+- `sudo` command logs
+- `journald` logs when using systemd
+- Process listings (`ps auxe`)
+
+**Use `-sf` for explicit file-based secrets:**
+
+```bash
+zn-vault-agent start \
+  --exec "python server.py" \
+  -s ZINC_CONFIG_USE_VAULT=literal:true \
+  -sf VAULT_API_KEY=api-key:my-key \
+  -sf AWS_SECRET_ACCESS_KEY=alias:aws.secretKey \
+  --health-port 9100
+```
+
+The agent will:
+1. Create temporary files with `0600` permissions
+2. Set `VAULT_API_KEY_FILE` and `AWS_SECRET_ACCESS_KEY_FILE` env vars pointing to the files
+3. Your application reads secrets from the file paths
+
+**Use `--secrets-to-files` for automatic detection:**
+
+```bash
+zn-vault-agent start \
+  --exec "python server.py" \
+  -s ZINC_CONFIG_USE_VAULT=literal:true \
+  -s VAULT_API_KEY=api-key:my-key \
+  -s AWS_SECRET_ACCESS_KEY=alias:aws.secretKey \
+  --secrets-to-files \
+  --health-port 9100
+```
+
+This automatically detects sensitive env var names (containing `KEY`, `SECRET`, `PASSWORD`, `TOKEN`, etc.) and writes them to files.
+
+**Config file format for file-based secrets:**
+
+```json
+{
+  "exec": {
+    "secrets": [
+      { "env": "VAULT_API_KEY", "apiKey": "my-key", "outputToFile": true },
+      { "env": "AWS_SECRET", "secret": "alias:aws.secretKey", "outputToFile": true }
+    ]
+  }
+}
+```
 
 ### Config File
 

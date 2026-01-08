@@ -48,8 +48,8 @@ describe('Managed API Keys', () => {
       ],
       tenantId: TEST_ENV.tenantId,
       rotationMode: 'on-bind',
-      rotationInterval: '10s',  // 10 seconds for fast testing
-      gracePeriod: '5s',        // 5 seconds grace period
+      rotationInterval: '60s',  // Minimum allowed rotation interval
+      gracePeriod: '30s',       // Minimum allowed grace period (we use expireGracePeriod for fast tests)
     });
 
     // Get initial key value via bind
@@ -265,6 +265,7 @@ describe('Managed API Keys', () => {
       });
 
       // Old key should still work (within grace period)
+      // Note: vault server health returns 'ok', agent health returns 'healthy'
       const health = await oldKeyClient.health();
       expect(health.status).toBe('ok');
     }, 15000);
@@ -277,8 +278,8 @@ describe('Managed API Keys', () => {
       // Bind again to rotate
       await vault.bindManagedApiKey(managedKey!.name, TEST_ENV.tenantId);
 
-      // Wait for grace period to expire (5 seconds + buffer)
-      await new Promise((r) => setTimeout(r, 7000));
+      // Force expire grace period immediately (instead of waiting 7 seconds)
+      await vault.expireGracePeriod(managedKey!.name, TEST_ENV.tenantId);
 
       // Old key should now fail
       const oldKeyClient = new VaultTestClient({
@@ -296,7 +297,7 @@ describe('Managed API Keys', () => {
         // Expected - old key should be rejected
         expect((error as Error).message).toMatch(/unauthorized|401|invalid|expired/i);
       }
-    }, 15000);
+    });
   });
 
   describe('Exec Mode with Managed Keys', () => {

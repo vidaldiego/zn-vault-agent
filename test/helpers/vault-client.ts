@@ -133,11 +133,21 @@ export class VaultTestClient {
     certPem: string;
     keyPem: string;
     chainPem?: string;
+    reason?: string;
   }): Promise<Certificate> {
+    // Combine cert + key + chain into a single PEM
+    let combinedPem = opts.certPem;
+    if (opts.keyPem) {
+      combinedPem += '\n' + opts.keyPem;
+    }
+    if (opts.chainPem) {
+      combinedPem += '\n' + opts.chainPem;
+    }
+
     const response = await this.request('POST', `/v1/certificates/${id}/rotate`, {
-      certificate: opts.certPem,
-      privateKey: opts.keyPem,
-      chain: opts.chainPem,
+      certificateData: Buffer.from(combinedPem).toString('base64'),
+      certificateType: 'PEM',
+      reason: opts.reason || 'Test rotation',
     });
 
     return response;
@@ -260,6 +270,7 @@ export class VaultTestClient {
 
   /**
    * Create a managed API key
+   * Returns the created key info plus the initial key value from bind
    */
   async createManagedApiKey(opts: {
     name: string;
@@ -268,7 +279,7 @@ export class VaultTestClient {
     rotationMode?: 'scheduled' | 'on-use' | 'on-bind';
     rotationInterval?: string;
     gracePeriod?: string;
-  }): Promise<ManagedApiKey> {
+  }): Promise<ManagedApiKey & { key: string }> {
     const query = opts.tenantId ? `?tenantId=${opts.tenantId}` : '';
     const response = await this.request<{ apiKey: ManagedApiKey }>('POST', `/auth/api-keys${query}`, {
       name: opts.name,
@@ -278,13 +289,19 @@ export class VaultTestClient {
         'apikey:read',
       ],
       managed: {
-        rotationMode: opts.rotationMode || 'on-bind',
+        rotationMode: opts.rotationMode || 'scheduled',
         rotationInterval: opts.rotationInterval || '24h',
         gracePeriod: opts.gracePeriod || '5m',
       },
     });
 
-    return response.apiKey;
+    // Bind to get the initial key value
+    const bindResponse = await this.bindManagedApiKey(opts.name, opts.tenantId);
+
+    return {
+      ...response.apiKey,
+      key: bindResponse.key,
+    };
   }
 
   /**
@@ -300,6 +317,23 @@ export class VaultTestClient {
    */
   async deleteManagedApiKey(id: string): Promise<void> {
     await this.request('DELETE', `/auth/api-keys/${id}`);
+  }
+
+  /**
+   * Force rotate a managed API key
+   */
+  async rotateManagedKey(name: string, tenantId?: string): Promise<{ success: boolean; newPrefix: string; graceExpiresAt: string }> {
+    const query = tenantId ? `?tenantId=${tenantId}` : '';
+    return await this.request('POST', `/auth/api-keys/managed/${encodeURIComponent(name)}/rotate${query}`, {});
+  }
+
+  /**
+   * Force expire the grace period for a managed API key
+   * This makes the old key stop working immediately instead of waiting for grace period
+   */
+  async expireGracePeriod(name: string, tenantId?: string): Promise<{ success: boolean; message: string }> {
+    const query = tenantId ? `?tenantId=${tenantId}` : '';
+    return await this.request('POST', `/auth/api-keys/managed/${encodeURIComponent(name)}/expire-grace${query}`, {});
   }
 
   /**

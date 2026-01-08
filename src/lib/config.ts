@@ -87,17 +87,20 @@ export interface ExecConfig {
   maxRestarts?: number;
   /** Time window in ms for counting restarts (default: 300000 = 5 minutes) */
   restartWindowMs?: number;
+  /** Path to env file to update when secrets/keys rotate (optional, for daemon mode) */
+  envFile?: string;
 }
 
 /**
  * Default exec configuration values
  */
-export const DEFAULT_EXEC_CONFIG: Required<Omit<ExecConfig, 'command' | 'secrets'>> = {
+export const DEFAULT_EXEC_CONFIG: Required<Omit<ExecConfig, 'command' | 'secrets' | 'envFile'>> & { envFile?: string } = {
   inheritEnv: true,
   restartOnChange: true,
   restartDelayMs: 5000,
   maxRestarts: 10,
   restartWindowMs: 300000,
+  envFile: undefined,
 };
 
 // Re-export ExecSecret for convenience

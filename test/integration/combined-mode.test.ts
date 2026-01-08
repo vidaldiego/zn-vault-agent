@@ -21,6 +21,26 @@ function getNextPort(): number {
   return nextPort++;
 }
 
+// Helper to wait for child process to reach 'running' status
+// Child starts as 'starting' and transitions to 'running' once confirmed running
+async function waitForChildRunning(port: number, maxAttempts = 20, interval = 250): Promise<void> {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/health`);
+      if (res.ok) {
+        const health = await res.json();
+        if (health.childProcess?.status === 'running') {
+          return;
+        }
+      }
+    } catch {
+      // Not ready yet
+    }
+    await new Promise((r) => setTimeout(r, interval));
+  }
+  throw new Error(`Child process did not reach 'running' status after ${(maxAttempts * interval) / 1000}s`);
+}
+
 describe('Combined Mode', () => {
   let agent: AgentRunner;
   let vault: VaultTestClient;
@@ -162,6 +182,9 @@ exit ${exitCode}
       // Wait for daemon to be ready
       await daemon.waitForReady();
 
+      // Wait for child process to reach 'running' status
+      await waitForChildRunning(port);
+
       // Check health endpoint shows child process
       const healthRes = await fetch(`http://127.0.0.1:${port}/health`);
       expect(healthRes.ok).toBe(true);
@@ -184,6 +207,7 @@ exit ${exitCode}
       });
 
       await daemon.waitForReady();
+      await waitForChildRunning(port);
 
       const healthRes = await fetch(`http://127.0.0.1:${port}/health`);
       const health = await healthRes.json();
@@ -213,6 +237,7 @@ exit ${exitCode}
       });
 
       await daemon.waitForReady();
+      await waitForChildRunning(port);
 
       // Verify child is running
       const healthRes = await fetch(`http://127.0.0.1:${port}/health`);
@@ -303,6 +328,7 @@ while true; do sleep 1; done
       });
 
       await daemon.waitForReady();
+      await waitForChildRunning(port);
 
       const healthRes = await fetch(`http://127.0.0.1:${port}/health`);
       const health = await healthRes.json();
@@ -325,6 +351,7 @@ while true; do sleep 1; done
       });
 
       await daemon.waitForReady();
+      await waitForChildRunning(port);
 
       const healthRes = await fetch(`http://127.0.0.1:${port}/health`);
       const health = await healthRes.json();
@@ -363,6 +390,7 @@ while true; do sleep 1; done
       });
 
       await daemon.waitForReady();
+      await waitForChildRunning(port);
 
       // Wait a bit for cert sync
       await new Promise(resolve => setTimeout(resolve, 2000));

@@ -28,10 +28,20 @@ import {
   startManagedKeyRenewal,
   stopManagedKeyRenewal,
   onKeyChanged as onManagedKeyChanged,
+  onWebSocketReconnect as notifyManagedKeyReconnect,
+  onWebSocketRotationEvent as notifyManagedKeyRotationEvent,
 } from '../services/managed-key-renewal.js';
 import { isManagedKeyMode } from './config.js';
 import { ChildProcessManager } from '../services/child-process-manager.js';
-import { extractSecretIds, parseSecretMappingFromConfig } from './secret-env.js';
+import {
+  extractSecretIds,
+  extractApiKeyNames,
+  parseSecretMappingFromConfig,
+  updateEnvFile,
+  findEnvVarsForApiKey,
+  type SecretMapping,
+} from './secret-env.js';
+import { bindManagedApiKey } from './api.js';
 
 export interface CertificateEvent {
   event: 'certificate.rotated' | 'certificate.created' | 'certificate.deleted';
@@ -58,14 +68,27 @@ export interface AgentUpdateEvent {
   timestamp: string;
 }
 
+export interface ApiKeyRotationEvent {
+  event: 'apikey.rotated';
+  apiKeyId: string;
+  apiKeyName: string;
+  tenantId: string;
+  newPrefix: string;
+  graceExpiresAt: string;
+  rotationMode: 'scheduled' | 'on-use' | 'on-bind';
+  rotationCount: number;
+  reason: string;
+  timestamp: string;
+}
+
 /**
  * Unified agent event (from /v1/ws/agent)
  */
 export interface UnifiedAgentEvent {
   type: 'pong' | 'event' | 'subscribed' | 'registered' | 'error';
-  topic?: 'certificates' | 'secrets' | 'updates';
-  data?: CertificateEvent | SecretEvent | AgentUpdateEvent;
-  subscriptions?: { certificates: string[]; secrets: string[]; updates: string | null };
+  topic?: 'certificates' | 'secrets' | 'updates' | 'apikeys';
+  data?: CertificateEvent | SecretEvent | AgentUpdateEvent | ApiKeyRotationEvent;
+  subscriptions?: { certificates: string[]; secrets: string[]; managedKeys: string[]; updates: string | null };
   agentId?: string;
   message?: string;
   timestamp?: string;
@@ -85,10 +108,11 @@ export interface UnifiedWebSocketClient {
   onCertificateEvent(handler: (event: CertificateEvent) => void): void;
   onSecretEvent(handler: (event: SecretEvent) => void): void;
   onUpdateEvent(handler: (event: AgentUpdateEvent) => void): void;
+  onApiKeyRotationEvent(handler: (event: ApiKeyRotationEvent) => void): void;
   onConnect(handler: (agentId: string) => void): void;
   onDisconnect(handler: (reason: string) => void): void;
   onError(handler: (error: Error) => void): void;
-  updateSubscriptions(subs: { certIds?: string[]; secretIds?: string[]; updateChannel?: string }): void;
+  updateSubscriptions(subs: { certIds?: string[]; secretIds?: string[]; managedKeys?: string[]; updateChannel?: string }): void;
 }
 
 /**
@@ -98,20 +122,27 @@ export interface UnifiedWebSocketClient {
  * - certificates: certificate rotation events
  * - secrets: secret update events
  * - updates: agent update availability events
+ * - apikeys: managed API key rotation events
  *
  * @param additionalSecretIds - Additional secret IDs to subscribe to (e.g., exec secrets)
+ * @param managedKeyNames - Managed API key names to subscribe to for rotation events
  */
-export function createUnifiedWebSocketClient(additionalSecretIds: string[] = []): UnifiedWebSocketClient {
+export function createUnifiedWebSocketClient(
+  additionalSecretIds: string[] = [],
+  managedKeyNames: string[] = []
+): UnifiedWebSocketClient {
   let ws: WebSocket | null = null;
   let reconnectAttempts = 0;
   let reconnectTimer: NodeJS.Timeout | null = null;
   let heartbeatTimer: NodeJS.Timeout | null = null;
   let shouldReconnect = true;
   let registeredAgentId: string | null = null;
+  let wasConnectedBefore = false; // Track if we've connected before (for reconnection detection)
 
   const certEventHandlers: ((event: CertificateEvent) => void)[] = [];
   const secretEventHandlers: ((event: SecretEvent) => void)[] = [];
   const updateEventHandlers: ((event: AgentUpdateEvent) => void)[] = [];
+  const apiKeyRotationEventHandlers: ((event: ApiKeyRotationEvent) => void)[] = [];
   const connectHandlers: ((agentId: string) => void)[] = [];
   const disconnectHandlers: ((reason: string) => void)[] = [];
   const errorHandlers: ((error: Error) => void)[] = [];
@@ -154,6 +185,10 @@ export function createUnifiedWebSocketClient(additionalSecretIds: string[] = [])
     }
     if (allSecretIds.length > 0) {
       url.searchParams.set('secretIds', allSecretIds.join(','));
+    }
+    // Subscribe to managed API key rotation events
+    if (managedKeyNames.length > 0) {
+      url.searchParams.set('managedKeys', managedKeyNames.join(','));
     }
     // Subscribe to stable update channel by default
     url.searchParams.set('updateChannel', 'stable');
@@ -290,6 +325,20 @@ export function createUnifiedWebSocketClient(additionalSecretIds: string[] = [])
           const event = message.data as AgentUpdateEvent;
           log.info({ version: event.version, channel: event.channel }, 'Received update event');
           updateEventHandlers.forEach(h => { h(event); });
+        } else if (message.topic === 'apikeys' && message.data) {
+          const event = message.data as ApiKeyRotationEvent;
+          log.info({
+            event: event.event,
+            keyName: event.apiKeyName,
+            newPrefix: event.newPrefix,
+            graceExpiresAt: event.graceExpiresAt,
+          }, 'Received API key rotation event');
+
+          // Notify managed key renewal service (for safety rail tracking)
+          // This must be called BEFORE the handlers to properly mark WS event received
+          void notifyManagedKeyRotationEvent(event.apiKeyName);
+
+          apiKeyRotationEventHandlers.forEach(h => { h(event); });
         }
         break;
 
@@ -329,12 +378,20 @@ export function createUnifiedWebSocketClient(additionalSecretIds: string[] = [])
       });
 
       ws.on('open', () => {
+        const isReconnect = wasConnectedBefore;
+        wasConnectedBefore = true;
         reconnectAttempts = 0;
         startHeartbeat();
         setWebSocketStatus(true, new Date());
         setSecretWebSocketStatus(true, new Date());
         metrics.wsConnected();
-        log.info({ ws: 'unified' }, 'Unified WebSocket connected');
+        log.info({ ws: 'unified', isReconnect }, 'Unified WebSocket connected');
+
+        // Notify managed key renewal service of reconnection (for connection loss recovery)
+        if (isReconnect && managedKeyNames.length > 0) {
+          log.debug('Notifying managed key renewal service of reconnection');
+          void notifyManagedKeyReconnect();
+        }
       });
 
       ws.on('message', (data) => {
@@ -395,9 +452,10 @@ export function createUnifiedWebSocketClient(additionalSecretIds: string[] = [])
     setSecretWebSocketStatus(false);
     metrics.wsDisconnected();
     registeredAgentId = null;
+    wasConnectedBefore = false; // Reset for clean reconnection tracking
   }
 
-  function updateSubscriptions(subs: { certIds?: string[]; secretIds?: string[]; updateChannel?: string }): void {
+  function updateSubscriptions(subs: { certIds?: string[]; secretIds?: string[]; managedKeys?: string[]; updateChannel?: string }): void {
     if (ws?.readyState !== WebSocket.OPEN) {
       log.warn('Cannot update subscriptions: not connected');
       return;
@@ -408,11 +466,13 @@ export function createUnifiedWebSocketClient(additionalSecretIds: string[] = [])
       topics: [] as string[],
       certIds: subs.certIds,
       secretIds: subs.secretIds,
+      managedKeys: subs.managedKeys,
       channel: subs.updateChannel,
     };
 
     if (subs.certIds?.length) message.topics.push('certificates');
     if (subs.secretIds?.length) message.topics.push('secrets');
+    if (subs.managedKeys?.length) message.topics.push('apikeys');
     if (subs.updateChannel) message.topics.push('updates');
 
     ws.send(JSON.stringify(message));
@@ -426,6 +486,7 @@ export function createUnifiedWebSocketClient(additionalSecretIds: string[] = [])
     onCertificateEvent: (handler) => certEventHandlers.push(handler),
     onSecretEvent: (handler) => secretEventHandlers.push(handler),
     onUpdateEvent: (handler) => updateEventHandlers.push(handler),
+    onApiKeyRotationEvent: (handler) => apiKeyRotationEventHandlers.push(handler),
     onConnect: (handler) => connectHandlers.push(handler),
     onDisconnect: (handler) => disconnectHandlers.push(handler),
     onError: (handler) => errorHandlers.push(handler),
@@ -450,11 +511,16 @@ export async function startDaemon(options: {
   // Setup log rotation handler
   setupLogRotation();
 
-  // Extract exec secret IDs for WebSocket subscription
+  // Extract exec secret IDs and managed API key names for WebSocket subscription
   let execSecretIds: string[] = [];
+  let execManagedKeyNames: string[] = [];
+  let execSecretMappings: (SecretMapping & { literal?: string })[] = [];
+  const execOutputFile = options.exec?.envFile; // Output file path for env file mode
+
   if (options.exec) {
-    const mappings = options.exec.secrets.map(parseSecretMappingFromConfig);
-    execSecretIds = extractSecretIds(mappings);
+    execSecretMappings = options.exec.secrets.map(parseSecretMappingFromConfig);
+    execSecretIds = extractSecretIds(execSecretMappings);
+    execManagedKeyNames = extractApiKeyNames(execSecretMappings);
   }
 
   log.info({
@@ -462,6 +528,7 @@ export async function startDaemon(options: {
     certTargets: config.targets.length,
     secretTargets: secretTargets.length,
     execSecrets: execSecretIds.length,
+    execManagedKeys: execManagedKeyNames.length,
     execCommand: options.exec?.command.join(' '),
   }, 'Starting ZN-Vault Agent');
 
@@ -506,8 +573,8 @@ export async function startDaemon(options: {
   // Update tracked metrics
   metrics.setCertsTracked(config.targets.length);
 
-  // Create unified WebSocket client with exec secret IDs
-  const unifiedClient = createUnifiedWebSocketClient(execSecretIds);
+  // Create unified WebSocket client with exec secret IDs and managed key names
+  const unifiedClient = createUnifiedWebSocketClient(execSecretIds, execManagedKeyNames);
 
   // Handle certificate events
   unifiedClient.onCertificateEvent(async (event) => {
@@ -594,6 +661,75 @@ export async function startDaemon(options: {
   unifiedClient.onUpdateEvent((event) => {
     log.info({ version: event.version, channel: event.channel }, 'Update available');
     // Auto-update handling is done by auto-update service
+  });
+
+  // Handle API key rotation events
+  unifiedClient.onApiKeyRotationEvent(async (event) => {
+    if (isShuttingDown) {
+      log.debug({ event: event.event }, 'Ignoring API key rotation event during shutdown');
+      return;
+    }
+
+    // Check if this key is one we're using
+    if (!execManagedKeyNames.includes(event.apiKeyName)) {
+      log.debug({ keyName: event.apiKeyName }, 'Received rotation event for untracked managed key');
+      return;
+    }
+
+    log.info({
+      keyName: event.apiKeyName,
+      newPrefix: event.newPrefix,
+      graceExpiresAt: event.graceExpiresAt,
+      reason: event.reason,
+    }, 'Processing managed API key rotation event');
+
+    activeDeployments++;
+    try {
+      // Fetch the new key via bind
+      const bindResponse = await bindManagedApiKey(event.apiKeyName);
+      const newKey = bindResponse.key;
+
+      log.info({
+        keyName: event.apiKeyName,
+        keyPrefix: newKey.substring(0, 8),
+      }, 'Fetched new API key value');
+
+      // Update env file if using output file mode
+      if (execOutputFile) {
+        // Find which env var(s) map to this API key
+        const envVars = findEnvVarsForApiKey(execSecretMappings, event.apiKeyName);
+
+        for (const envVar of envVars) {
+          try {
+            await updateEnvFile(execOutputFile, envVar, newKey);
+            log.info({
+              keyName: event.apiKeyName,
+              envVar,
+              filePath: execOutputFile,
+            }, 'Updated env file with rotated API key');
+          } catch (err) {
+            log.error({
+              err,
+              keyName: event.apiKeyName,
+              envVar,
+              filePath: execOutputFile,
+            }, 'Failed to update env file with rotated API key');
+          }
+        }
+      }
+
+      // Restart child process if configured to restart on changes
+      if (childManager && options.exec?.restartOnChange) {
+        await childManager.restart(`managed API key '${event.apiKeyName}' rotated`);
+      }
+    } catch (err) {
+      log.error({
+        err,
+        keyName: event.apiKeyName,
+      }, 'Failed to process API key rotation event');
+    } finally {
+      activeDeployments--;
+    }
   });
 
   unifiedClient.onConnect((agentId) => {

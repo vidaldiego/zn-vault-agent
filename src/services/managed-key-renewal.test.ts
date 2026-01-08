@@ -236,6 +236,14 @@ describe('Managed Key Renewal Service', () => {
         },
       } as ReturnType<typeof loadConfig>);
 
+      // Mock bind response WITHOUT graceExpiresAt to avoid grace period poll
+      // interfering with refresh scheduling test
+      vi.mocked(bindManagedApiKey).mockResolvedValue({
+        ...mockBindResponse,
+        graceExpiresAt: undefined, // Disable grace period poll for this test
+        nextRotationAt: nextRotation.toISOString(),
+      });
+
       await startManagedKeyRenewal();
 
       // Clear the initial bind call
