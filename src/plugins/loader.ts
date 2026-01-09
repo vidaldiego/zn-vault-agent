@@ -30,6 +30,7 @@ const EVENT_HANDLERS: typeof PLUGIN_EVENT_HANDLERS = {
   secretDeployed: 'onSecretDeployed',
   keyRotated: 'onKeyRotated',
   childProcess: 'onChildProcessEvent',
+  secretChanged: 'onSecretChanged',
 } as const;
 
 /**

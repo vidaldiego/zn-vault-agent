@@ -14,6 +14,7 @@ export type {
   SecretDeployedEvent,
   KeyRotatedEvent,
   ChildProcessEvent,
+  SecretChangedEvent,
   PluginHealthStatus,
   LoadedPlugin,
   PluginEventMap,

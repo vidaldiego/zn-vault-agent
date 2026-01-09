@@ -68,6 +68,12 @@ export interface AgentPlugin {
   onChildProcessEvent?(event: ChildProcessEvent, ctx: PluginContext): Promise<void>;
 
   /**
+   * React to secret change events (via WebSocket subscription).
+   * Called when a watched secret is updated in the vault.
+   */
+  onSecretChanged?(event: SecretChangedEvent, ctx: PluginContext): Promise<void>;
+
+  /**
    * Contribute to health check response.
    * Return status object that will be merged into /health response.
    */
@@ -348,6 +354,22 @@ export interface ChildProcessEvent {
 }
 
 /**
+ * Emitted when a watched secret is changed in the vault
+ */
+export interface SecretChangedEvent {
+  /** Secret ID */
+  secretId: string;
+  /** Secret alias */
+  alias: string;
+  /** New secret version */
+  version: number;
+  /** Whether this was a value update (true) or metadata only (false) */
+  valueChanged: boolean;
+  /** Timestamp of change */
+  changedAt: string;
+}
+
+/**
  * Plugin health status for /health endpoint
  */
 export interface PluginHealthStatus {
@@ -387,6 +409,7 @@ export type PluginEventMap = {
   secretDeployed: SecretDeployedEvent;
   keyRotated: KeyRotatedEvent;
   childProcess: ChildProcessEvent;
+  secretChanged: SecretChangedEvent;
 };
 
 /**
@@ -397,4 +420,5 @@ export const PLUGIN_EVENT_HANDLERS = {
   secretDeployed: 'onSecretDeployed',
   keyRotated: 'onKeyRotated',
   childProcess: 'onChildProcessEvent',
+  secretChanged: 'onSecretChanged',
 } as const;
