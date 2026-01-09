@@ -843,6 +843,126 @@ znvault_agent_sync_duration_seconds{cert_name}
 znvault_agent_api_request_duration_seconds{method}
 ```
 
+## Plugin System
+
+The agent supports plugins that extend functionality without modifying core code. Plugins can:
+
+- Register HTTP routes on the health server
+- React to certificate/secret deployment events
+- Add custom health checks
+- Respond to child process events
+
+### Installing Plugins
+
+Add plugins to your `config.json`:
+
+```json
+{
+  "vaultUrl": "https://vault.example.com",
+  "tenantId": "my-tenant",
+  "auth": { "apiKey": "znv_..." },
+  "plugins": [
+    {
+      "package": "@zincapp/znvault-plugin-payara",
+      "config": {
+        "payaraHome": "/opt/payara",
+        "domain": "domain1",
+        "user": "payara",
+        "warPath": "/opt/app/MyApp.war",
+        "appName": "MyApp"
+      }
+    }
+  ]
+}
+```
+
+Then install the plugin package:
+
+```bash
+npm install @zincapp/znvault-plugin-payara
+```
+
+### Available Plugins
+
+| Plugin | Package | Description |
+|--------|---------|-------------|
+| Payara | `@zincapp/znvault-plugin-payara` | WAR diff deployment, Payara lifecycle management |
+
+### Plugin Configuration Options
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `package` | string | npm package name |
+| `path` | string | Local file path (alternative to package) |
+| `config` | object | Plugin-specific configuration |
+| `enabled` | boolean | Enable/disable plugin (default: true) |
+
+### Plugin Routes
+
+Plugins register HTTP routes under `/plugins/<name>/`. For example, the Payara plugin registers:
+
+- `GET /plugins/payara/status` - Payara status
+- `GET /plugins/payara/hashes` - WAR file hashes for diff deployment
+- `POST /plugins/payara/deploy` - Apply WAR changes
+
+### Plugin Health
+
+Plugin health is included in the `/health` endpoint:
+
+```json
+{
+  "status": "healthy",
+  "plugins": [
+    {
+      "name": "payara",
+      "status": "healthy",
+      "details": {
+        "domain": "domain1",
+        "running": true,
+        "healthy": true
+      }
+    }
+  ]
+}
+```
+
+### Writing Plugins
+
+Plugins export a factory function that returns an `AgentPlugin` object:
+
+```typescript
+import type { AgentPlugin, PluginContext } from '@zincapp/zn-vault-agent/plugins';
+
+export default function createMyPlugin(config: MyConfig): AgentPlugin {
+  return {
+    name: 'my-plugin',
+    version: '1.0.0',
+
+    async onInit(ctx: PluginContext) {
+      ctx.logger.info('Initializing...');
+    },
+
+    async onStart(ctx: PluginContext) {
+      ctx.logger.info('Starting...');
+    },
+
+    async routes(fastify, ctx) {
+      fastify.get('/status', async () => ({ ok: true }));
+    },
+
+    async onCertificateDeployed(event, ctx) {
+      ctx.logger.info({ certId: event.certId }, 'Certificate deployed');
+    },
+
+    async healthCheck(ctx) {
+      return { name: 'my-plugin', status: 'healthy' };
+    },
+  };
+}
+```
+
+Plugin types are exported from `@zincapp/zn-vault-agent/plugins`.
+
 ## Systemd Installation
 
 ```bash
