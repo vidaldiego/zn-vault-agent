@@ -53,6 +53,13 @@ import type {
   KeyRotatedEvent,
   ChildProcessEvent,
 } from '../plugins/types.js';
+import {
+  initDegradedModeHandler,
+  handleDegradedConnection,
+  handleReprovisionAvailable,
+  cleanupDegradedModeHandler,
+  setAgentId,
+} from '../services/degraded-mode-handler.js';
 
 export interface CertificateEvent {
   event: 'certificate.rotated' | 'certificate.created' | 'certificate.deleted';
@@ -93,16 +100,47 @@ export interface ApiKeyRotationEvent {
 }
 
 /**
+ * Degraded connection reason
+ */
+export type DegradedReason = 'key_expired' | 'key_revoked' | 'key_disabled' | 'auth_failed';
+
+/**
+ * Degraded connection info from server
+ */
+export interface DegradedConnectionInfo {
+  isDegraded: true;
+  reason: DegradedReason;
+  agentId?: string;
+  message: string;
+  canReceiveReprovision: boolean;
+}
+
+/**
+ * Reprovision event from server
+ */
+export interface ReprovisionEvent {
+  event: 'agent.reprovision.available' | 'agent.reprovision.cancelled';
+  agentId: string;
+  tenantId: string;
+  expiresAt?: string;
+  reason?: string;
+  timestamp: string;
+}
+
+/**
  * Unified agent event (from /v1/ws/agent)
  */
 export interface UnifiedAgentEvent {
-  type: 'pong' | 'event' | 'subscribed' | 'registered' | 'error';
-  topic?: 'certificates' | 'secrets' | 'updates' | 'apikeys';
-  data?: CertificateEvent | SecretEvent | AgentUpdateEvent | ApiKeyRotationEvent;
+  type: 'pong' | 'event' | 'subscribed' | 'registered' | 'error' | 'connection_established' | 'degraded_connection' | 'reprovision_available';
+  topic?: 'certificates' | 'secrets' | 'updates' | 'apikeys' | 'reprovision';
+  data?: CertificateEvent | SecretEvent | AgentUpdateEvent | ApiKeyRotationEvent | ReprovisionEvent | DegradedConnectionInfo;
   subscriptions?: { certificates: string[]; secrets: string[]; managedKeys: string[]; updates: string | null };
   agentId?: string;
   message?: string;
   timestamp?: string;
+  // For reprovision_available message
+  reprovisionToken?: string;
+  expiresAt?: string;
 }
 
 // Graceful shutdown state
@@ -120,6 +158,8 @@ export interface UnifiedWebSocketClient {
   onSecretEvent(handler: (event: SecretEvent) => void): void;
   onUpdateEvent(handler: (event: AgentUpdateEvent) => void): void;
   onApiKeyRotationEvent(handler: (event: ApiKeyRotationEvent) => void): void;
+  onDegradedConnection(handler: (info: DegradedConnectionInfo) => void): void;
+  onReprovisionAvailable(handler: (expiresAt: string) => void): void;
   onConnect(handler: (agentId: string) => void): void;
   onDisconnect(handler: (reason: string) => void): void;
   onError(handler: (error: Error) => void): void;
@@ -154,6 +194,8 @@ export function createUnifiedWebSocketClient(
   const secretEventHandlers: ((event: SecretEvent) => void)[] = [];
   const updateEventHandlers: ((event: AgentUpdateEvent) => void)[] = [];
   const apiKeyRotationEventHandlers: ((event: ApiKeyRotationEvent) => void)[] = [];
+  const degradedConnectionHandlers: ((info: DegradedConnectionInfo) => void)[] = [];
+  const reprovisionAvailableHandlers: ((expiresAt: string) => void)[] = [];
   const connectHandlers: ((agentId: string) => void)[] = [];
   const disconnectHandlers: ((reason: string) => void)[] = [];
   const errorHandlers: ((error: Error) => void)[] = [];
@@ -356,6 +398,44 @@ export function createUnifiedWebSocketClient(
       case 'error':
         log.error({ message: message.message }, 'Server error');
         break;
+
+      case 'connection_established':
+        log.debug('Connection established with server');
+        break;
+
+      case 'degraded_connection':
+        if (message.data) {
+          const info = message.data as DegradedConnectionInfo;
+          log.warn({
+            reason: info.reason,
+            agentId: info.agentId,
+            message: info.message,
+          }, 'Agent in degraded mode');
+          degradedConnectionHandlers.forEach(h => { h(info); });
+        }
+        break;
+
+      case 'reprovision_available':
+        if (message.expiresAt) {
+          log.info({
+            expiresAt: message.expiresAt,
+          }, 'Reprovision token available');
+          reprovisionAvailableHandlers.forEach(h => { h(message.expiresAt!); });
+        }
+        break;
+    }
+
+    // Also check for reprovision events in the event topic
+    if (message.type === 'event' && message.topic === 'reprovision' && message.data) {
+      const event = message.data as ReprovisionEvent;
+      if (event.event === 'agent.reprovision.available' && event.expiresAt) {
+        log.info({
+          agentId: event.agentId,
+          expiresAt: event.expiresAt,
+          reason: event.reason,
+        }, 'Reprovision event received');
+        reprovisionAvailableHandlers.forEach(h => { h(event.expiresAt!); });
+      }
     }
   }
 
@@ -498,6 +578,8 @@ export function createUnifiedWebSocketClient(
     onSecretEvent: (handler) => secretEventHandlers.push(handler),
     onUpdateEvent: (handler) => updateEventHandlers.push(handler),
     onApiKeyRotationEvent: (handler) => apiKeyRotationEventHandlers.push(handler),
+    onDegradedConnection: (handler) => degradedConnectionHandlers.push(handler),
+    onReprovisionAvailable: (handler) => reprovisionAvailableHandlers.push(handler),
     onConnect: (handler) => connectHandlers.push(handler),
     onDisconnect: (handler) => disconnectHandlers.push(handler),
     onError: (handler) => errorHandlers.push(handler),
@@ -646,6 +728,37 @@ export async function startDaemon(options: {
 
   // Create unified WebSocket client with exec secret IDs and managed key names
   const unifiedClient = createUnifiedWebSocketClient(execSecretIds, execManagedKeyNames);
+
+  // Initialize degraded mode handler
+  initDegradedModeHandler({
+    onCredentialsUpdated: (newKey) => {
+      log.info({ keyPrefix: newKey.substring(0, 8) }, 'Credentials updated via reprovision, reconnecting');
+      // Reconnect with new credentials
+      unifiedClient.disconnect();
+      setTimeout(() => {
+        if (!isShuttingDown) {
+          unifiedClient.connect();
+        }
+      }, 500);
+    },
+    onStateChanged: (isDegraded, reason) => {
+      if (isDegraded) {
+        log.warn({ reason }, 'Agent entered degraded mode');
+      } else {
+        log.info('Agent exited degraded mode');
+      }
+    },
+  });
+
+  // Handle degraded connection notifications
+  unifiedClient.onDegradedConnection((info) => {
+    handleDegradedConnection(info);
+  });
+
+  // Handle reprovision available notifications
+  unifiedClient.onReprovisionAvailable((expiresAt) => {
+    handleReprovisionAvailable(expiresAt);
+  });
 
   // Handle certificate events
   unifiedClient.onCertificateEvent(async (event) => {
@@ -845,6 +958,8 @@ export async function startDaemon(options: {
 
   unifiedClient.onConnect((agentId) => {
     log.info({ agentId }, 'Connected to vault');
+    // Store agent ID for degraded mode handling
+    setAgentId(agentId);
   });
 
   unifiedClient.onDisconnect((reason) => {
@@ -987,6 +1102,9 @@ export async function startDaemon(options: {
     } else {
       stopApiKeyRenewal();
     }
+
+    // Cleanup degraded mode handler
+    cleanupDegradedModeHandler();
 
     // Stop plugins
     if (pluginLoader) {
