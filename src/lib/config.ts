@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { configLogger as log } from './logger.js';
 import type { ExecSecret } from './secret-env.js';
+import type { PluginConfig } from '../plugins/types.js';
 
 /**
  * Certificate target configuration
@@ -154,6 +155,8 @@ export interface AgentConfig {
   pollInterval?: number;
   /** Enable verbose logging */
   verbose?: boolean;
+  /** Plugin configurations */
+  plugins?: PluginConfig[];
 }
 
 // Default config location - computed dynamically to support test isolation

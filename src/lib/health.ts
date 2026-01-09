@@ -1,11 +1,13 @@
 // Path: src/lib/health.ts
-// HTTP health and metrics endpoint for zn-vault-agent
+// HTTP health and metrics endpoint for zn-vault-agent using Fastify
 
-import http from 'node:http';
+import Fastify, { type FastifyInstance } from 'fastify';
 import { healthLogger as log } from './logger.js';
 import { exportMetrics } from './metrics.js';
 import { loadConfig, getTargets, isConfigured } from './config.js';
 import type { ChildProcessManager, ChildProcessState } from '../services/child-process-manager.js';
+import type { PluginLoader } from '../plugins/loader.js';
+import type { PluginHealthStatus } from '../plugins/types.js';
 
 export interface HealthStatus {
   status: 'healthy' | 'degraded' | 'unhealthy';
@@ -31,6 +33,7 @@ export interface HealthStatus {
     errors: number;
   };
   childProcess?: ChildProcessState;
+  plugins?: PluginHealthStatus[];
 }
 
 // Track health state
@@ -43,8 +46,9 @@ let syncedCerts = 0;
 let certErrors = 0;
 let syncedSecrets = 0;
 let secretErrors = 0;
-let server: http.Server | null = null;
+let fastifyServer: FastifyInstance | null = null;
 let childProcessManager: ChildProcessManager | null = null;
+let pluginLoader: PluginLoader | null = null;
 
 /**
  * Update WebSocket connection status for certificates
@@ -97,9 +101,16 @@ export function setChildProcessManager(manager: ChildProcessManager | null): voi
 }
 
 /**
+ * Set plugin loader for health status aggregation and route registration
+ */
+export function setPluginLoader(loader: PluginLoader | null): void {
+  pluginLoader = loader;
+}
+
+/**
  * Get current health status
  */
-export function getHealthStatus(): HealthStatus {
+export async function getHealthStatus(): Promise<HealthStatus> {
   const config = loadConfig();
   const targets = getTargets();
   const secretTargets = config.secretTargets || [];
@@ -134,6 +145,22 @@ export function getHealthStatus(): HealthStatus {
     // Unhealthy if child process failed to start and never ran
     if (childProcessState.status === 'crashed' && childProcessState.lastStartTime === null) {
       status = 'unhealthy';
+    }
+  }
+
+  // Collect plugin health status
+  let pluginStatuses: PluginHealthStatus[] | undefined;
+  if (pluginLoader && pluginLoader.hasPlugins()) {
+    pluginStatuses = await pluginLoader.collectHealthStatus();
+
+    // Plugin status affects overall health
+    for (const ps of pluginStatuses) {
+      if (ps.status === 'unhealthy' && status !== 'unhealthy') {
+        status = 'degraded';
+      }
+      if (ps.status === 'degraded' && status === 'healthy') {
+        status = 'degraded';
+      }
     }
   }
 
@@ -173,128 +200,130 @@ export function getHealthStatus(): HealthStatus {
     result.childProcess = childProcessState;
   }
 
+  // Include plugin statuses if any plugins are loaded
+  if (pluginStatuses && pluginStatuses.length > 0) {
+    result.plugins = pluginStatuses;
+  }
+
   return result;
 }
 
 /**
- * Handle HTTP requests
+ * Create Fastify instance with core routes
  */
-function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-  const url = req.url || '/';
+function createFastifyInstance(): FastifyInstance {
+  const fastify = Fastify({
+    logger: false, // We use our own pino logger
+    trustProxy: true,
+  });
 
-  log.debug({ method: req.method, url }, 'Health endpoint request');
+  // CORS support for monitoring tools
+  fastify.addHook('onRequest', async (request, reply) => {
+    reply.header('Access-Control-Allow-Origin', '*');
+    reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-  // CORS headers for monitoring tools
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  if (req.method !== 'GET') {
-    res.writeHead(405, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Method not allowed' }));
-    return;
-  }
-
-  switch (url) {
-    case '/health':
-    case '/health/': {
-      const health = getHealthStatus();
-      const statusCode = health.status === 'unhealthy' ? 503 : 200;
-      res.writeHead(statusCode, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(health, null, 2));
-      break;
+    if (request.method === 'OPTIONS') {
+      reply.code(204).send();
     }
+  });
 
-    case '/ready':
-    case '/ready/': {
-      // Readiness probe - are we configured and at least one WebSocket connected?
-      const ready = isConfigured() && (certWsConnected || secretWsConnected);
-      res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ready, timestamp: new Date().toISOString() }));
-      break;
-    }
+  // Health endpoint
+  fastify.get('/health', async (_request, reply) => {
+    const health = await getHealthStatus();
+    const statusCode = health.status === 'unhealthy' ? 503 : 200;
+    reply.code(statusCode).send(health);
+  });
 
-    case '/live':
-    case '/live/': {
-      // Liveness probe - is the process running?
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ alive: true, timestamp: new Date().toISOString() }));
-      break;
-    }
+  // Readiness probe
+  fastify.get('/ready', async (_request, reply) => {
+    const ready = isConfigured() && (certWsConnected || secretWsConnected);
+    const statusCode = ready ? 200 : 503;
+    reply.code(statusCode).send({ ready, timestamp: new Date().toISOString() });
+  });
 
-    case '/metrics':
-    case '/metrics/': {
-      // Prometheus metrics
-      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
-      res.end(exportMetrics());
-      break;
-    }
+  // Liveness probe
+  fastify.get('/live', async (_request, reply) => {
+    reply.send({ alive: true, timestamp: new Date().toISOString() });
+  });
 
-    default:
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found' }));
-  }
+  // Prometheus metrics
+  fastify.get('/metrics', async (_request, reply) => {
+    reply.type('text/plain; version=0.0.4; charset=utf-8').send(exportMetrics());
+  });
+
+  return fastify;
 }
 
 /**
  * Start the health HTTP server
  */
-export function startHealthServer(port: number = 9100): Promise<http.Server> {
-  return new Promise((resolve, reject) => {
-    if (server) {
-      log.warn('Health server already running');
-      resolve(server);
-      return;
+export async function startHealthServer(
+  port: number = 9100,
+  loader?: PluginLoader
+): Promise<FastifyInstance> {
+  if (fastifyServer) {
+    log.warn('Health server already running');
+    return fastifyServer;
+  }
+
+  // Set plugin loader if provided
+  if (loader) {
+    pluginLoader = loader;
+  }
+
+  // Create Fastify instance
+  fastifyServer = createFastifyInstance();
+
+  // Register plugin routes if loader provided
+  if (pluginLoader) {
+    await pluginLoader.registerRoutes(fastifyServer);
+  }
+
+  try {
+    await fastifyServer.listen({ port, host: '0.0.0.0' });
+    log.info({ port }, 'Health server started');
+    return fastifyServer;
+  } catch (err) {
+    const error = err as NodeJS.ErrnoException;
+    if (error.code === 'EADDRINUSE') {
+      log.error({ port }, 'Health server port already in use');
+    } else {
+      log.error({ err: error }, 'Health server error');
     }
-
-    server = http.createServer(handleRequest);
-
-    server.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'EADDRINUSE') {
-        log.error({ port }, 'Health server port already in use');
-      } else {
-        log.error({ err }, 'Health server error');
-      }
-      reject(err);
-    });
-
-    server.listen(port, '0.0.0.0', () => {
-      log.info({ port }, 'Health server started');
-      resolve(server!);
-    });
-  });
+    fastifyServer = null;
+    throw error;
+  }
 }
 
 /**
  * Stop the health HTTP server
  */
-export function stopHealthServer(): Promise<void> {
-  return new Promise((resolve) => {
-    if (!server) {
-      resolve();
-      return;
-    }
+export async function stopHealthServer(): Promise<void> {
+  if (!fastifyServer) {
+    return;
+  }
 
-    server.close((err) => {
-      if (err) {
-        log.warn({ err }, 'Error closing health server');
-      } else {
-        log.info('Health server stopped');
-      }
-      server = null;
-      resolve();
-    });
-  });
+  try {
+    await fastifyServer.close();
+    log.info('Health server stopped');
+  } catch (err) {
+    log.warn({ err }, 'Error closing health server');
+  } finally {
+    fastifyServer = null;
+  }
 }
 
 /**
  * Check if health server is running
  */
 export function isHealthServerRunning(): boolean {
-  return server !== null && server.listening;
+  return fastifyServer !== null;
+}
+
+/**
+ * Get the Fastify instance (for testing or advanced use)
+ */
+export function getFastifyInstance(): FastifyInstance | null {
+  return fastifyServer;
 }

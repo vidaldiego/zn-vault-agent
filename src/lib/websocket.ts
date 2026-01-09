@@ -4,7 +4,7 @@
 import WebSocket from 'ws';
 import os from 'node:os';
 import { createRequire } from 'node:module';
-import { loadConfig, type ExecConfig } from './config.js';
+import { loadConfig, type ExecConfig, type AgentConfig } from './config.js';
 
 // ESM-compatible way to read package.json
 const require = createRequire(import.meta.url);
@@ -42,6 +42,17 @@ import {
   type SecretMapping,
 } from './secret-env.js';
 import { bindManagedApiKey } from './api.js';
+import {
+  createPluginLoader,
+  clearPluginLoader,
+  type PluginLoader,
+} from '../plugins/loader.js';
+import type {
+  CertificateDeployedEvent,
+  SecretDeployedEvent,
+  KeyRotatedEvent,
+  ChildProcessEvent,
+} from '../plugins/types.js';
 
 export interface CertificateEvent {
   event: 'certificate.rotated' | 'certificate.created' | 'certificate.deleted';
@@ -505,6 +516,9 @@ export async function startDaemon(options: {
   const config = loadConfig();
   const secretTargets = config.secretTargets || [];
 
+  // Initialize plugin loader
+  let pluginLoader: PluginLoader | null = null;
+
   // Initialize metrics
   initializeMetrics();
 
@@ -561,10 +575,67 @@ export async function startDaemon(options: {
     });
   }
 
-  // Start health server if port specified
+  // Initialize plugin system if plugins are configured
+  const pluginConfigs = (config as AgentConfig & { plugins?: unknown[] }).plugins;
+  if (pluginConfigs && pluginConfigs.length > 0) {
+    log.info({ pluginCount: pluginConfigs.length }, 'Initializing plugin system');
+
+    pluginLoader = createPluginLoader(
+      {
+        config,
+        childProcessManager: childManager,
+        restartChild: childManager ? (reason: string) => childManager!.restart(reason) : undefined,
+      },
+      {
+        pluginDir: process.env.ZNVAULT_AGENT_PLUGIN_DIR,
+      }
+    );
+
+    try {
+      // Load plugins from config
+      await pluginLoader.loadPlugins(config);
+
+      // Initialize plugins
+      await pluginLoader.initializePlugins();
+
+      log.info({ plugins: pluginLoader.getAllPluginStatuses() }, 'Plugins initialized');
+    } catch (err) {
+      log.error({ err }, 'Failed to initialize plugins');
+      // Continue running agent without plugins
+    }
+
+    // Wire up child process events to plugins
+    if (childManager) {
+      childManager.on('started', (pid: number) => {
+        const event: ChildProcessEvent = { type: 'started', pid };
+        void pluginLoader?.dispatchEvent('childProcess', event);
+      });
+
+      childManager.on('stopped', (code: number | null, signal: string | null) => {
+        const event: ChildProcessEvent = {
+          type: 'stopped',
+          exitCode: code ?? undefined,
+          signal: signal ?? undefined,
+        };
+        void pluginLoader?.dispatchEvent('childProcess', event);
+      });
+
+      childManager.on('restarting', (reason: string) => {
+        const event: ChildProcessEvent = { type: 'restarting', reason };
+        void pluginLoader?.dispatchEvent('childProcess', event);
+      });
+
+      childManager.on('maxRestartsExceeded', () => {
+        const event: ChildProcessEvent = { type: 'max_restarts' };
+        void pluginLoader?.dispatchEvent('childProcess', event);
+      });
+    }
+  }
+
+  // Start health server if port specified (pass plugin loader for routes and health aggregation)
   if (options.healthPort) {
     try {
-      await startHealthServer(options.healthPort);
+      await startHealthServer(options.healthPort, pluginLoader ?? undefined);
     } catch (err) {
       log.error({ err }, 'Failed to start health server');
     }
@@ -592,6 +663,20 @@ export async function startDaemon(options: {
 
         if (result.success) {
           log.info({ name: target.name, fingerprint: result.fingerprint }, 'Certificate deployed');
+
+          // Dispatch plugin event
+          if (pluginLoader) {
+            const certEvent: CertificateDeployedEvent = {
+              certId: target.certId,
+              name: target.name,
+              paths: target.outputs,
+              fingerprint: result.fingerprint || '',
+              expiresAt: '', // Would need cert parsing for this
+              commonName: '', // Would need cert parsing for this
+              isUpdate: true,
+            };
+            void pluginLoader.dispatchEvent('certificateDeployed', certEvent);
+          }
 
           // Restart child process if configured
           if (childManager && options.exec?.restartOnChange) {
@@ -629,6 +714,20 @@ export async function startDaemon(options: {
         if (result.success) {
           log.info({ name: target.name, version: result.version }, 'Secret deployed');
           deployedSecretTarget = true;
+
+          // Dispatch plugin event
+          if (pluginLoader) {
+            const secretEvent: SecretDeployedEvent = {
+              secretId: target.secretId,
+              alias: event.alias,
+              name: target.name,
+              path: target.output,
+              format: target.format,
+              version: result.version || event.version,
+              isUpdate: true,
+            };
+            void pluginLoader.dispatchEvent('secretDeployed', secretEvent);
+          }
         } else {
           log.error({ name: target.name, error: result.message }, 'Secret deployment failed');
         }
@@ -693,6 +792,18 @@ export async function startDaemon(options: {
         keyName: event.apiKeyName,
         keyPrefix: newKey.substring(0, 8),
       }, 'Fetched new API key value');
+
+      // Dispatch plugin event
+      if (pluginLoader) {
+        const keyEvent: KeyRotatedEvent = {
+          keyName: event.apiKeyName,
+          newPrefix: event.newPrefix,
+          graceExpiresAt: event.graceExpiresAt,
+          nextRotationAt: bindResponse.nextRotationAt,
+          rotationMode: event.rotationMode,
+        };
+        void pluginLoader.dispatchEvent('keyRotated', keyEvent);
+      }
 
       // Update env file if using output file mode
       if (execOutputFile) {
@@ -775,6 +886,16 @@ export async function startDaemon(options: {
 
   // Connect unified WebSocket
   unifiedClient.connect();
+
+  // Start plugins (after WebSocket is connecting but before initial sync)
+  if (pluginLoader) {
+    try {
+      await pluginLoader.startPlugins();
+      log.info({ plugins: pluginLoader.getAllPluginStatuses() }, 'Plugins started');
+    } catch (err) {
+      log.error({ err }, 'Failed to start plugins');
+    }
+  }
 
   // Initial sync - certificates
   if (config.targets.length > 0) {
@@ -865,6 +986,17 @@ export async function startDaemon(options: {
       stopManagedKeyRenewal();
     } else {
       stopApiKeyRenewal();
+    }
+
+    // Stop plugins
+    if (pluginLoader) {
+      try {
+        await pluginLoader.stopPlugins();
+        clearPluginLoader();
+        log.info('Plugins stopped');
+      } catch (err) {
+        log.warn({ err }, 'Error stopping plugins');
+      }
     }
 
     // Stop child process first (it needs to exit before we can)

@@ -227,12 +227,29 @@ Examples:
           console.log(`  Restart:     on cert/secret change (delay: ${execConfig.restartDelayMs}ms)`);
         }
       }
+
+      // Plugin status
+      const pluginConfigs = (config as typeof config & { plugins?: Array<{ package?: string; path?: string; enabled?: boolean }> }).plugins || [];
+      const enabledPlugins = pluginConfigs.filter(p => p.enabled !== false);
+      if (enabledPlugins.length > 0) {
+        console.log(`  Plugins:     ${chalk.cyan(enabledPlugins.length.toString())} configured`);
+      }
       console.log();
 
       if (targets.length > 0) {
         console.log(chalk.gray('Subscribed certificates:'));
         for (const target of targets) {
           console.log(`  - ${target.name} (${target.certId.substring(0, 8)}...)`);
+        }
+        console.log();
+      }
+
+      // List configured plugins
+      if (enabledPlugins.length > 0) {
+        console.log(chalk.gray('Configured plugins:'));
+        for (const plugin of enabledPlugins) {
+          const name = plugin.package || plugin.path || 'unknown';
+          console.log(`  - ${name}`);
         }
         console.log();
       }
