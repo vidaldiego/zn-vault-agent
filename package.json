@@ -1,6 +1,6 @@
 {
   "name": "@zincapp/zn-vault-agent",
-  "version": "1.14.2",
+  "version": "1.14.3",
   "description": "ZnVault Certificate Agent - Real-time certificate and secret distribution",
   "type": "module",
   "main": "dist/index.js",
@@ -67,7 +67,7 @@
   },
   "homepage": "https://github.com/vidaldiego/zn-vault-agent#readme",
   "dependencies": {
-    "@zincapp/znvault-plugin-payara": "^1.1.0",
+    "@zincapp/znvault-plugin-payara": "^1.4.3",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
     "conf": "^13.0.1",
