@@ -386,31 +386,47 @@ export class PluginLoader extends EventEmitter {
     const statuses: PluginHealthStatus[] = [];
 
     for (const [name, loaded] of this.plugins) {
-      // Include status for errored plugins
+      // If plugin has healthCheck, always call it (even if status is 'error')
+      // This allows plugins to recover from transient startup failures
+      if (loaded.plugin.healthCheck) {
+        const ctx = createPluginContext(name, this.agentInternals, this);
+
+        try {
+          const status = await loaded.plugin.healthCheck(ctx);
+          statuses.push(status);
+
+          // If health check returns healthy and plugin was in error state, recover it
+          if (status.status === 'healthy' && loaded.status === 'error') {
+            log.info({ name }, 'Plugin recovered from error state');
+            loaded.status = 'running';
+            loaded.error = undefined;
+          }
+        } catch (err) {
+          const error = err instanceof Error ? err : new Error(String(err));
+          statuses.push({
+            name,
+            status: 'unhealthy',
+            message: `Health check failed: ${error.message}`,
+          });
+        }
+        continue;
+      }
+
+      // No healthCheck method - report based on plugin status
       if (loaded.status === 'error') {
         statuses.push({
           name,
           status: 'unhealthy',
           message: loaded.error?.message || 'Plugin failed to load',
         });
-        continue;
-      }
-
-      if (loaded.status !== 'running' || !loaded.plugin.healthCheck) continue;
-
-      const ctx = createPluginContext(name, this.agentInternals, this);
-
-      try {
-        const status = await loaded.plugin.healthCheck(ctx);
-        statuses.push(status);
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
+      } else if (loaded.status === 'running') {
+        // Running but no health check - assume healthy
         statuses.push({
           name,
-          status: 'unhealthy',
-          message: `Health check failed: ${error.message}`,
+          status: 'healthy',
         });
       }
+      // Skip plugins that aren't running and don't have errors
     }
 
     return statuses;
