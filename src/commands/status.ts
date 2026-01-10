@@ -37,7 +37,7 @@ Examples:
       }
 
       console.log();
-      console.log(chalk.bold('ZN-Vault Agent Status'));
+      console.log(chalk.bold('ZnVault Agent Status'));
       console.log();
 
       if (!isConfigured()) {

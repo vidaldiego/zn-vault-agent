@@ -626,7 +626,7 @@ export async function startDaemon(options: {
     execSecrets: execSecretIds.length,
     execManagedKeys: execManagedKeyNames.length,
     execCommand: options.exec?.command.join(' '),
-  }, 'Starting ZN-Vault Agent');
+  }, 'Starting ZnVault Agent');
 
   // Initialize child process manager if exec config provided
   let childManager: ChildProcessManager | null = null;

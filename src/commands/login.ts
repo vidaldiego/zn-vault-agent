@@ -116,7 +116,7 @@ Examples:
         }
 
         console.log();
-        console.log(chalk.bold('ZN-Vault Agent Configuration') + ' (non-interactive)');
+        console.log(chalk.bold('ZnVault Agent Configuration') + ' (non-interactive)');
         console.log();
         console.log(`  Vault URL:   ${vaultUrl}`);
         console.log(`  Tenant ID:   ${tenantId}`);
@@ -126,7 +126,7 @@ Examples:
       } else {
         // Interactive mode: prompt for values
         console.log();
-        console.log(chalk.bold('ZN-Vault Agent Configuration'));
+        console.log(chalk.bold('ZnVault Agent Configuration'));
         console.log();
 
         const answers = await inquirer.prompt([

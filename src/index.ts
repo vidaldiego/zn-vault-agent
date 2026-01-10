@@ -31,7 +31,7 @@ const program = new Command();
 
 program
   .name('zn-vault-agent')
-  .description('ZN-Vault Agent - Sync certificates and secrets from vault')
+  .description('ZnVault Agent - Sync certificates and secrets from vault')
   .version(version);
 
 // Register commands

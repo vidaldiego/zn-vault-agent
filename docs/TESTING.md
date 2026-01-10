@@ -1,6 +1,6 @@
-# ZN-Vault Agent Testing Documentation
+# ZnVault Agent Testing Documentation
 
-This document describes the comprehensive testing infrastructure for the ZN-Vault Agent.
+This document describes the comprehensive testing infrastructure for the ZnVault Agent.
 
 ## Overview
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=ZN-Vault Certificate Agent
+Description=ZnVault Certificate Agent
 Documentation=https://github.com/zincapp/zn-vault
 After=network-online.target
 Wants=network-online.target

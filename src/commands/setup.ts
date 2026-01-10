@@ -58,7 +58,7 @@ Examples:
 
 async function handleInstall(options: { skipUser?: boolean; yes?: boolean }): Promise<void> {
   console.log();
-  console.log(chalk.bold('ZN-Vault Agent Setup'));
+  console.log(chalk.bold('ZnVault Agent Setup'));
   console.log();
 
   // Confirm installation
@@ -136,7 +136,7 @@ async function handleInstall(options: { skipUser?: boolean; yes?: boolean }): Pr
     console.log(`Creating ${envFile}...`);
     writeFileSync(
       envFile,
-      `# ZN-Vault Agent Configuration
+      `# ZnVault Agent Configuration
 # See: zn-vault-agent --help
 
 # Logging
@@ -208,7 +208,7 @@ LOG_LEVEL=info
 
 async function handleUninstall(options: { purge?: boolean; yes?: boolean }): Promise<void> {
   console.log();
-  console.log(chalk.bold('ZN-Vault Agent Uninstall'));
+  console.log(chalk.bold('ZnVault Agent Uninstall'));
   console.log();
 
   // Confirm uninstall
@@ -306,7 +306,7 @@ function generateServiceFile(): string {
   }
 
   return `[Unit]
-Description=ZN-Vault Certificate Agent
+Description=ZnVault Certificate Agent
 Documentation=https://github.com/zincapp/zn-vault
 After=network-online.target
 Wants=network-online.target

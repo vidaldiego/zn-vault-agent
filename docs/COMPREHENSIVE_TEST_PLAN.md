@@ -1,11 +1,11 @@
-# ZN-Vault Agent - Comprehensive Test Plan
+# ZnVault Agent - Comprehensive Test Plan
 
 This document outlines a complete testing strategy for the zn-vault-agent, covering all features and capabilities.
 
 ## Test Environment Setup
 
 ### Prerequisites
-- ZN-Vault server running in test mode (port 9443)
+- ZnVault server running in test mode (port 9443)
 - Test tenant with certificates and secrets created
 - API key with appropriate permissions
 - Docker for isolated testing

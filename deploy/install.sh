@@ -1,5 +1,5 @@
 #!/bin/bash
-# ZN-Vault Certificate Agent Installation Script
+# ZnVault Certificate Agent Installation Script
 #
 # Usage:
 #   sudo ./install.sh           # Install from local build
@@ -56,7 +56,7 @@ check_node() {
 }
 
 uninstall() {
-    log_info "Uninstalling ZN-Vault Certificate Agent..."
+    log_info "Uninstalling ZnVault Certificate Agent..."
 
     # Use the agent's setup --uninstall if available
     if command -v zn-vault-agent &> /dev/null; then

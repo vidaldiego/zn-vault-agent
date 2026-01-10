@@ -1,6 +1,6 @@
-# ZN-Vault Certificate Agent
+# ZnVault Certificate Agent
 
-Real-time certificate distribution agent for ZN-Vault. Automatically syncs TLS certificates from your vault to target servers with zero-downtime deployments.
+Real-time certificate distribution agent for ZnVault. Automatically syncs TLS certificates from your vault to target servers with zero-downtime deployments.
 
 ## Features
 
@@ -181,7 +181,7 @@ curl -sk -X POST https://vault.example.com/auth/api-keys \
 
 #### Via Dashboard
 
-In the ZN-Vault dashboard:
+In the ZnVault dashboard:
 1. Navigate to **Settings** → **API Keys**
 2. Click **Create API Key**
 3. Set name: `cert-agent-<hostname>`
@@ -388,7 +388,7 @@ When using managed keys, the agent automatically persists new keys to the config
 
 **Log output during restart recovery:**
 ```json
-{"level":"info","msg":"Starting ZN-Vault Agent"}
+{"level":"info","msg":"Starting ZnVault Agent"}
 {"level":"info","msg":"Using managed API key mode"}
 {"level":"info","msg":"Binding to managed key","name":"my-service-key"}
 {"level":"info","msg":"Managed key bound","prefix":"znv_abc1","nextRotationAt":"2026-01-08T20:00:00Z"}

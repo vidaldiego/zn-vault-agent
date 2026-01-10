@@ -190,7 +190,7 @@ Examples:
 
       // Print startup banner
       console.log();
-      console.log(chalk.bold('ZN-Vault Certificate Agent'));
+      console.log(chalk.bold('ZnVault Certificate Agent'));
       console.log();
       console.log(`  Vault:       ${config.vaultUrl}`);
       console.log(`  Tenant:      ${config.tenantId}`);

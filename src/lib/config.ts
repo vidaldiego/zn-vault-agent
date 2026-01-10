@@ -212,7 +212,15 @@ export function loadConfig(): AgentConfig {
   if (fs.existsSync(configFile)) {
     try {
       const content = fs.readFileSync(configFile, 'utf-8');
-      config = JSON.parse(content) as AgentConfig;
+      const parsed = JSON.parse(content) as Partial<AgentConfig>;
+      // Merge with defaults to ensure all fields are present
+      config = {
+        ...emptyConfig,
+        ...parsed,
+        auth: { ...emptyConfig.auth, ...parsed.auth },
+        targets: parsed.targets ?? [],
+        secretTargets: parsed.secretTargets ?? [],
+      };
       log.debug({ path: configFile }, 'Loaded system config');
     } catch (err) {
       log.error({ err, path: configFile }, 'Failed to load system config');

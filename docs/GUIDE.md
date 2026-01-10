@@ -1,6 +1,6 @@
-# ZN-Vault Agent Guide
+# ZnVault Agent Guide
 
-Comprehensive documentation for the ZN-Vault Certificate Agent.
+Comprehensive documentation for the ZnVault Certificate Agent.
 
 ## Table of Contents
 
@@ -26,7 +26,7 @@ Comprehensive documentation for the ZN-Vault Certificate Agent.
 
 ## Introduction
 
-The ZN-Vault Agent is a certificate synchronization daemon that automatically keeps local certificate files in sync with certificates stored in the vault. When certificates are rotated or updated, agents are notified in real-time via WebSocket and automatically sync the changes.
+The ZnVault Agent is a certificate synchronization daemon that automatically keeps local certificate files in sync with certificates stored in the vault. When certificates are rotated or updated, agents are notified in real-time via WebSocket and automatically sync the changes.
 
 ### Two Ways to Use
 
@@ -61,7 +61,7 @@ Both share the same config file format and can be used together:
          │                         │                         │
          ▼                         ▼                         ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         ZN-Vault Cluster                            │
+│                         ZnVault Cluster                            │
 │  ┌──────────┐   ┌──────────┐   ┌──────────┐                        │
 │  │ Vault-1  │◄──│  Redis   │──►│ Vault-2  │   (Events distributed  │
 │  │          │   │ Pub/Sub  │   │          │    via Redis)          │
@@ -914,7 +914,7 @@ The `/health` endpoint includes child process status:
 
 ```ini
 [Unit]
-Description=ZN-Vault Agent (Combined Mode)
+Description=ZnVault Agent (Combined Mode)
 After=network-online.target
 Wants=network-online.target
 
@@ -1468,7 +1468,7 @@ Create `/etc/systemd/system/zn-vault-agent.service`:
 
 ```ini
 [Unit]
-Description=ZN-Vault Certificate Agent
+Description=ZnVault Certificate Agent
 After=network-online.target
 Wants=network-online.target
 
