@@ -15,6 +15,7 @@ import { validateConfig, formatValidationResult } from '../lib/validation.js';
 import { startDaemon } from '../lib/websocket.js';
 import { logger } from '../lib/logger.js';
 import { NpmAutoUpdateService, loadUpdateConfig } from '../services/npm-auto-update.js';
+import { PluginAutoUpdateService, loadPluginUpdateConfig } from '../services/plugin-auto-update.js';
 import { parseSecretMapping, isSensitiveEnvVar, type ExecSecret } from '../lib/secret-env.js';
 
 // Helper to collect repeatable options
@@ -32,6 +33,8 @@ export function registerStartCommand(program: Command): void {
     .option('--foreground', 'Run in foreground (default)')
     .option('--auto-update', 'Enable automatic updates (uses saved config)')
     .option('--no-auto-update', 'Disable automatic updates')
+    .option('--plugin-auto-update', 'Enable automatic plugin updates (default: enabled)')
+    .option('--no-plugin-auto-update', 'Disable automatic plugin updates')
     // Exec mode options
     .option('--exec <command>', 'Command to execute with secrets (combined mode)')
     .option('-s, --secret <mapping>', 'Secret mapping for exec (ENV=secret, repeatable)', collect, [])
@@ -219,6 +222,8 @@ Examples:
       const autoUpdateEnabled = options.autoUpdate !== false && updateConfig.enabled;
       console.log(`  Auto-update: ${autoUpdateEnabled ? chalk.green('enabled') : 'disabled'}`);
 
+      // Plugin auto-update status (shown later if plugins are configured)
+
       // Exec mode status
       if (execConfig) {
         console.log(`  Exec:        ${chalk.cyan(execConfig.command.join(' '))}`);
@@ -229,10 +234,12 @@ Examples:
       }
 
       // Plugin status
-      const pluginConfigs = (config as typeof config & { plugins?: Array<{ package?: string; path?: string; enabled?: boolean }> }).plugins || [];
+      const pluginConfigs = (config as typeof config & { plugins?: Array<{ package?: string; path?: string; enabled?: boolean; autoUpdate?: { enabled?: boolean } }> }).plugins || [];
       const enabledPlugins = pluginConfigs.filter(p => p.enabled !== false);
       if (enabledPlugins.length > 0) {
+        const pluginUpdateEnabled = options.pluginAutoUpdate !== false && loadPluginUpdateConfig().enabled;
         console.log(`  Plugins:     ${chalk.cyan(enabledPlugins.length.toString())} configured`);
+        console.log(`  Plugin update: ${pluginUpdateEnabled ? chalk.green('enabled') : 'disabled'}`);
       }
       console.log();
 
@@ -300,6 +307,16 @@ Examples:
         logger.info('Starting npm-based auto-update service');
         autoUpdateService = new NpmAutoUpdateService(updateConfig);
         autoUpdateService.start();
+      }
+
+      // Start plugin auto-update service if enabled and plugins are configured
+      let pluginAutoUpdateService: PluginAutoUpdateService | null = null;
+      const pluginUpdateConfig = loadPluginUpdateConfig();
+      const pluginAutoUpdateEnabled = options.pluginAutoUpdate !== false && pluginUpdateConfig.enabled && enabledPlugins.length > 0;
+      if (pluginAutoUpdateEnabled) {
+        logger.info({ plugins: enabledPlugins.length }, 'Starting plugin auto-update service');
+        pluginAutoUpdateService = new PluginAutoUpdateService(pluginConfigs, pluginUpdateConfig);
+        pluginAutoUpdateService.start();
       }
 
       try {

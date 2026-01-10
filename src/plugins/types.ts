@@ -88,6 +88,16 @@ export type PluginFactory<TConfig = Record<string, unknown>> = (
 ) => AgentPlugin;
 
 /**
+ * Plugin auto-update configuration
+ */
+export interface PluginAutoUpdateConfig {
+  /** Enable auto-update for this plugin (default: inherits from agent config) */
+  enabled?: boolean;
+  /** Release channel: 'latest', 'beta', 'next' (default: 'latest') */
+  channel?: 'latest' | 'beta' | 'next';
+}
+
+/**
  * Plugin configuration in agent config.json
  */
 export interface PluginConfig {
@@ -102,6 +112,23 @@ export interface PluginConfig {
 
   /** Enable/disable plugin (default: true) */
   enabled?: boolean;
+
+  /** Auto-update settings for this plugin */
+  autoUpdate?: PluginAutoUpdateConfig;
+}
+
+/**
+ * Plugin version info for update checking
+ */
+export interface PluginVersionInfo {
+  /** Plugin package name */
+  package: string;
+  /** Currently installed version */
+  current: string;
+  /** Latest available version */
+  latest: string;
+  /** Whether an update is available */
+  updateAvailable: boolean;
 }
 
 /**
