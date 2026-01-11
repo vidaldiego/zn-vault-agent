@@ -7,6 +7,7 @@ import {
   isConfigured,
   loadConfig,
   getTargets,
+  getSecretTargets,
   isManagedKeyMode,
   type ExecConfig,
   DEFAULT_EXEC_CONFIG,
@@ -98,6 +99,7 @@ Examples:
 
       const config = loadConfig();
       const targets = getTargets();
+      const secretTargets = getSecretTargets();
 
       // Build exec config from CLI options or config file
       let execConfig: ExecConfig | undefined;
@@ -180,8 +182,8 @@ Examples:
       }
 
       // Warn if no targets and no exec
-      if (targets.length === 0 && !execConfig) {
-        console.log(chalk.yellow('Warning: No certificate targets configured.'));
+      if (targets.length === 0 && secretTargets.length === 0 && !execConfig) {
+        console.log(chalk.yellow('Warning: No certificate or secret targets configured.'));
         console.log('Run ' + chalk.cyan('zn-vault-agent add') + ' to add certificates to sync.');
         console.log();
       }
@@ -197,7 +199,8 @@ Examples:
       console.log();
       console.log(`  Vault:       ${config.vaultUrl}`);
       console.log(`  Tenant:      ${config.tenantId}`);
-      console.log(`  Targets:     ${targets.length} certificate(s)`);
+      console.log(`  Certs:       ${targets.length} certificate(s)`);
+      console.log(`  Secrets:     ${secretTargets.length} secret(s)`);
       console.log(`  Poll:        every ${config.pollInterval || 3600}s`);
       if (options.healthPort) {
         console.log(`  Health:      http://0.0.0.0:${options.healthPort}/health`);
@@ -247,6 +250,14 @@ Examples:
         console.log(chalk.gray('Subscribed certificates:'));
         for (const target of targets) {
           console.log(`  - ${target.name} (${target.certId.substring(0, 8)}...)`);
+        }
+        console.log();
+      }
+
+      if (secretTargets.length > 0) {
+        console.log(chalk.gray('Subscribed secrets:'));
+        for (const target of secretTargets) {
+          console.log(`  - ${target.name} (${target.secretId.substring(0, 8)}...)`);
         }
         console.log();
       }

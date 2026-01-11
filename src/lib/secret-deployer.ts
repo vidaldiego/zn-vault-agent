@@ -148,15 +148,21 @@ export async function deploySecret(
       };
     }
 
-    // Format the data
-    const content = formatSecretData(secret.data, target.format, {
-      key: target.key,
-      envPrefix: target.envPrefix,
-      templatePath: target.templatePath,
-    });
+    // Skip file writing for 'none' format (subscribe-only mode)
+    if (target.format !== 'none') {
+      // Format the data
+      const content = formatSecretData(secret.data, target.format, {
+        key: target.key,
+        envPrefix: target.envPrefix,
+        templatePath: target.templatePath,
+      });
 
-    // Write to file
-    writeSecretFile(target.output, content, target.owner, target.mode);
+      // Write to file
+      if (!target.output) {
+        throw new Error(`Output path required for format '${target.format}'`);
+      }
+      writeSecretFile(target.output, content, target.owner, target.mode);
+    }
 
     // Update config with new version
     updateSecretTargetVersion(target.secretId, secret.version);
@@ -174,19 +180,20 @@ export async function deploySecret(
     const durationMs = Date.now() - startTime;
     metrics.secretDeployed(target.name, true, durationMs);
 
+    const isSubscribeOnly = target.format === 'none';
     log.info({
       name: target.name,
       secretId: target.secretId,
       version: secret.version,
-      output: target.output,
+      output: isSubscribeOnly ? '(subscribe-only)' : target.output,
       durationMs,
-    }, 'Secret deployed successfully');
+    }, isSubscribeOnly ? 'Secret synced (subscribe-only)' : 'Secret deployed successfully');
 
     return {
       success: true,
       secretId: target.secretId,
       name: target.name,
-      message: 'Deployed successfully',
+      message: isSubscribeOnly ? 'Synced (subscribe-only)' : 'Deployed successfully',
       version: secret.version,
       durationMs,
     };

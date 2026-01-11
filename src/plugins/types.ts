@@ -336,10 +336,10 @@ export interface SecretDeployedEvent {
   alias?: string;
   /** Secret name (from target config) */
   name: string;
-  /** Output file path */
-  path: string;
+  /** Output file path (undefined for subscribe-only 'none' format) */
+  path?: string;
   /** Output format used */
-  format: 'env' | 'json' | 'yaml' | 'raw' | 'template';
+  format: 'env' | 'json' | 'yaml' | 'raw' | 'template' | 'none';
   /** Secret version */
   version: number;
   /** Whether this was an update (true) or initial sync (false) */

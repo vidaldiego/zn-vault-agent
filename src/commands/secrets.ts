@@ -137,15 +137,21 @@ async function syncSecretTarget(target: SecretTarget): Promise<boolean> {
   try {
     const secret = await getSecret(target.secretId);
 
-    // Format the data
-    const content = formatSecretData(secret, target.format, {
-      key: target.key,
-      envPrefix: target.envPrefix,
-      templatePath: target.templatePath,
-    });
+    // Skip file writing for 'none' format (subscribe-only mode)
+    if (target.format !== 'none') {
+      // Format the data
+      const content = formatSecretData(secret, target.format, {
+        key: target.key,
+        envPrefix: target.envPrefix,
+        templatePath: target.templatePath,
+      });
 
-    // Write to file
-    writeSecretFile(target.output, content, target.owner, target.mode);
+      // Write to file
+      if (!target.output) {
+        throw new Error(`Output path required for format '${target.format}'`);
+      }
+      writeSecretFile(target.output, content, target.owner, target.mode);
+    }
 
     // Update config with new version
     updateSecretTargetVersion(target.secretId, secret.version);

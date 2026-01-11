@@ -48,10 +48,10 @@ export interface SecretTarget {
   secretId: string;
   /** Human-readable name */
   name: string;
-  /** Output format */
-  format: 'env' | 'json' | 'yaml' | 'raw' | 'template';
-  /** Output file path */
-  output: string;
+  /** Output format. Use 'none' for subscribe-only mode (no file output) */
+  format: 'env' | 'json' | 'yaml' | 'raw' | 'template' | 'none';
+  /** Output file path (not required when format is 'none') */
+  output?: string;
   /** For 'raw' format: which key from the secret data to extract */
   key?: string;
   /** For 'template' format: path to template file */
