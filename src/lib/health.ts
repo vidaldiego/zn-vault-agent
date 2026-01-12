@@ -215,6 +215,7 @@ function createFastifyInstance(): FastifyInstance {
   const fastify = Fastify({
     logger: false, // We use our own pino logger
     trustProxy: true,
+    bodyLimit: 500 * 1024 * 1024, // 500MB for WAR file uploads
   });
 
   // CORS support for monitoring tools
