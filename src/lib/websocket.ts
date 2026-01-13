@@ -451,6 +451,9 @@ export function createUnifiedWebSocketClient(
       return;
     }
 
+    // Reset shouldReconnect - if connect() is called explicitly, we want reconnection enabled
+    shouldReconnect = true;
+
     const config = loadConfig();
 
     if (!config.vaultUrl) {
