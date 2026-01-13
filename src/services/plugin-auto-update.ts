@@ -288,6 +288,8 @@ export class PluginAutoUpdateService {
    * Uses `npm list -g --json` for accurate global package version detection.
    */
   private detectInstalledVersions(): void {
+    logger.info({ plugins: this.plugins.map(p => p.package) }, 'Detecting installed plugin versions');
+
     // First try npm list for all packages at once
     try {
       const { execSync } = require('child_process');
@@ -305,15 +307,15 @@ export class PluginAutoUpdateService {
         const pkgInfo = dependencies[plugin.package];
         if (pkgInfo?.version) {
           this.installedVersions.set(plugin.package, pkgInfo.version);
-          logger.debug({ package: plugin.package, version: pkgInfo.version }, 'Detected installed plugin version');
+          logger.info({ package: plugin.package, version: pkgInfo.version }, 'Detected installed plugin version');
         } else {
           this.installedVersions.set(plugin.package, '0.0.0');
-          logger.debug({ package: plugin.package }, 'Plugin not found in global packages');
+          logger.warn({ package: plugin.package, availablePackages: Object.keys(dependencies) }, 'Plugin not found in global packages');
         }
       }
       return;
     } catch (err) {
-      logger.debug({ err }, 'Failed to get versions via npm list, falling back to require.resolve');
+      logger.warn({ err }, 'Failed to get versions via npm list, falling back to require.resolve');
     }
 
     // Fallback to require.resolve for each plugin
