@@ -288,12 +288,10 @@ export class PluginAutoUpdateService {
    * Uses `npm list -g --json` for accurate global package version detection.
    */
   private detectInstalledVersions(): void {
-    console.log(`  [PluginAutoUpdate] detectInstalledVersions called with ${this.plugins.length} plugins`);
-    logger.info({ plugins: this.plugins.map(p => p.package) }, 'Detecting installed plugin versions');
+    logger.debug({ plugins: this.plugins.map(p => p.package) }, 'Detecting installed plugin versions');
 
     // First try npm list for all packages at once
     try {
-      console.log('  [PluginAutoUpdate] Running npm list -g --json --depth=0...');
       const output = execSync('npm list -g --json --depth=0', {
         encoding: 'utf-8',
         timeout: 10000,
@@ -301,7 +299,6 @@ export class PluginAutoUpdateService {
       });
       const npmList = JSON.parse(output);
       const dependencies = npmList.dependencies || {};
-      console.log(`  [PluginAutoUpdate] npm list found ${Object.keys(dependencies).length} global packages`);
 
       for (const plugin of this.plugins) {
         if (!plugin.package) continue;
@@ -309,17 +306,14 @@ export class PluginAutoUpdateService {
         const pkgInfo = dependencies[plugin.package];
         if (pkgInfo?.version) {
           this.installedVersions.set(plugin.package, pkgInfo.version);
-          console.log(`  [PluginAutoUpdate] ${plugin.package} = ${pkgInfo.version}`);
           logger.info({ package: plugin.package, version: pkgInfo.version }, 'Detected installed plugin version');
         } else {
           this.installedVersions.set(plugin.package, '0.0.0');
-          console.log(`  [PluginAutoUpdate] ${plugin.package} NOT FOUND in: ${Object.keys(dependencies).join(', ')}`);
-          logger.warn({ package: plugin.package, availablePackages: Object.keys(dependencies) }, 'Plugin not found in global packages');
+          logger.warn({ package: plugin.package }, 'Plugin not found in global packages');
         }
       }
       return;
     } catch (err) {
-      console.log(`  [PluginAutoUpdate] npm list failed: ${err}`);
       logger.warn({ err }, 'Failed to get versions via npm list, falling back to require.resolve');
     }
 

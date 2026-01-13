@@ -324,14 +324,10 @@ Examples:
       let pluginAutoUpdateService: PluginAutoUpdateService | null = null;
       const pluginUpdateConfig = loadPluginUpdateConfig();
       const pluginAutoUpdateEnabled = options.pluginAutoUpdate !== false && pluginUpdateConfig.enabled && enabledPlugins.length > 0;
-      console.log(chalk.gray(`  Plugin update debug: enabled=${pluginAutoUpdateEnabled}, configEnabled=${pluginUpdateConfig.enabled}, plugins=${enabledPlugins.length}`));
       if (pluginAutoUpdateEnabled) {
         logger.info({ plugins: enabledPlugins.length }, 'Starting plugin auto-update service');
-        console.log(chalk.gray('  Creating PluginAutoUpdateService...'));
         pluginAutoUpdateService = new PluginAutoUpdateService(pluginConfigs, pluginUpdateConfig);
-        console.log(chalk.gray('  Calling pluginAutoUpdateService.start()...'));
         pluginAutoUpdateService.start();
-        console.log(chalk.gray('  PluginAutoUpdateService started'));
       }
 
       try {
