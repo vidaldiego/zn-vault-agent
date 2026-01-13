@@ -1138,6 +1138,34 @@ export async function startDaemon(options: {
 
   const pollTimer = setInterval(poll, pollInterval);
 
+  // Periodic managed key file sync check (every 60 seconds)
+  // This catches cases where the file is overwritten/corrupted mid-run
+  let keySyncTimer: NodeJS.Timeout | null = null;
+  if (config.managedKey?.filePath) {
+    const KEY_SYNC_INTERVAL = 60_000; // 60 seconds
+
+    keySyncTimer = setInterval(() => {
+      if (isShuttingDown) return;
+
+      const syncResult = syncManagedKeyFile();
+      if (syncResult.wasOutOfSync) {
+        if (syncResult.synced) {
+          log.warn({
+            filePath: config.managedKey!.filePath,
+          }, 'Periodic check: Managed key file was out of sync - auto-fixed');
+        } else {
+          log.error({
+            filePath: config.managedKey!.filePath,
+            error: syncResult.error,
+          }, 'Periodic check: CRITICAL - Managed key file sync failed');
+        }
+      }
+      // Don't log on success - too noisy
+    }, KEY_SYNC_INTERVAL);
+
+    log.info({ intervalMs: KEY_SYNC_INTERVAL }, 'Periodic managed key file sync check enabled');
+  }
+
   // Graceful shutdown handler
   const shutdown = async (signal: string) => {
     if (isShuttingDown) {
@@ -1150,6 +1178,7 @@ export async function startDaemon(options: {
 
     // Stop accepting new events
     clearInterval(pollTimer);
+    if (keySyncTimer) clearInterval(keySyncTimer);
     unifiedClient.disconnect();
 
     // Stop API key renewal service (managed or standard)
