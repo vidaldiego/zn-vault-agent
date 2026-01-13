@@ -465,16 +465,20 @@ export function updateSecretTargetVersion(secretId: string, version: number): vo
  * the config file value).
  */
 /**
- * Write managed key to file using atomic write (write to temp + rename).
+ * Write managed key to file using paranoid-level durability guarantees.
  * This is a CRITICAL operation - failures must be logged and thrown.
  *
- * Atomic write pattern:
- * 1. Write to temp file in same directory
- * 2. Verify temp file contents
- * 3. Apply permissions/ownership to temp file
- * 4. Rename temp to target (atomic on POSIX)
+ * Durability pattern:
+ * 1. Create backup of existing file (if present)
+ * 2. Write to temp file using open/write/fsync/close (ensures data on disk)
+ * 3. Verify temp file contents
+ * 4. Apply permissions/ownership to temp file
+ * 5. Atomic rename temp to target (POSIX guarantees atomicity)
  *
- * If power fails mid-write, temp file is left behind but original is intact.
+ * Recovery guarantees:
+ * - Power failure during write: original file intact, temp may exist
+ * - Power failure after fsync but before rename: original intact, temp valid
+ * - Corruption of main file: backup available at .backup
  */
 function writeManagedKeyToFile(
   filePath: string,
@@ -483,6 +487,7 @@ function writeManagedKeyToFile(
 ): void {
   const dir = path.dirname(filePath);
   const tempPath = `${filePath}.tmp.${process.pid}`;
+  const backupPath = `${filePath}.backup`;
 
   // Ensure directory exists
   if (!fs.existsSync(dir)) {
@@ -491,22 +496,48 @@ function writeManagedKeyToFile(
   }
 
   try {
-    // Step 1: Write to temp file
-    fs.writeFileSync(tempPath, key, { mode: 0o640 });
+    // Step 1: Create backup of existing file (if present and valid)
+    if (fs.existsSync(filePath)) {
+      try {
+        const currentKey = fs.readFileSync(filePath, 'utf-8');
+        // Only backup if current file has valid content (not empty/corrupted)
+        if (currentKey && currentKey.startsWith('znv_')) {
+          fs.copyFileSync(filePath, backupPath);
+          // Apply same permissions to backup
+          if (options?.mode) {
+            fs.chmodSync(backupPath, parseInt(options.mode, 8));
+          }
+          log.debug({ backupPath }, 'Created backup of existing key file');
+        }
+      } catch (backupErr) {
+        // Non-fatal - continue without backup
+        log.warn({ backupPath, err: backupErr }, 'Failed to create backup (continuing)');
+      }
+    }
 
-    // Step 2: Verify temp file contents before rename
+    // Step 2: Write to temp file with fsync for durability
+    // Using open/write/fsync/close instead of writeFileSync ensures data is on disk
+    const fd = fs.openSync(tempPath, 'w', 0o640);
+    try {
+      fs.writeSync(fd, key);
+      fs.fsyncSync(fd); // Force data to disk - critical for durability
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    // Step 3: Verify temp file contents before rename
     const written = fs.readFileSync(tempPath, 'utf-8');
     if (written !== key) {
       throw new Error('Temp file verification failed: written content doesn\'t match');
     }
 
-    // Step 3: Apply custom mode if specified
+    // Step 4: Apply custom mode if specified
     if (options?.mode) {
       const mode = parseInt(options.mode, 8);
       fs.chmodSync(tempPath, mode);
     }
 
-    // Step 4: Apply ownership if specified and running as root
+    // Step 5: Apply ownership if specified and running as root
     if (options?.owner && process.getuid?.() === 0) {
       const [user, group] = options.owner.split(':');
       try {
@@ -522,10 +553,10 @@ function writeManagedKeyToFile(
       }
     }
 
-    // Step 5: Atomic rename (POSIX guarantees this is atomic)
+    // Step 6: Atomic rename (POSIX guarantees this is atomic)
     fs.renameSync(tempPath, filePath);
 
-    log.info({ path: filePath }, 'Managed key written atomically and verified');
+    log.info({ path: filePath }, 'Managed key written with fsync and verified');
   } catch (err) {
     // Clean up temp file on failure
     try {
@@ -536,9 +567,33 @@ function writeManagedKeyToFile(
       // Ignore cleanup errors
     }
 
-    log.error({ path: filePath, err }, 'CRITICAL: Managed key file atomic write FAILED');
+    log.error({ path: filePath, err }, 'CRITICAL: Managed key file write FAILED');
     throw err;
   }
+}
+
+/**
+ * Attempt to recover key from backup file if main file is missing/corrupted.
+ * Returns the recovered key or null if recovery not possible.
+ */
+function recoverKeyFromBackup(filePath: string): string | null {
+  const backupPath = `${filePath}.backup`;
+
+  if (!fs.existsSync(backupPath)) {
+    return null;
+  }
+
+  try {
+    const backupKey = fs.readFileSync(backupPath, 'utf-8');
+    if (backupKey && backupKey.startsWith('znv_')) {
+      log.warn({ backupPath }, 'Recovered key from backup file');
+      return backupKey;
+    }
+  } catch (err) {
+    log.error({ backupPath, err }, 'Failed to read backup file');
+  }
+
+  return null;
 }
 
 export function updateManagedKey(
@@ -609,9 +664,10 @@ export function isManagedKeyMode(): boolean {
 
 /**
  * Verify and sync managed key file on startup.
+ * Includes backup recovery if main file is corrupted/missing.
  * Returns true if file was in sync or successfully synced, false if sync failed.
  */
-export function syncManagedKeyFile(): { synced: boolean; wasOutOfSync: boolean; error?: string } {
+export function syncManagedKeyFile(): { synced: boolean; wasOutOfSync: boolean; recoveredFromBackup?: boolean; error?: string } {
   const config = loadConfig();
 
   if (!config.managedKey?.filePath) {
@@ -640,7 +696,31 @@ export function syncManagedKeyFile(): { synced: boolean; wasOutOfSync: boolean; 
     return { synced: true, wasOutOfSync: false };
   }
 
-  // File is out of sync - fix it
+  // File is out of sync - try backup recovery first
+  if (!currentKey || !currentKey.startsWith('znv_')) {
+    const backupKey = recoverKeyFromBackup(filePath);
+    if (backupKey === expectedKey) {
+      // Backup matches expected key - restore from backup
+      log.info({ path: filePath }, 'Backup matches expected key - restoring');
+      try {
+        writeManagedKeyToFile(filePath, backupKey, {
+          owner: config.managedKey.fileOwner,
+          mode: config.managedKey.fileMode,
+        });
+        return { synced: true, wasOutOfSync: true, recoveredFromBackup: true };
+      } catch (err) {
+        log.error({ path: filePath, err }, 'Failed to restore from backup');
+        // Fall through to write expected key
+      }
+    } else if (backupKey) {
+      log.warn({
+        backupPrefix: backupKey.substring(0, 20),
+        expectedPrefix: expectedKey.substring(0, 20),
+      }, 'Backup exists but does not match expected key - using expected key');
+    }
+  }
+
+  // File is out of sync - fix it with expected key
   log.warn({
     path: filePath,
     expectedPrefix: expectedKey.substring(0, 20),
@@ -652,7 +732,7 @@ export function syncManagedKeyFile(): { synced: boolean; wasOutOfSync: boolean; 
       owner: config.managedKey.fileOwner,
       mode: config.managedKey.fileMode,
     });
-    log.info({ path: filePath }, 'Managed key file auto-fixed on startup');
+    log.info({ path: filePath }, 'Managed key file auto-fixed');
     return { synced: true, wasOutOfSync: true };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
