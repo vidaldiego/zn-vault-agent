@@ -2,6 +2,9 @@
 // HTTP health and metrics endpoint for zn-vault-agent using Fastify
 
 import Fastify, { type FastifyInstance } from 'fastify';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { healthLogger as log } from './logger.js';
 import { exportMetrics } from './metrics.js';
 import { loadConfig, getTargets, isConfigured } from './config.js';
@@ -9,6 +12,20 @@ import type { ChildProcessManager, ChildProcessState } from '../services/child-p
 import type { PluginLoader } from '../plugins/loader.js';
 import type { PluginHealthStatus, PluginVersionInfo } from '../plugins/types.js';
 import type { PluginAutoUpdateService } from '../services/plugin-auto-update.js';
+
+// Get agent version from package.json at module load time
+let agentVersion = '1.0.0';
+try {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = dirname(__filename);
+  // Navigate up from dist/lib to find package.json
+  const pkgPath = join(__dirname, '..', '..', 'package.json');
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+  agentVersion = pkg.version || '1.0.0';
+} catch {
+  // Fallback to env var or default
+  agentVersion = process.env.npm_package_version || '1.0.0';
+}
 
 export interface HealthStatus {
   status: 'healthy' | 'degraded' | 'unhealthy';
@@ -177,7 +194,7 @@ export async function getHealthStatus(): Promise<HealthStatus> {
     status,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    version: process.env.npm_package_version || '1.0.0',
+    version: agentVersion,
     websocket: {
       certificates: {
         connected: certWsConnected,

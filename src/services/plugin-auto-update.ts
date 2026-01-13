@@ -285,23 +285,50 @@ export class PluginAutoUpdateService {
 
   /**
    * Detect currently installed versions by querying npm.
+   * Uses `npm list -g --json` for accurate global package version detection.
    */
   private detectInstalledVersions(): void {
+    // First try npm list for all packages at once
+    try {
+      const { execSync } = require('child_process');
+      const output = execSync('npm list -g --json --depth=0', {
+        encoding: 'utf-8',
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      const npmList = JSON.parse(output);
+      const dependencies = npmList.dependencies || {};
+
+      for (const plugin of this.plugins) {
+        if (!plugin.package) continue;
+
+        const pkgInfo = dependencies[plugin.package];
+        if (pkgInfo?.version) {
+          this.installedVersions.set(plugin.package, pkgInfo.version);
+          logger.debug({ package: plugin.package, version: pkgInfo.version }, 'Detected installed plugin version');
+        } else {
+          this.installedVersions.set(plugin.package, '0.0.0');
+          logger.debug({ package: plugin.package }, 'Plugin not found in global packages');
+        }
+      }
+      return;
+    } catch (err) {
+      logger.debug({ err }, 'Failed to get versions via npm list, falling back to require.resolve');
+    }
+
+    // Fallback to require.resolve for each plugin
     for (const plugin of this.plugins) {
       if (!plugin.package) continue;
 
       try {
-        // Try to get version from npm list
         const result = require.resolve(plugin.package);
-        // Read package.json from the resolved path
         const pkgJsonPath = this.findPackageJson(result);
         if (pkgJsonPath) {
           const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'));
           this.installedVersions.set(plugin.package, pkg.version || '0.0.0');
-          logger.debug({ package: plugin.package, version: pkg.version }, 'Detected installed plugin version');
+          logger.debug({ package: plugin.package, version: pkg.version }, 'Detected installed plugin version via require.resolve');
         }
       } catch {
-        // Plugin might not be installed yet
         this.installedVersions.set(plugin.package, '0.0.0');
         logger.debug({ package: plugin.package }, 'Plugin not installed or version unknown');
       }
