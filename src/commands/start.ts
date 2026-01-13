@@ -335,6 +335,7 @@ Examples:
           verbose: options.verbose,
           healthPort: options.healthPort,
           exec: execConfig,
+          pluginAutoUpdateService,
         });
       } catch (err) {
         logger.error({ err }, 'Daemon error');

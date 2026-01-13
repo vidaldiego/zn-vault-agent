@@ -7,7 +7,8 @@ import { exportMetrics } from './metrics.js';
 import { loadConfig, getTargets, isConfigured } from './config.js';
 import type { ChildProcessManager, ChildProcessState } from '../services/child-process-manager.js';
 import type { PluginLoader } from '../plugins/loader.js';
-import type { PluginHealthStatus } from '../plugins/types.js';
+import type { PluginHealthStatus, PluginVersionInfo } from '../plugins/types.js';
+import type { PluginAutoUpdateService } from '../services/plugin-auto-update.js';
 
 export interface HealthStatus {
   status: 'healthy' | 'degraded' | 'unhealthy';
@@ -49,6 +50,7 @@ let secretErrors = 0;
 let fastifyServer: FastifyInstance | null = null;
 let childProcessManager: ChildProcessManager | null = null;
 let pluginLoader: PluginLoader | null = null;
+let pluginAutoUpdateService: PluginAutoUpdateService | null = null;
 
 /**
  * Update WebSocket connection status for certificates
@@ -105,6 +107,13 @@ export function setChildProcessManager(manager: ChildProcessManager | null): voi
  */
 export function setPluginLoader(loader: PluginLoader | null): void {
   pluginLoader = loader;
+}
+
+/**
+ * Set plugin auto-update service for version checking and updates via HTTP
+ */
+export function setPluginAutoUpdateService(service: PluginAutoUpdateService | null): void {
+  pluginAutoUpdateService = service;
 }
 
 /**
@@ -251,6 +260,67 @@ function createFastifyInstance(): FastifyInstance {
   // Prometheus metrics
   fastify.get('/metrics', async (_request, reply) => {
     reply.type('text/plain; version=0.0.4; charset=utf-8').send(exportMetrics());
+  });
+
+  // Plugin version check endpoint
+  fastify.get('/plugins/versions', async (_request, reply) => {
+    if (!pluginAutoUpdateService) {
+      return reply.code(503).send({
+        error: 'Plugin auto-update service not available',
+        versions: [],
+      });
+    }
+
+    try {
+      const versions = await pluginAutoUpdateService.checkForUpdates();
+      const hasUpdates = versions.some((v) => v.updateAvailable);
+      reply.send({
+        hasUpdates,
+        versions,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      log.error({ err }, 'Failed to check plugin versions');
+      reply.code(500).send({
+        error: 'Failed to check plugin versions',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // Plugin update trigger endpoint
+  fastify.post('/plugins/update', async (_request, reply) => {
+    if (!pluginAutoUpdateService) {
+      return reply.code(503).send({
+        error: 'Plugin auto-update service not available',
+        results: [],
+      });
+    }
+
+    try {
+      log.info('Plugin update triggered via HTTP');
+      const results = await pluginAutoUpdateService.triggerUpdates();
+      const successful = results.filter((r) => r.success);
+      const willRestart = successful.length > 0;
+
+      reply.send({
+        updated: successful.length,
+        results,
+        willRestart,
+        message: willRestart
+          ? 'Updates installed, agent will restart in 2 seconds'
+          : results.length === 0
+            ? 'No updates available'
+            : 'Some updates failed',
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      log.error({ err }, 'Failed to update plugins');
+      reply.code(500).send({
+        error: 'Failed to update plugins',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
   });
 
   return fastify;

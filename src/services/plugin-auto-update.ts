@@ -149,7 +149,64 @@ export class PluginAutoUpdateService {
   }
 
   /**
-   * Check for updates and install if available.
+   * Trigger immediate update check and installation.
+   * Used by HTTP endpoint to update plugins on-demand.
+   * Returns results of update attempts.
+   */
+  async triggerUpdates(): Promise<PluginUpdateResult[]> {
+    const updates = await this.checkForUpdates();
+    const availableUpdates = updates.filter((u) => u.updateAvailable);
+
+    if (availableUpdates.length === 0) {
+      logger.debug({ checked: updates.length }, 'No plugin updates available');
+      return [];
+    }
+
+    logger.info(
+      { updates: availableUpdates.map((u) => `${u.package}@${u.current} → ${u.latest}`) },
+      'Plugin updates available, triggering update'
+    );
+
+    // Acquire lock (prevents multiple agents updating simultaneously)
+    if (!this.acquireLock()) {
+      throw new Error('Another agent is updating plugins, try again later');
+    }
+
+    const results: PluginUpdateResult[] = [];
+
+    try {
+      for (const update of availableUpdates) {
+        const plugin = this.plugins.find((p) => p.package === update.package);
+        if (!plugin) continue;
+
+        const channel = plugin.autoUpdate?.channel || this.config.defaultChannel;
+        const result = await this.updatePlugin(update.package, channel);
+        results.push({
+          package: update.package,
+          previousVersion: update.current,
+          newVersion: update.latest,
+          ...result,
+        });
+      }
+
+      const successful = results.filter((r) => r.success);
+      if (successful.length > 0) {
+        logger.info(
+          { updated: successful.map((r) => `${r.package}@${r.newVersion}`) },
+          'Plugin updates complete, requesting restart'
+        );
+        // Schedule restart after response is sent
+        setTimeout(() => this.requestRestart(), 2000);
+      }
+    } finally {
+      this.releaseLock();
+    }
+
+    return results;
+  }
+
+  /**
+   * Check for updates and install if available (internal periodic check).
    */
   private async checkAndUpdateAll(): Promise<void> {
     const updates = await this.checkForUpdates();

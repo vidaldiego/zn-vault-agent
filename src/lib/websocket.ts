@@ -21,8 +21,10 @@ import {
   updateCertStatus,
   updateSecretStatus,
   setChildProcessManager,
+  setPluginAutoUpdateService,
 } from './health.js';
 import { flushLogs, setupLogRotation } from './logger.js';
+import type { PluginAutoUpdateService } from '../services/plugin-auto-update.js';
 import { startApiKeyRenewal, stopApiKeyRenewal } from '../services/api-key-renewal.js';
 import {
   startManagedKeyRenewal,
@@ -594,6 +596,7 @@ export async function startDaemon(options: {
   verbose?: boolean;
   healthPort?: number;
   exec?: ExecConfig;
+  pluginAutoUpdateService?: PluginAutoUpdateService | null;
 } = {}): Promise<void> {
   const config = loadConfig();
   const secretTargets = config.secretTargets || [];
@@ -712,6 +715,11 @@ export async function startDaemon(options: {
         void pluginLoader?.dispatchEvent('childProcess', event);
       });
     }
+  }
+
+  // Register plugin auto-update service with health module for HTTP endpoints
+  if (options.pluginAutoUpdateService) {
+    setPluginAutoUpdateService(options.pluginAutoUpdateService);
   }
 
   // Start health server if port specified (pass plugin loader for routes and health aggregation)
