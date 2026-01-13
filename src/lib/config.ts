@@ -113,6 +113,12 @@ export type { ExecSecret } from './secret-env.js';
 export interface ManagedKeyConfig {
   /** Managed key name in vault */
   name: string;
+  /** File path to write the API key to (for apps that read from file) */
+  filePath?: string;
+  /** File owner (user:group) for the key file */
+  fileOwner?: string;
+  /** File mode for the key file (e.g., "0640") */
+  fileMode?: string;
   /** When the next rotation will occur (ISO timestamp) */
   nextRotationAt?: string;
   /** When the grace period expires (ISO timestamp) */
@@ -458,6 +464,59 @@ export function updateSecretTargetVersion(secretId: string, version: number): vo
  * agent was started with the env var set (which would otherwise override
  * the config file value).
  */
+/**
+ * Write managed key to file and verify the write.
+ * This is a CRITICAL operation - failures must be logged and thrown.
+ */
+function writeManagedKeyToFile(
+  filePath: string,
+  key: string,
+  options?: { owner?: string; mode?: string }
+): void {
+  const dir = path.dirname(filePath);
+
+  // Ensure directory exists
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o750 });
+    log.debug({ dir }, 'Created directory for managed key file');
+  }
+
+  // Write the key
+  fs.writeFileSync(filePath, key, { mode: 0o640 });
+
+  // Apply custom mode if specified
+  if (options?.mode) {
+    const mode = parseInt(options.mode, 8);
+    fs.chmodSync(filePath, mode);
+  }
+
+  // Apply ownership if specified and running as root
+  if (options?.owner && process.getuid?.() === 0) {
+    const [user, group] = options.owner.split(':');
+    try {
+      const { execSync } = require('child_process');
+      if (group) {
+        execSync(`chown ${user}:${group} "${filePath}"`, { stdio: 'pipe' });
+      } else {
+        execSync(`chown ${user} "${filePath}"`, { stdio: 'pipe' });
+      }
+      log.debug({ path: filePath, owner: options.owner }, 'Set managed key file ownership');
+    } catch (err) {
+      log.warn({ path: filePath, owner: options.owner, err }, 'Failed to set managed key file ownership');
+    }
+  }
+
+  // CRITICAL: Verify the write by reading back
+  const written = fs.readFileSync(filePath, 'utf-8');
+  if (written !== key) {
+    const error = new Error(`Managed key file verification failed: written content doesn't match`);
+    log.error({ path: filePath }, 'CRITICAL: Managed key file write verification FAILED');
+    throw error;
+  }
+
+  log.info({ path: filePath }, 'Managed key written and verified');
+}
+
 export function updateManagedKey(
   newKey: string,
   metadata: {
@@ -491,9 +550,28 @@ export function updateManagedKey(
   // returning the old key even after saveConfig() writes the new one.
   process.env.ZNVAULT_API_KEY = newKey;
 
+  // CRITICAL: Write key to file if filePath is configured
+  // This ensures apps that read from file always have the current key
+  if (config.managedKey.filePath) {
+    try {
+      writeManagedKeyToFile(config.managedKey.filePath, newKey, {
+        owner: config.managedKey.fileOwner,
+        mode: config.managedKey.fileMode,
+      });
+    } catch (err) {
+      // Log but don't throw - config.json is already updated
+      // Plugin will auto-fix on next health check or startup
+      log.error({
+        err,
+        filePath: config.managedKey.filePath,
+      }, 'CRITICAL: Failed to write managed key to file');
+    }
+  }
+
   log.info({
     managedKeyName: config.managedKey.name,
     nextRotationAt: metadata.nextRotationAt,
+    filePath: config.managedKey.filePath,
   }, 'Managed key config updated');
 }
 
@@ -503,6 +581,60 @@ export function updateManagedKey(
 export function isManagedKeyMode(): boolean {
   const config = loadConfig();
   return !!config.managedKey?.name;
+}
+
+/**
+ * Verify and sync managed key file on startup.
+ * Returns true if file was in sync or successfully synced, false if sync failed.
+ */
+export function syncManagedKeyFile(): { synced: boolean; wasOutOfSync: boolean; error?: string } {
+  const config = loadConfig();
+
+  if (!config.managedKey?.filePath) {
+    return { synced: true, wasOutOfSync: false };
+  }
+
+  if (!config.auth?.apiKey) {
+    return { synced: false, wasOutOfSync: true, error: 'No API key in config' };
+  }
+
+  const filePath = config.managedKey.filePath;
+  const expectedKey = config.auth.apiKey;
+
+  // Check if file exists and matches
+  let currentKey: string | null = null;
+  try {
+    if (fs.existsSync(filePath)) {
+      currentKey = fs.readFileSync(filePath, 'utf-8');
+    }
+  } catch (err) {
+    log.warn({ path: filePath, err }, 'Failed to read managed key file');
+  }
+
+  if (currentKey === expectedKey) {
+    log.info({ path: filePath }, 'Managed key file verified - in sync');
+    return { synced: true, wasOutOfSync: false };
+  }
+
+  // File is out of sync - fix it
+  log.warn({
+    path: filePath,
+    expectedPrefix: expectedKey.substring(0, 20),
+    currentPrefix: currentKey?.substring(0, 20) || '(missing)',
+  }, 'Managed key file OUT OF SYNC - auto-fixing');
+
+  try {
+    writeManagedKeyToFile(filePath, expectedKey, {
+      owner: config.managedKey.fileOwner,
+      mode: config.managedKey.fileMode,
+    });
+    log.info({ path: filePath }, 'Managed key file auto-fixed on startup');
+    return { synced: true, wasOutOfSync: true };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    log.error({ path: filePath, err }, 'CRITICAL: Failed to auto-fix managed key file');
+    return { synced: false, wasOutOfSync: true, error };
+  }
 }
 
 /**

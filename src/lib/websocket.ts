@@ -4,7 +4,7 @@
 import WebSocket from 'ws';
 import os from 'node:os';
 import { createRequire } from 'node:module';
-import { loadConfig, type ExecConfig, type AgentConfig } from './config.js';
+import { loadConfig, syncManagedKeyFile, type ExecConfig, type AgentConfig } from './config.js';
 
 // ESM-compatible way to read package.json
 const require = createRequire(import.meta.url);
@@ -610,6 +610,28 @@ export async function startDaemon(options: {
   // Setup log rotation handler
   setupLogRotation();
 
+  // CRITICAL: Verify and sync managed key file before doing anything else
+  // This ensures apps that read from file always have the correct key
+  if (config.managedKey?.filePath) {
+    const syncResult = syncManagedKeyFile();
+    if (syncResult.wasOutOfSync) {
+      if (syncResult.synced) {
+        log.warn({
+          filePath: config.managedKey.filePath,
+        }, 'Managed key file was out of sync - auto-fixed on startup');
+      } else {
+        log.error({
+          filePath: config.managedKey.filePath,
+          error: syncResult.error,
+        }, 'CRITICAL: Managed key file sync failed - app may fail to authenticate');
+      }
+    } else {
+      log.info({
+        filePath: config.managedKey.filePath,
+      }, 'Managed key file verified - in sync');
+    }
+  }
+
   // Extract exec secret IDs and managed API key names for WebSocket subscription
   let execSecretIds: string[] = [];
   let execManagedKeyNames: string[] = [];
@@ -689,11 +711,13 @@ export async function startDaemon(options: {
       // Continue running agent without plugins
     }
 
-    // Wire up child process events to plugins
+    // Wire up child process events to plugins - use .catch() for error handling in event callbacks
     if (childManager) {
       childManager.on('started', (pid: number) => {
         const event: ChildProcessEvent = { type: 'started', pid };
-        void pluginLoader?.dispatchEvent('childProcess', event);
+        pluginLoader?.dispatchEvent('childProcess', event).catch((err) => {
+          log.error({ err, type: 'started' }, 'Plugin failed to handle childProcess event');
+        });
       });
 
       childManager.on('stopped', (code: number | null, signal: string | null) => {
@@ -702,17 +726,23 @@ export async function startDaemon(options: {
           exitCode: code ?? undefined,
           signal: signal ?? undefined,
         };
-        void pluginLoader?.dispatchEvent('childProcess', event);
+        pluginLoader?.dispatchEvent('childProcess', event).catch((err) => {
+          log.error({ err, type: 'stopped' }, 'Plugin failed to handle childProcess event');
+        });
       });
 
       childManager.on('restarting', (reason: string) => {
         const event: ChildProcessEvent = { type: 'restarting', reason };
-        void pluginLoader?.dispatchEvent('childProcess', event);
+        pluginLoader?.dispatchEvent('childProcess', event).catch((err) => {
+          log.error({ err, type: 'restarting' }, 'Plugin failed to handle childProcess event');
+        });
       });
 
       childManager.on('maxRestartsExceeded', () => {
         const event: ChildProcessEvent = { type: 'max_restarts' };
-        void pluginLoader?.dispatchEvent('childProcess', event);
+        pluginLoader?.dispatchEvent('childProcess', event).catch((err) => {
+          log.error({ err, type: 'max_restarts' }, 'Plugin failed to handle childProcess event');
+        });
       });
     }
   }
@@ -785,7 +815,7 @@ export async function startDaemon(options: {
         if (result.success) {
           log.info({ name: target.name, fingerprint: result.fingerprint }, 'Certificate deployed');
 
-          // Dispatch plugin event
+          // Dispatch plugin event - await with error handling
           if (pluginLoader) {
             const certEvent: CertificateDeployedEvent = {
               certId: target.certId,
@@ -796,7 +826,11 @@ export async function startDaemon(options: {
               commonName: '', // Would need cert parsing for this
               isUpdate: true,
             };
-            void pluginLoader.dispatchEvent('certificateDeployed', certEvent);
+            try {
+              await pluginLoader.dispatchEvent('certificateDeployed', certEvent);
+            } catch (pluginErr) {
+              log.error({ err: pluginErr, certId: target.certId }, 'Plugin failed to handle certificateDeployed event');
+            }
           }
 
           // Restart child process if configured
@@ -836,7 +870,7 @@ export async function startDaemon(options: {
           log.info({ name: target.name, version: result.version }, 'Secret deployed');
           deployedSecretTarget = true;
 
-          // Dispatch plugin event
+          // Dispatch plugin event - await with error handling
           if (pluginLoader) {
             const secretEvent: SecretDeployedEvent = {
               secretId: target.secretId,
@@ -847,7 +881,11 @@ export async function startDaemon(options: {
               version: result.version || event.version,
               isUpdate: true,
             };
-            void pluginLoader.dispatchEvent('secretDeployed', secretEvent);
+            try {
+              await pluginLoader.dispatchEvent('secretDeployed', secretEvent);
+            } catch (pluginErr) {
+              log.error({ err: pluginErr, secretId: target.secretId }, 'Plugin failed to handle secretDeployed event');
+            }
           }
         } else {
           log.error({ name: target.name, error: result.message }, 'Secret deployment failed');
@@ -914,7 +952,8 @@ export async function startDaemon(options: {
         keyPrefix: newKey.substring(0, 8),
       }, 'Fetched new API key value');
 
-      // Dispatch plugin event
+      // Dispatch plugin event - CRITICAL: await with error handling
+      // Previously this was fire-and-forget which could cause silent failures
       if (pluginLoader) {
         const keyEvent: KeyRotatedEvent = {
           keyName: event.apiKeyName,
@@ -923,7 +962,16 @@ export async function startDaemon(options: {
           nextRotationAt: bindResponse.nextRotationAt,
           rotationMode: event.rotationMode,
         };
-        void pluginLoader.dispatchEvent('keyRotated', keyEvent);
+        try {
+          await pluginLoader.dispatchEvent('keyRotated', keyEvent);
+          log.debug({ keyName: event.apiKeyName }, 'Plugin keyRotated event dispatched successfully');
+        } catch (pluginErr) {
+          log.error({
+            err: pluginErr,
+            keyName: event.apiKeyName,
+          }, 'Plugin failed to handle keyRotated event');
+          // Continue processing - plugin failure should not block key rotation
+        }
       }
 
       // Update env file if using output file mode
