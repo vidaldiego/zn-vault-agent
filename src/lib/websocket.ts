@@ -330,7 +330,10 @@ export function createUnifiedWebSocketClient(
   }
 
   function scheduleReconnect(): void {
-    if (!shouldReconnect || isShuttingDown) return;
+    if (!shouldReconnect || isShuttingDown) {
+      log.debug({ shouldReconnect, isShuttingDown }, 'Skipping reconnect - shutdown or disabled');
+      return;
+    }
 
     if (reconnectTimer) clearTimeout(reconnectTimer);
 
@@ -341,6 +344,7 @@ export function createUnifiedWebSocketClient(
     log.info({ ws: 'unified', attempt: reconnectAttempts, delay }, 'Scheduling reconnect');
 
     reconnectTimer = setTimeout(() => {
+      log.info({ ws: 'unified', attempt: reconnectAttempts }, 'Reconnect timer fired - attempting connection');
       connect();
     }, delay);
   }
@@ -510,6 +514,7 @@ export function createUnifiedWebSocketClient(
         const reasonStr = reason?.toString() || `Code: ${code}`;
         log.warn({ ws: 'unified', code, reason: reasonStr }, 'WebSocket disconnected');
         disconnectHandlers.forEach(h => { h(reasonStr); });
+        log.info({ ws: 'unified', shouldReconnect, isShuttingDown }, 'Triggering reconnect from close handler');
         scheduleReconnect();
       });
 
