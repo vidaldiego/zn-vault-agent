@@ -8,7 +8,7 @@
  * restarts to load the new plugin versions.
  */
 
-import { exec } from 'child_process';
+import { exec, execSync } from 'child_process';
 import { promisify } from 'util';
 import { existsSync, writeFileSync, unlinkSync, readFileSync, statSync } from 'fs';
 import { logger } from '../lib/logger.js';
@@ -293,7 +293,6 @@ export class PluginAutoUpdateService {
 
     // First try npm list for all packages at once
     try {
-      const { execSync } = require('child_process');
       console.log('  [PluginAutoUpdate] Running npm list -g --json --depth=0...');
       const output = execSync('npm list -g --json --depth=0', {
         encoding: 'utf-8',
