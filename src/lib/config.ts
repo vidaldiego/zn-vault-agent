@@ -465,8 +465,16 @@ export function updateSecretTargetVersion(secretId: string, version: number): vo
  * the config file value).
  */
 /**
- * Write managed key to file and verify the write.
+ * Write managed key to file using atomic write (write to temp + rename).
  * This is a CRITICAL operation - failures must be logged and thrown.
+ *
+ * Atomic write pattern:
+ * 1. Write to temp file in same directory
+ * 2. Verify temp file contents
+ * 3. Apply permissions/ownership to temp file
+ * 4. Rename temp to target (atomic on POSIX)
+ *
+ * If power fails mid-write, temp file is left behind but original is intact.
  */
 function writeManagedKeyToFile(
   filePath: string,
@@ -474,6 +482,7 @@ function writeManagedKeyToFile(
   options?: { owner?: string; mode?: string }
 ): void {
   const dir = path.dirname(filePath);
+  const tempPath = `${filePath}.tmp.${process.pid}`;
 
   // Ensure directory exists
   if (!fs.existsSync(dir)) {
@@ -481,40 +490,55 @@ function writeManagedKeyToFile(
     log.debug({ dir }, 'Created directory for managed key file');
   }
 
-  // Write the key
-  fs.writeFileSync(filePath, key, { mode: 0o640 });
+  try {
+    // Step 1: Write to temp file
+    fs.writeFileSync(tempPath, key, { mode: 0o640 });
 
-  // Apply custom mode if specified
-  if (options?.mode) {
-    const mode = parseInt(options.mode, 8);
-    fs.chmodSync(filePath, mode);
-  }
-
-  // Apply ownership if specified and running as root
-  if (options?.owner && process.getuid?.() === 0) {
-    const [user, group] = options.owner.split(':');
-    try {
-      const { execSync } = require('child_process');
-      if (group) {
-        execSync(`chown ${user}:${group} "${filePath}"`, { stdio: 'pipe' });
-      } else {
-        execSync(`chown ${user} "${filePath}"`, { stdio: 'pipe' });
-      }
-      log.debug({ path: filePath, owner: options.owner }, 'Set managed key file ownership');
-    } catch (err) {
-      log.warn({ path: filePath, owner: options.owner, err }, 'Failed to set managed key file ownership');
+    // Step 2: Verify temp file contents before rename
+    const written = fs.readFileSync(tempPath, 'utf-8');
+    if (written !== key) {
+      throw new Error('Temp file verification failed: written content doesn\'t match');
     }
-  }
 
-  // CRITICAL: Verify the write by reading back
-  const written = fs.readFileSync(filePath, 'utf-8');
-  if (written !== key) {
-    const error = new Error(`Managed key file verification failed: written content doesn't match`);
-    log.error({ path: filePath }, 'CRITICAL: Managed key file write verification FAILED');
-    throw error;
-  }
+    // Step 3: Apply custom mode if specified
+    if (options?.mode) {
+      const mode = parseInt(options.mode, 8);
+      fs.chmodSync(tempPath, mode);
+    }
 
-  log.info({ path: filePath }, 'Managed key written and verified');
+    // Step 4: Apply ownership if specified and running as root
+    if (options?.owner && process.getuid?.() === 0) {
+      const [user, group] = options.owner.split(':');
+      try {
+        const { execSync } = require('child_process');
+        if (group) {
+          execSync(`chown ${user}:${group} "${tempPath}"`, { stdio: 'pipe' });
+        } else {
+          execSync(`chown ${user} "${tempPath}"`, { stdio: 'pipe' });
+        }
+      } catch (err) {
+        log.warn({ path: tempPath, owner: options.owner, err }, 'Failed to set temp file ownership');
+        // Continue - ownership will be inherited or can be fixed manually
+      }
+    }
+
+    // Step 5: Atomic rename (POSIX guarantees this is atomic)
+    fs.renameSync(tempPath, filePath);
+
+    log.info({ path: filePath }, 'Managed key written atomically and verified');
+  } catch (err) {
+    // Clean up temp file on failure
+    try {
+      if (fs.existsSync(tempPath)) {
+        fs.unlinkSync(tempPath);
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+
+    log.error({ path: filePath, err }, 'CRITICAL: Managed key file atomic write FAILED');
+    throw err;
+  }
 }
 
 export function updateManagedKey(
