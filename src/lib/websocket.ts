@@ -32,6 +32,7 @@ import {
   onKeyChanged as onManagedKeyChanged,
   onWebSocketReconnect as notifyManagedKeyReconnect,
   onWebSocketRotationEvent as notifyManagedKeyRotationEvent,
+  onWebSocketAuthFailure as notifyManagedKeyAuthFailure,
 } from '../services/managed-key-renewal.js';
 import { isManagedKeyMode } from './config.js';
 import { ChildProcessManager } from '../services/child-process-manager.js';
@@ -517,8 +518,29 @@ export function createUnifiedWebSocketClient(
         const reasonStr = reason?.toString() || `Code: ${code}`;
         log.warn({ ws: 'unified', code, reason: reasonStr }, 'WebSocket disconnected');
         disconnectHandlers.forEach(h => { h(reasonStr); });
-        log.info({ ws: 'unified', shouldReconnect, isShuttingDown }, 'Triggering reconnect from close handler');
-        scheduleReconnect();
+
+        // Check for authentication failure (code 4001 = Unauthorized)
+        // This happens when the agent's API key is stale/expired/revoked
+        if (code === 4001 && managedKeyNames.length > 0) {
+          log.warn({ ws: 'unified' }, 'WebSocket closed with 4001 (Unauthorized) - attempting managed key recovery');
+
+          // Try to refresh the managed key before reconnecting
+          void notifyManagedKeyAuthFailure().then((recovered) => {
+            if (recovered) {
+              log.info({ ws: 'unified' }, 'Managed key recovered, scheduling reconnect');
+              // Reset reconnect attempts since we have a fresh key
+              reconnectAttempts = 0;
+            } else {
+              log.error({ ws: 'unified' }, 'Managed key recovery failed - agent needs manual intervention');
+              // Still try to reconnect, but don't reset attempts (exponential backoff)
+            }
+            log.info({ ws: 'unified', shouldReconnect, isShuttingDown }, 'Triggering reconnect from close handler');
+            scheduleReconnect();
+          });
+        } else {
+          log.info({ ws: 'unified', shouldReconnect, isShuttingDown }, 'Triggering reconnect from close handler');
+          scheduleReconnect();
+        }
       });
 
       ws.on('error', (err) => {

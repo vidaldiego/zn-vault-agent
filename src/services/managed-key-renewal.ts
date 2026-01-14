@@ -339,6 +339,66 @@ export async function onWebSocketReconnect(): Promise<void> {
   }
 }
 
+/**
+ * Called when WebSocket authentication fails (401 Unauthorized).
+ * This is a critical safety rail - if the agent's stored key is stale/expired,
+ * we need to perform a fresh bind to get the current key BEFORE reconnecting.
+ *
+ * Returns true if key was refreshed successfully (caller should reconnect).
+ * Returns false if refresh failed (key is truly invalid, needs manual intervention).
+ */
+export async function onWebSocketAuthFailure(): Promise<boolean> {
+  if (!isManagedKeyMode()) {
+    log.debug('Not in managed key mode, cannot recover from auth failure');
+    return false;
+  }
+
+  log.warn('WebSocket authentication failed - attempting managed key refresh');
+
+  // Mark as stale
+  staleKeyDetected = true;
+  setGauge('znvault_agent_managed_key_stale', 1);
+
+  try {
+    // Try to refresh the key - this will call bind to get the latest key
+    const response = await refreshManagedKey('reconnect');
+
+    if (response) {
+      log.info({
+        newKeyPrefix: response.key.substring(0, 8),
+        nextRotationAt: response.nextRotationAt,
+      }, 'Managed key refreshed after auth failure - will reconnect with new key');
+
+      // Clear stale flag
+      staleKeyDetected = false;
+      setGauge('znvault_agent_managed_key_stale', 0);
+
+      // Reschedule timers with new data
+      scheduleNextRefresh(response);
+      scheduleGracePeriodPoll(response.graceExpiresAt ? new Date(response.graceExpiresAt) : null);
+
+      return true;
+    }
+
+    return false;
+  } catch (err) {
+    const error = err as Error & { statusCode?: number };
+
+    // If bind also fails with 401, the key is truly gone
+    if (error.statusCode === 401 || error.message?.includes('Unauthorized')) {
+      log.error({
+        name: loadConfig().managedKey?.name,
+      }, 'Managed key bind also failed with 401 - key is invalid and cannot be recovered automatically');
+      log.error({}, 'MANUAL RECOVERY REQUIRED: Create a new API key and update agent config');
+      return false;
+    }
+
+    // Other errors (network, server down) - might recover on retry
+    log.error({ err }, 'Failed to refresh managed key after auth failure');
+    return false;
+  }
+}
+
 // ============================================================================
 // Safety Rail #3: Heartbeat Freshness Monitor
 // ============================================================================
