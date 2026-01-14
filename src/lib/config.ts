@@ -1,6 +1,7 @@
 import Conf from 'conf';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { configLogger as log } from './logger.js';
 import type { ExecSecret } from './secret-env.js';
 import type { PluginConfig } from '../plugins/types.js';
@@ -541,12 +542,12 @@ function writeManagedKeyToFile(
     if (options?.owner && process.getuid?.() === 0) {
       const [user, group] = options.owner.split(':');
       try {
-        const { execSync } = require('child_process');
         if (group) {
           execSync(`chown ${user}:${group} "${tempPath}"`, { stdio: 'pipe' });
         } else {
           execSync(`chown ${user} "${tempPath}"`, { stdio: 'pipe' });
         }
+        log.debug({ path: tempPath, owner: options.owner }, 'Applied ownership to managed key file');
       } catch (err) {
         log.warn({ path: tempPath, owner: options.owner, err }, 'Failed to set temp file ownership');
         // Continue - ownership will be inherited or can be fixed manually
