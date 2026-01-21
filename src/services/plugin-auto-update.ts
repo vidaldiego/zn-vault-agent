@@ -11,6 +11,7 @@
 import { exec, execSync } from 'child_process';
 import { promisify } from 'util';
 import { existsSync, writeFileSync, unlinkSync, readFileSync, statSync } from 'fs';
+import semver from 'semver';
 import { logger } from '../lib/logger.js';
 import type { PluginConfig, PluginVersionInfo } from '../plugins/types.js';
 import type { UpdateChannel } from '../types/update.js';
@@ -442,21 +443,20 @@ export class PluginAutoUpdateService {
   }
 
   /**
-   * Compare semver versions.
+   * Compare semver versions using the semver package.
    * Returns true if `latest` is newer than `current`.
+   * Properly handles pre-releases (e.g., 1.0.0-beta.1 < 1.0.0)
+   * and build metadata (ignored per semver spec).
    */
   private isNewer(latest: string, current: string): boolean {
-    const parseSemver = (v: string): number[] => {
-      const parts = v.replace(/^v/, '').split('.');
-      return parts.map((p) => parseInt(p, 10) || 0);
-    };
-
-    const [lMaj, lMin = 0, lPatch = 0] = parseSemver(latest);
-    const [cMaj, cMin = 0, cPatch = 0] = parseSemver(current);
-
-    if (lMaj !== cMaj) return lMaj > cMaj;
-    if (lMin !== cMin) return lMin > cMin;
-    return lPatch > cPatch;
+    try {
+      // semver.gt handles all edge cases including pre-releases
+      return semver.gt(latest, current);
+    } catch {
+      // Fallback to simple comparison if semver parsing fails
+      logger.warn({ latest, current }, 'Failed to parse semver, falling back to string comparison');
+      return latest > current;
+    }
   }
 
   /**

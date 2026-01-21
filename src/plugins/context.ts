@@ -2,6 +2,7 @@
 // Plugin context implementation - provides safe access to agent internals
 
 import { EventEmitter } from 'node:events';
+import { X509Certificate } from 'node:crypto';
 import { createLogger } from '../lib/logger.js';
 import { getSecret as apiGetSecret, decryptCertificate } from '../lib/api.js';
 import type {
@@ -13,6 +14,8 @@ import type { AgentInternals } from './loader.js';
 import type { PluginLoader } from './loader.js';
 import { getPluginStorage } from './storage.js';
 import type { CertTarget, SecretTarget } from '../lib/config.js';
+
+const logger = createLogger({ module: 'plugin-context' });
 
 /**
  * Inter-plugin event emitter (singleton)
@@ -83,6 +86,9 @@ export function createPluginContext(
       const certData = decrypted.certificateData;
       const parts = parsePemBundle(certData);
 
+      // Extract metadata from the certificate
+      const metadata = extractCertMetadata(parts.certificate);
+
       return {
         id: decrypted.id,
         name: target?.name ?? certId,
@@ -91,8 +97,8 @@ export function createPluginContext(
         chain: parts.chain,
         fullchain: parts.fullchain,
         fingerprint: decrypted.fingerprintSha256,
-        expiresAt: '', // Would need to parse from cert
-        commonName: '', // Would need to parse from cert
+        expiresAt: metadata.expiresAt,
+        commonName: metadata.commonName,
       };
     },
 
@@ -201,6 +207,34 @@ function parsePemBundle(pemData: string): {
   const fullchain = chain ? `${certificate}\n${chain}` : certificate;
 
   return { certificate, privateKey, chain, fullchain };
+}
+
+/**
+ * Extract metadata from a PEM certificate using Node's X509Certificate
+ */
+function extractCertMetadata(certPem: string): { expiresAt: string; commonName: string } {
+  try {
+    const x509 = new X509Certificate(certPem);
+
+    // Get expiration date (notAfter) in ISO format
+    const expiresAt = x509.validTo;
+
+    // Extract CN from subject string (format: "CN=example.com,O=Org,...")
+    const subject = x509.subject;
+    let commonName = '';
+
+    // Parse subject to extract CN
+    const cnMatch = subject.match(/CN=([^,\n]+)/);
+    if (cnMatch) {
+      commonName = cnMatch[1];
+    }
+
+    return { expiresAt, commonName };
+  } catch (err) {
+    // If parsing fails, return empty values
+    logger.debug({ err }, 'Failed to parse certificate metadata');
+    return { expiresAt: '', commonName: '' };
+  }
 }
 
 /**

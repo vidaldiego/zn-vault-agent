@@ -42,6 +42,7 @@ import {
 import type {
   CertificateDeployedEvent,
   SecretDeployedEvent,
+  SecretChangedEvent,
   KeyRotatedEvent,
   ChildProcessEvent,
 } from '../plugins/types.js';
@@ -440,6 +441,23 @@ export async function startDaemon(options: {
     if (getIsShuttingDown()) {
       log.debug({ event: event.event }, 'Ignoring secret event during shutdown');
       return;
+    }
+
+    // Dispatch secretChanged event to plugins (before deployment)
+    if (pluginLoader) {
+      const valueChanged = event.event === 'secret.updated' || event.event === 'secret.rotated';
+      const secretChangedEvent: SecretChangedEvent = {
+        secretId: event.secretId,
+        alias: event.alias,
+        version: event.version,
+        valueChanged,
+        changedAt: event.timestamp,
+      };
+      try {
+        await pluginLoader.dispatchEvent('secretChanged', secretChangedEvent);
+      } catch (pluginErr) {
+        log.error({ err: pluginErr, secretId: event.secretId }, 'Plugin failed to handle secretChanged event');
+      }
     }
 
     let deployedSecretTarget = false;

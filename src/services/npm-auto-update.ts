@@ -30,6 +30,7 @@ import {
 } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import semver from 'semver';
 import { logger, flushLogs } from '../lib/logger.js';
 import type { UpdateConfig, NpmVersionInfo } from '../types/update.js';
 import { DEFAULT_UPDATE_CONFIG } from '../types/update.js';
@@ -253,65 +254,20 @@ export class NpmAutoUpdateService {
   }
 
   /**
-   * Compare semver versions.
+   * Compare semver versions using the semver package.
    * Returns true if `latest` is newer than `current`.
-   * Handles pre-release versions (e.g., 1.4.0-beta.1)
+   * Properly handles pre-releases (e.g., 1.0.0-beta.1 < 1.0.0)
+   * and build metadata (ignored per semver spec).
    */
   isNewer(latest: string, current: string): boolean {
-    const parseSemver = (v: string): { major: number; minor: number; patch: number; prerelease: string[] } => {
-      // Remove 'v' prefix if present
-      const cleaned = v.replace(/^v/, '');
-
-      // Split into version and prerelease parts
-      const [versionPart, prereleasePart] = cleaned.split('-');
-      const parts = versionPart.split('.');
-
-      return {
-        major: parseInt(parts[0], 10) || 0,
-        minor: parseInt(parts[1], 10) || 0,
-        patch: parseInt(parts[2], 10) || 0,
-        prerelease: prereleasePart ? prereleasePart.split('.') : [],
-      };
-    };
-
-    const l = parseSemver(latest);
-    const c = parseSemver(current);
-
-    // Compare major.minor.patch
-    if (l.major !== c.major) return l.major > c.major;
-    if (l.minor !== c.minor) return l.minor > c.minor;
-    if (l.patch !== c.patch) return l.patch > c.patch;
-
-    // If versions are equal, compare prerelease
-    // No prerelease > prerelease (1.0.0 > 1.0.0-beta)
-    if (c.prerelease.length > 0 && l.prerelease.length === 0) {
-      return true; // latest is release, current is prerelease
+    try {
+      // semver.gt handles all edge cases including pre-releases
+      return semver.gt(latest, current);
+    } catch {
+      // Fallback to simple comparison if semver parsing fails
+      logger.warn({ latest, current }, 'Failed to parse semver, falling back to string comparison');
+      return latest > current;
     }
-    if (c.prerelease.length === 0 && l.prerelease.length > 0) {
-      return false; // latest is prerelease, current is release
-    }
-
-    // Both have prerelease - compare lexicographically
-    for (let i = 0; i < Math.max(l.prerelease.length, c.prerelease.length); i++) {
-      const lPart = l.prerelease.at(i);
-      const cPart = c.prerelease.at(i);
-
-      // Missing part means earlier version (1.0.0-beta < 1.0.0-beta.1)
-      if (lPart === undefined) return false;
-      if (cPart === undefined) return true;
-
-      // Compare as numbers if both are numeric
-      const lNum = parseInt(lPart, 10);
-      const cNum = parseInt(cPart, 10);
-      if (!isNaN(lNum) && !isNaN(cNum)) {
-        if (lNum !== cNum) return lNum > cNum;
-      } else {
-        // Compare as strings
-        if (lPart !== cPart) return lPart > cPart;
-      }
-    }
-
-    return false; // versions are equal
   }
 
   /**

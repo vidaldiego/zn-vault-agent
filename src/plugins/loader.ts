@@ -14,24 +14,40 @@ import type {
   LoadedPlugin,
   PluginEventMap,
   PluginHealthStatus,
-  PLUGIN_EVENT_HANDLERS,
 } from './types.js';
+import { PLUGIN_EVENT_HANDLERS } from './types.js';
 import { createPluginContext } from './context.js';
 import type { AgentConfig } from '../lib/config.js';
 import type { ChildProcessManager } from '../services/child-process-manager.js';
 
 const log = createLogger({ module: 'plugin-loader' });
 
+/** Default timeout for plugin hooks (30 seconds) */
+const PLUGIN_HOOK_TIMEOUT_MS = 30_000;
+
 /**
- * Plugin event handler method names mapping
+ * Execute a plugin hook with timeout protection
  */
-const EVENT_HANDLERS: typeof PLUGIN_EVENT_HANDLERS = {
-  certificateDeployed: 'onCertificateDeployed',
-  secretDeployed: 'onSecretDeployed',
-  keyRotated: 'onKeyRotated',
-  childProcess: 'onChildProcessEvent',
-  secretChanged: 'onSecretChanged',
-} as const;
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  pluginName: string,
+  hookName: string
+): Promise<T> {
+  let timeoutId: NodeJS.Timeout | undefined;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`Plugin '${pluginName}' ${hookName} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
 
 /**
  * Agent internals passed to plugin context
@@ -239,7 +255,12 @@ export class PluginLoader extends EventEmitter {
 
       if (loaded.plugin.onInit) {
         try {
-          await loaded.plugin.onInit(ctx);
+          await withTimeout(
+            loaded.plugin.onInit(ctx),
+            PLUGIN_HOOK_TIMEOUT_MS,
+            name,
+            'onInit'
+          );
           loaded.status = 'initialized';
           log.debug({ name }, 'Plugin initialized');
         } catch (err) {
@@ -273,7 +294,12 @@ export class PluginLoader extends EventEmitter {
 
       if (loaded.plugin.onStart) {
         try {
-          await loaded.plugin.onStart(ctx);
+          await withTimeout(
+            loaded.plugin.onStart(ctx),
+            PLUGIN_HOOK_TIMEOUT_MS,
+            name,
+            'onStart'
+          );
           loaded.status = 'running';
           log.debug({ name }, 'Plugin started');
         } catch (err) {
@@ -311,11 +337,16 @@ export class PluginLoader extends EventEmitter {
 
       if (loaded.plugin.onStop) {
         try {
-          await loaded.plugin.onStop(ctx);
+          await withTimeout(
+            loaded.plugin.onStop(ctx),
+            PLUGIN_HOOK_TIMEOUT_MS,
+            name,
+            'onStop'
+          );
           loaded.status = 'stopped';
           log.debug({ name }, 'Plugin stopped');
         } catch (err) {
-          log.warn({ err, name }, 'Plugin stop error');
+          log.warn({ err, name }, 'Plugin stop error (continuing shutdown)');
           loaded.status = 'stopped';
         }
       } else {
@@ -356,7 +387,7 @@ export class PluginLoader extends EventEmitter {
     eventType: K,
     event: PluginEventMap[K]
   ): Promise<void> {
-    const handlerName = EVENT_HANDLERS[eventType] as keyof AgentPlugin;
+    const handlerName = PLUGIN_EVENT_HANDLERS[eventType] as keyof AgentPlugin;
 
     log.debug({ eventType, plugins: this.plugins.size }, 'Dispatching event to plugins');
 
@@ -372,7 +403,12 @@ export class PluginLoader extends EventEmitter {
       const ctx = createPluginContext(name, this.agentInternals, this);
 
       try {
-        await handler.call(loaded.plugin, event, ctx);
+        await withTimeout(
+          handler.call(loaded.plugin, event, ctx),
+          PLUGIN_HOOK_TIMEOUT_MS,
+          name,
+          handlerName
+        );
       } catch (err) {
         log.error({ err, name, eventType }, 'Plugin event handler error');
         // Don't fail other plugins
