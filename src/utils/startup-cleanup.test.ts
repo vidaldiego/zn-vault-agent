@@ -172,7 +172,7 @@ describe('cleanupOrphanedFiles', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
     mockReaddirSync([]);
 
-    const stats = cleanupOrphanedFiles(['', null as unknown as string, '/etc/certs']);
+    cleanupOrphanedFiles(['', null as unknown as string, '/etc/certs']);
 
     // existsSync should only be called for /etc/certs
     expect(fs.existsSync).toHaveBeenCalledTimes(1);

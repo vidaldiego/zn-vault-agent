@@ -259,7 +259,7 @@ export interface PluginStorage {
    * @param key Storage key
    * @returns Value or undefined if not found
    */
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T is used for type inference at call site
+   
   get<T>(key: string): T | undefined;
 
   /**
@@ -267,7 +267,7 @@ export interface PluginStorage {
    * @param key Storage key
    * @param value Value to store (must be JSON-serializable)
    */
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T is used for type inference at call site
+   
   set<T>(key: string, value: T): void;
 
   /**

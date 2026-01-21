@@ -280,7 +280,7 @@ export async function onWebSocketReconnect(): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, RECONNECT_POLL_DELAY_MS));
 
   // Re-check after async pause (isRunning may have changed during await)
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+   
   if (!isRunning) return;
 
   try {

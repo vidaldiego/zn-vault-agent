@@ -1,7 +1,7 @@
 // Path: src/commands/exec.test.ts
 // Unit tests for exec mode functionality
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   parseSecretMapping,
   parseSecretMappingFromConfig,

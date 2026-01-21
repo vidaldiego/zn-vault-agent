@@ -33,11 +33,11 @@ vi.mock('../lib/config.js', () => ({
 }));
 
 import { PluginLoader, createPluginLoader, getPluginLoader, clearPluginLoader } from './loader.js';
-import type { AgentPlugin, PluginContext } from './types.js';
+import type { AgentPlugin } from './types.js';
 import type { AgentConfig } from '../lib/config.js';
 
-// Helper to create mock plugins
-function createMockPlugin(overrides: Partial<AgentPlugin> = {}): AgentPlugin {
+// Helper to create mock plugins - kept for future tests
+function _createMockPlugin(overrides: Partial<AgentPlugin> = {}): AgentPlugin {
   return {
     name: 'mock-plugin',
     version: '1.0.0',

@@ -12,11 +12,11 @@ vi.mock('../lib/api.js', () => ({
   listSecrets: vi.fn(),
 }));
 
-// Import after mocking
-import { getSecret } from '../lib/api.js';
+// Import after mocking - kept for future use
+const { getSecret: _getSecret } = await import('../lib/api.js');
 
-// Helper to create a mock secret
-function mockSecret(data: Record<string, unknown>) {
+// Helper to create a mock secret - kept for future use
+function _mockSecret(data: Record<string, unknown>) {
   return {
     id: 'test-uuid',
     alias: 'test/secret',
@@ -180,7 +180,7 @@ describe('Secret Target Configuration', () => {
 
   it('should add and retrieve secret targets', async () => {
     // Dynamic import to pick up env var
-    const { addSecretTarget, getSecretTargets, saveConfig, loadConfig } = await import('../lib/config.js');
+    const { addSecretTarget, getSecretTargets, saveConfig } = await import('../lib/config.js');
 
     // Initialize config
     saveConfig({

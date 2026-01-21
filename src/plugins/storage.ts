@@ -111,13 +111,13 @@ function saveStorageData(pluginName: string, data: Record<string, unknown>): voi
  */
 export function getPluginStorage(pluginName: string): PluginStorage {
   return {
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T is used for type inference at call site
+     
     get<T>(key: string): T | undefined {
       const data = loadStorageData(pluginName);
       return data[key] as T | undefined;
     },
 
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T is used for type inference at call site
+     
     set<T>(key: string, value: T): void {
       const data = loadStorageData(pluginName);
       data[key] = value as unknown;
@@ -126,7 +126,7 @@ export function getPluginStorage(pluginName: string): PluginStorage {
 
     delete(key: string): void {
       const data = loadStorageData(pluginName);
-      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete -- key-value store API
+       
       delete data[key];
       saveStorageData(pluginName, data);
     },

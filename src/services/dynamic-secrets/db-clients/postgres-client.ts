@@ -32,7 +32,7 @@ export class PostgresClient implements DatabaseClient {
     try {
       // Dynamic import to handle optional dependency
       const pg = await import('pg');
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- pg module structure varies
+       
       const Pool = pg.default?.Pool ?? pg.Pool;
 
       this.pool = new Pool({

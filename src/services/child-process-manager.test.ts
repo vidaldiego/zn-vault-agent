@@ -1,7 +1,7 @@
 // Path: zn-vault-agent/src/services/child-process-manager.test.ts
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { ChildProcessManager, type ChildProcessState } from './child-process-manager.js';
+import { ChildProcessManager } from './child-process-manager.js';
 import type { ExecConfig } from '../lib/config.js';
 import fs from 'node:fs';
 
