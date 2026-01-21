@@ -19,8 +19,8 @@ function getVersion(): string {
     const __dirname = dirname(fileURLToPath(import.meta.url));
     // Try dist/../package.json first (installed via npm)
     const pkgPath = join(__dirname, '..', 'package.json');
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-    return pkg.version || '0.0.0';
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { version?: string };
+    return pkg.version ?? '0.0.0';
   } catch {
     return '0.0.0';
   }

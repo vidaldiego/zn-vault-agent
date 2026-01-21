@@ -21,17 +21,17 @@ const DEFAULT_SECRETS_DIR = '/run/zn-vault-agent/secrets';
  */
 export class SecretFileManager {
   private readonly secretsDir: string;
-  private readonly writtenFiles: Set<string> = new Set();
+  private readonly writtenFiles = new Set<string>();
   private cleanupRegistered = false;
 
   constructor(secretsDir?: string) {
-    this.secretsDir = secretsDir || process.env.ZNVAULT_SECRETS_DIR || DEFAULT_SECRETS_DIR;
+    this.secretsDir = secretsDir ?? process.env.ZNVAULT_SECRETS_DIR ?? DEFAULT_SECRETS_DIR;
   }
 
   /**
    * Initialize the secrets directory with secure permissions
    */
-  async initialize(): Promise<void> {
+  initialize(): void {
     try {
       // Create parent directory if needed (/run/zn-vault-agent)
       const parentDir = path.dirname(this.secretsDir);
@@ -64,7 +64,7 @@ export class SecretFileManager {
    * Write a secret to a file
    * Returns the path to the file
    */
-  async writeSecret(name: string, value: string): Promise<string> {
+  writeSecret(name: string, value: string): string {
     const filePath = path.join(this.secretsDir, name);
 
     try {
@@ -83,7 +83,7 @@ export class SecretFileManager {
   /**
    * Read a secret from a file
    */
-  async readSecret(name: string): Promise<string> {
+  readSecret(name: string): string {
     const filePath = path.join(this.secretsDir, name);
 
     try {
@@ -97,7 +97,7 @@ export class SecretFileManager {
   /**
    * Delete a specific secret file
    */
-  async deleteSecret(name: string): Promise<void> {
+  deleteSecret(name: string): void {
     const filePath = path.join(this.secretsDir, name);
 
     try {
@@ -117,7 +117,7 @@ export class SecretFileManager {
   /**
    * Clean up all written secret files
    */
-  async cleanup(): Promise<void> {
+  cleanup(): void {
     log.debug({ count: this.writtenFiles.size }, 'Cleaning up secret files');
 
     for (const filePath of this.writtenFiles) {
@@ -178,9 +178,11 @@ export class SecretFileManager {
     if (this.cleanupRegistered) return;
 
     const cleanup = (): void => {
-      this.cleanup().catch(() => {
+      try {
+        this.cleanup();
+      } catch {
         // Ignore errors during shutdown
-      });
+      }
     };
 
     process.on('exit', cleanup);
@@ -198,17 +200,15 @@ let defaultManager: SecretFileManager | null = null;
  * Get the default SecretFileManager instance
  */
 export function getSecretFileManager(): SecretFileManager {
-  if (!defaultManager) {
-    defaultManager = new SecretFileManager();
-  }
+  defaultManager ??= new SecretFileManager();
   return defaultManager;
 }
 
 /**
  * Initialize the default SecretFileManager
  */
-export async function initializeSecretFiles(): Promise<SecretFileManager> {
+export function initializeSecretFiles(): SecretFileManager {
   const manager = getSecretFileManager();
-  await manager.initialize();
+  manager.initialize();
   return manager;
 }

@@ -9,10 +9,19 @@
 
 import type { Command } from 'commander';
 import chalk from 'chalk';
-import { execSync } from 'child_process';
-import { existsSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, copyFileSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync, unlinkSync, copyFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import {
+  chownSafe,
+  useraddSafe,
+  userExists,
+  systemctlSafe,
+  systemctlSafeQuiet,
+  rmDirSafe,
+  whichSafe,
+} from '../utils/shell.js';
+import type { SetupCommandOptions } from './types.js';
 
 const SYSTEM_USER = 'zn-vault-agent';
 const SERVICE_NAME = 'zn-vault-agent';
@@ -41,17 +50,17 @@ Examples:
   # Remove everything including config
   sudo zn-vault-agent setup --uninstall --purge
 `)
-    .action(async (options) => {
+    .action(async (options: SetupCommandOptions) => {
       // Check for root
       if (process.getuid && process.getuid() !== 0) {
         console.error(chalk.red('This command requires root. Run with sudo.'));
         process.exit(1);
       }
 
-      if (options.uninstall) {
-        await handleUninstall(options);
+      if (options.uninstall === true) {
+        await handleUninstall({ purge: options.purge, yes: options.yes });
       } else {
-        await handleInstall(options);
+        await handleInstall({ skipUser: options.skipUser, yes: options.yes });
       }
     });
 }
@@ -74,7 +83,7 @@ async function handleInstall(options: { skipUser?: boolean; yes?: boolean }): Pr
     console.log();
 
     const inquirer = await import('inquirer');
-    const { confirm } = await inquirer.default.prompt([
+    const { confirm } = await inquirer.default.prompt<{ confirm: boolean }>([
       {
         type: 'confirm',
         name: 'confirm',
@@ -91,19 +100,18 @@ async function handleInstall(options: { skipUser?: boolean; yes?: boolean }): Pr
 
   console.log();
 
-  // Step 1: Create system user
+  // Step 1: Create system user (using safe utilities)
   if (!options.skipUser) {
-    try {
-      // Check if user exists
-      execSync(`id ${SYSTEM_USER}`, { stdio: 'pipe' });
+    if (userExists(SYSTEM_USER)) {
       console.log(chalk.gray(`User ${SYSTEM_USER} already exists`));
-    } catch {
+    } else {
       console.log(`Creating user ${SYSTEM_USER}...`);
       try {
-        execSync(
-          `useradd --system --no-create-home --shell /sbin/nologin ${SYSTEM_USER}`,
-          { stdio: 'inherit' }
-        );
+        useraddSafe(SYSTEM_USER, {
+          system: true,
+          noCreateHome: true,
+          shell: '/sbin/nologin',
+        });
         console.log(chalk.green(`  Created user ${SYSTEM_USER}`));
       } catch {
         console.log(chalk.yellow(`  Could not create user (might already exist)`));
@@ -111,7 +119,7 @@ async function handleInstall(options: { skipUser?: boolean; yes?: boolean }): Pr
     }
   }
 
-  // Step 2: Create directories
+  // Step 2: Create directories (using safe chown)
   const directories = [
     { path: CONFIG_DIR, mode: 0o755 },
     { path: DATA_DIR, mode: 0o750 },
@@ -123,14 +131,14 @@ async function handleInstall(options: { skipUser?: boolean; yes?: boolean }): Pr
     if (!existsSync(dir.path)) {
       console.log(`Creating ${dir.path}/...`);
       mkdirSync(dir.path, { recursive: true, mode: dir.mode });
-      execSync(`chown ${SYSTEM_USER}:${SYSTEM_USER} ${dir.path}`);
+      chownSafe(dir.path, `${SYSTEM_USER}:${SYSTEM_USER}`);
       console.log(chalk.green(`  Created ${dir.path}/`));
     } else {
       console.log(chalk.gray(`${dir.path}/ already exists`));
     }
   }
 
-  // Step 3: Create config template if not exists
+  // Step 3: Create config template if not exists (using safe chown)
   const envFile = join(CONFIG_DIR, 'agent.env');
   if (!existsSync(envFile)) {
     console.log(`Creating ${envFile}...`);
@@ -149,7 +157,7 @@ LOG_LEVEL=info
 `,
       { mode: 0o640 }
     );
-    execSync(`chown ${SYSTEM_USER}:${SYSTEM_USER} ${envFile}`);
+    chownSafe(envFile, `${SYSTEM_USER}:${SYSTEM_USER}`);
     console.log(chalk.green(`  Created ${envFile}`));
   } else {
     console.log(chalk.gray(`${envFile} already exists`));
@@ -185,14 +193,14 @@ LOG_LEVEL=info
     console.log(chalk.green(`  Generated ${SERVICE_FILE}`));
   }
 
-  // Step 5: Reload systemd
+  // Step 5: Reload systemd (using safe utilities)
   console.log('Reloading systemd...');
-  execSync('systemctl daemon-reload', { stdio: 'inherit' });
+  systemctlSafe('daemon-reload');
   console.log(chalk.green('  systemd reloaded'));
 
   // Enable service (but don't start)
   console.log('Enabling service...');
-  execSync(`systemctl enable ${SERVICE_NAME}`, { stdio: 'inherit' });
+  systemctlSafe('enable', SERVICE_NAME);
   console.log(chalk.green(`  ${SERVICE_NAME} enabled`));
 
   console.log();
@@ -224,11 +232,11 @@ async function handleUninstall(options: { purge?: boolean; yes?: boolean }): Pro
     console.log();
 
     const inquirer = await import('inquirer');
-    const { confirm } = await inquirer.default.prompt([
+    const { confirm } = await inquirer.default.prompt<{ confirm: boolean }>([
       {
         type: 'confirm',
         name: 'confirm',
-        message: options.purge
+        message: options.purge === true
           ? 'Are you sure? This will remove all configuration and data!'
           : 'Proceed with uninstall?',
         default: false,
@@ -243,19 +251,19 @@ async function handleUninstall(options: { purge?: boolean; yes?: boolean }): Pro
 
   console.log();
 
-  // Stop service
+  // Stop service (using safe utilities)
   try {
     console.log('Stopping service...');
-    execSync(`systemctl stop ${SERVICE_NAME}`, { stdio: 'pipe' });
+    systemctlSafeQuiet('stop', SERVICE_NAME);
     console.log(chalk.green(`  ${SERVICE_NAME} stopped`));
   } catch {
     console.log(chalk.gray('  Service not running'));
   }
 
-  // Disable service
+  // Disable service (using safe utilities)
   try {
     console.log('Disabling service...');
-    execSync(`systemctl disable ${SERVICE_NAME}`, { stdio: 'pipe' });
+    systemctlSafeQuiet('disable', SERVICE_NAME);
     console.log(chalk.green(`  ${SERVICE_NAME} disabled`));
   } catch {
     console.log(chalk.gray('  Service not enabled'));
@@ -268,17 +276,17 @@ async function handleUninstall(options: { purge?: boolean; yes?: boolean }): Pro
     console.log(chalk.green(`  Removed ${SERVICE_FILE}`));
   }
 
-  // Reload systemd
+  // Reload systemd (using safe utilities)
   console.log('Reloading systemd...');
-  execSync('systemctl daemon-reload', { stdio: 'inherit' });
+  systemctlSafe('daemon-reload');
 
-  // Purge if requested
+  // Purge if requested (using safe rm)
   if (options.purge) {
     const dirsToRemove = [CONFIG_DIR, DATA_DIR, LOG_DIR];
     for (const dir of dirsToRemove) {
       if (existsSync(dir)) {
         console.log(`Removing ${dir}/...`);
-        execSync(`rm -rf ${dir}`, { stdio: 'inherit' });
+        rmDirSafe(dir);
         console.log(chalk.green(`  Removed ${dir}/`));
       }
     }
@@ -296,14 +304,9 @@ async function handleUninstall(options: { purge?: boolean; yes?: boolean }): Pro
 }
 
 function generateServiceFile(): string {
-  // Find the binary path
-  let binPath = '/usr/local/bin/zn-vault-agent';
-  try {
-    const result = execSync('which zn-vault-agent', { encoding: 'utf-8', stdio: 'pipe' });
-    binPath = result.trim();
-  } catch {
-    // Use default
-  }
+  // Find the binary path (using safe which)
+  const foundPath = whichSafe('zn-vault-agent');
+  const binPath = foundPath ?? '/usr/local/bin/zn-vault-agent';
 
   return `[Unit]
 Description=ZnVault Certificate Agent

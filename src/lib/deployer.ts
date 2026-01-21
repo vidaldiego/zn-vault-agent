@@ -6,6 +6,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execSync } from 'node:child_process';
 import os from 'node:os';
+import { chownSafe } from '../utils/shell.js';
+import { validateOutputPath } from '../utils/path.js';
 import type { CertTarget } from './config.js';
 import { decryptCertificate, getCertificate, ackDelivery } from './api.js';
 import { updateTargetFingerprint, loadConfig } from './config.js';
@@ -38,7 +40,7 @@ function parsePemBundle(pemData: string): {
   // Support all private key formats: RSA, EC, PKCS8, and encrypted
   const keyRegex = /-----BEGIN (?:RSA |EC |ENCRYPTED )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |ENCRYPTED )?PRIVATE KEY-----/;
 
-  const certs = pemData.match(certRegex) || [];
+  const certs = pemData.match(certRegex) ?? [];
   const keyMatch = keyRegex.exec(pemData);
 
   log.debug({
@@ -48,7 +50,7 @@ function parsePemBundle(pemData: string): {
   }, 'Parsed PEM bundle');
 
   return {
-    certificate: certs[0] || '',
+    certificate: certs[0] ?? '',
     privateKey: keyMatch ? keyMatch[0] : '',
     chain: certs.slice(1),
   };
@@ -110,16 +112,20 @@ function verifyFile(filePath: string, expectedHash: string): boolean {
  * Write file with proper ownership and permissions, using atomic write
  */
 function writeSecureFile(filePath: string, content: string, owner?: string, mode?: string): { hash: string } {
+  // Validate path to prevent traversal attacks
+  validateOutputPath(filePath);
+
   const fileMode = mode ? parseInt(mode, 8) : 0o600;
 
   // Atomic write
   writeFileAtomic(filePath, content, fileMode);
 
-  // Set ownership if specified and running as root
+  // Set ownership if specified and running as root (using safe chown)
   if (owner && process.getuid?.() === 0) {
     const [user, group] = owner.split(':');
+    const ownerArg = group ? owner : user;
     try {
-      execSync(`chown ${user}:${group || user} "${filePath}"`, { stdio: 'pipe' });
+      chownSafe(filePath, ownerArg);
     } catch (err) {
       log.warn({ filePath, owner, err }, 'Failed to set file ownership');
     }
@@ -201,7 +207,7 @@ function executeReload(cmd: string): { success: boolean; output: string } {
     return { success: true, output };
   } catch (err) {
     const error = err as { message?: string; stderr?: string };
-    const output = error.stderr || error.message || 'Unknown error';
+    const output = error.stderr ?? error.message ?? 'Unknown error';
     log.error({ cmd, error: output }, 'Reload command failed');
     return { success: false, output };
   }
@@ -309,7 +315,7 @@ export async function deployCertificate(
 
       if (outputs.key) {
         if (privateKey) {
-          const { hash } = writeSecureFile(outputs.key, privateKey, owner, mode || '0600');
+          const { hash } = writeSecureFile(outputs.key, privateKey, owner, mode ?? '0600');
           fileHashes.set(outputs.key, hash);
           filesWritten.push(outputs.key);
         } else {
@@ -344,7 +350,7 @@ export async function deployCertificate(
       log.debug({ files: filesWritten.length }, 'All files written and verified');
 
       // Execute reload command
-      const reloadCommand = reloadCmd || config.globalReloadCmd;
+      const reloadCommand = reloadCmd ?? config.globalReloadCmd;
       let reloadOutput: string | undefined;
 
       if (reloadCommand) {

@@ -18,6 +18,7 @@ import { logger } from '../lib/logger.js';
 import { NpmAutoUpdateService, loadUpdateConfig } from '../services/npm-auto-update.js';
 import { PluginAutoUpdateService, loadPluginUpdateConfig } from '../services/plugin-auto-update.js';
 import { parseSecretMapping, isSensitiveEnvVar, type ExecSecret } from '../lib/secret-env.js';
+import type { StartCommandOptions } from './types.js';
 
 // Helper to collect repeatable options
 function collect(value: string, previous: string[]): string[] {
@@ -39,7 +40,7 @@ export function registerStartCommand(program: Command): void {
     // Exec mode options
     .option('--exec <command>', 'Command to execute with secrets (combined mode)')
     .option('-s, --secret <mapping>', 'Secret mapping for exec (ENV=secret, repeatable)', collect, [])
-    .option('-sf, --secret-file <mapping>', 'Secret written to file instead of env var (ENV=secret, repeatable)', collect, [])
+    .option('-F, --secret-file <mapping>', 'Secret written to file instead of env var (ENV=secret, repeatable)', collect, [])
     .option('--secrets-to-files', 'Auto-detect sensitive secrets and write to files instead of env vars')
     .option('--restart-on-change', 'Restart child on cert/secret changes (default: true)')
     .option('--no-restart-on-change', 'Do not restart child on cert/secret changes')
@@ -90,7 +91,7 @@ Examples:
   # Production setup (systemd)
   # See docs/GUIDE.md for systemd service file
 `)
-    .action(async (options) => {
+    .action(async (options: StartCommandOptions) => {
       // Check configuration
       if (!isConfigured()) {
         console.error(chalk.red('Not configured. Run: zn-vault-agent login'));
@@ -129,7 +130,7 @@ Examples:
         };
 
         // Parse -s/--secret mappings (env vars by default, or files if --secrets-to-files)
-        for (const mapping of options.secret as string[]) {
+        for (const mapping of options.secret ?? []) {
           try {
             secrets.push(createExecSecret(mapping, false));
           } catch (err) {
@@ -139,8 +140,8 @@ Examples:
           }
         }
 
-        // Parse -sf/--secret-file mappings (always write to files)
-        for (const mapping of options.secretFile as string[]) {
+        // Parse -F/--secret-file mappings (always write to files)
+        for (const mapping of options.secretFile ?? []) {
           try {
             secrets.push(createExecSecret(mapping, true));
           } catch (err) {
@@ -201,7 +202,7 @@ Examples:
       console.log(`  Tenant:      ${config.tenantId}`);
       console.log(`  Certs:       ${targets.length} certificate(s)`);
       console.log(`  Secrets:     ${secretTargets.length} secret(s)`);
-      console.log(`  Poll:        every ${config.pollInterval || 3600}s`);
+      console.log(`  Poll:        every ${config.pollInterval ?? 3600}s`);
       if (options.healthPort) {
         console.log(`  Health:      http://0.0.0.0:${options.healthPort}/health`);
         console.log(`  Metrics:     http://0.0.0.0:${options.healthPort}/metrics`);
@@ -212,7 +213,8 @@ Examples:
         const nextRotation = config.managedKey?.nextRotationAt
           ? new Date(config.managedKey.nextRotationAt).toLocaleString()
           : 'unknown';
-        console.log(`  Auth:        ${chalk.cyan('Managed API Key')} (${config.managedKey?.name})`);
+        const keyName = config.managedKey?.name ?? 'unknown';
+        console.log(`  Auth:        ${chalk.cyan('Managed API Key')} (${keyName})`);
         console.log(`  Key rotates: ${nextRotation}`);
       } else if (config.auth.apiKey) {
         console.log(`  Auth:        API Key`);
@@ -232,12 +234,18 @@ Examples:
         console.log(`  Exec:        ${chalk.cyan(execConfig.command.join(' '))}`);
         console.log(`  Exec secrets: ${execConfig.secrets.length} env var(s)`);
         if (execConfig.restartOnChange) {
-          console.log(`  Restart:     on cert/secret change (delay: ${execConfig.restartDelayMs}ms)`);
+          console.log(`  Restart:     on cert/secret change (delay: ${execConfig.restartDelayMs ?? 5000}ms)`);
         }
       }
 
       // Plugin status
-      const pluginConfigs = (config as typeof config & { plugins?: Array<{ package?: string; path?: string; enabled?: boolean; autoUpdate?: { enabled?: boolean } }> }).plugins || [];
+      interface PluginConfig {
+        package?: string;
+        path?: string;
+        enabled?: boolean;
+        autoUpdate?: { enabled?: boolean };
+      }
+      const pluginConfigs = ((config as typeof config & { plugins?: PluginConfig[] }).plugins) ?? [];
       const enabledPlugins = pluginConfigs.filter(p => p.enabled !== false);
       if (enabledPlugins.length > 0) {
         const pluginUpdateEnabled = options.pluginAutoUpdate !== false && loadPluginUpdateConfig().enabled;
@@ -266,7 +274,7 @@ Examples:
       if (enabledPlugins.length > 0) {
         console.log(chalk.gray('Configured plugins:'));
         for (const plugin of enabledPlugins) {
-          const name = plugin.package || plugin.path || 'unknown';
+          const name = plugin.package ?? plugin.path ?? 'unknown';
           console.log(`  - ${name}`);
         }
         console.log();
@@ -285,7 +293,7 @@ Examples:
             } else if (s.apiKey) {
               source = `api-key:${s.apiKey}`;
             } else {
-              source = s.secret || '(unknown)';
+              source = s.secret ?? '(unknown)';
             }
             console.log(`  - ${s.env} = ${source}`);
           }
@@ -301,7 +309,7 @@ Examples:
             } else if (s.apiKey) {
               source = `api-key:${s.apiKey}`;
             } else {
-              source = s.secret || '(unknown)';
+              source = s.secret ?? '(unknown)';
             }
             console.log(`  - ${s.env}_FILE = ${source} ${chalk.green('(secure)')}`);
           }

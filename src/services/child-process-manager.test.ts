@@ -3,10 +3,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ChildProcessManager, type ChildProcessState } from './child-process-manager.js';
 import type { ExecConfig } from '../lib/config.js';
+import fs from 'node:fs';
 
 // Mock child_process
 vi.mock('child_process', () => ({
   spawn: vi.fn(),
+}));
+
+// Mock fs module
+vi.mock('node:fs', () => ({
+  default: {
+    existsSync: vi.fn(),
+    readFileSync: vi.fn(),
+    writeFileSync: vi.fn(),
+    unlinkSync: vi.fn(),
+    mkdirSync: vi.fn(),
+  },
 }));
 
 // Mock secret-env module
@@ -461,6 +473,120 @@ describe('ChildProcessManager', () => {
 
       expect(manager.getState().status).toBe('stopped');
       expect(manager.getState().restartCount).toBe(0);
+    });
+  });
+
+  describe('orphan process handling', () => {
+    it('should write PID file on child start', async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      vi.mocked(fs.writeFileSync).mockImplementation(() => undefined);
+
+      const manager = new ChildProcessManager(baseConfig);
+      await manager.start();
+
+      expect(fs.writeFileSync).toHaveBeenCalledWith(
+        expect.stringContaining('zn-vault-agent-child.pid'),
+        '12345',
+        expect.objectContaining({ mode: 0o644 })
+      );
+    });
+
+    it('should remove PID file on stop', async () => {
+      vi.mocked(fs.existsSync).mockImplementation((path) => {
+        // PID file exists for deletion check
+        if (String(path).includes('child.pid')) return true;
+        return false;
+      });
+      vi.mocked(fs.unlinkSync).mockImplementation(() => undefined);
+
+      const manager = new ChildProcessManager(baseConfig);
+      await manager.start();
+
+      const stopPromise = manager.stop();
+      mockChild.emit('exit', 0, null);
+      await stopPromise;
+
+      expect(fs.unlinkSync).toHaveBeenCalledWith(
+        expect.stringContaining('zn-vault-agent-child.pid')
+      );
+    });
+
+    it('should kill orphaned process found in PID file', async () => {
+      const orphanPid = 99999;
+
+      vi.mocked(fs.existsSync).mockImplementation((path) => {
+        if (String(path).includes('child.pid')) return true;
+        return false;
+      });
+      vi.mocked(fs.readFileSync).mockReturnValue(String(orphanPid));
+
+      // Track kill calls
+      const killCalls: Array<{ pid: number; signal: string | number }> = [];
+      vi.spyOn(process, 'kill').mockImplementation((pid: number, signal?: string | number) => {
+        killCalls.push({ pid, signal: signal ?? 0 });
+        if (signal === 0) {
+          // Process exists check - on first check return true, then throw (process exited)
+          if (killCalls.filter(k => k.signal === 0).length === 1) {
+            return true;
+          }
+          throw new Error('ESRCH');
+        }
+        return true;
+      });
+
+      const manager = new ChildProcessManager(baseConfig);
+      await manager.start();
+
+      // Should have called kill with SIGTERM for orphan
+      const sigtermCalls = killCalls.filter(k => k.pid === orphanPid && k.signal === 'SIGTERM');
+      expect(sigtermCalls.length).toBeGreaterThan(0);
+
+      // Cleanup
+      vi.spyOn(process, 'kill').mockRestore();
+    });
+
+    it('should handle missing orphan process gracefully', async () => {
+      const orphanPid = 99999;
+
+      vi.mocked(fs.existsSync).mockImplementation((path) => {
+        if (String(path).includes('child.pid')) return true;
+        return false;
+      });
+      vi.mocked(fs.readFileSync).mockReturnValue(String(orphanPid));
+
+      // Process doesn't exist
+      vi.spyOn(process, 'kill').mockImplementation((pid: number, signal?: string | number) => {
+        if (signal === 0) {
+          throw new Error('ESRCH'); // Process not found
+        }
+        return true;
+      });
+
+      const manager = new ChildProcessManager(baseConfig);
+
+      // Should not throw
+      await expect(manager.start()).resolves.not.toThrow();
+
+      // PID file should be cleaned up
+      expect(fs.unlinkSync).toHaveBeenCalled();
+
+      vi.spyOn(process, 'kill').mockRestore();
+    });
+
+    it('should handle invalid PID in file', async () => {
+      vi.mocked(fs.existsSync).mockImplementation((path) => {
+        if (String(path).includes('child.pid')) return true;
+        return false;
+      });
+      vi.mocked(fs.readFileSync).mockReturnValue('invalid-not-a-number');
+
+      const manager = new ChildProcessManager(baseConfig);
+
+      // Should not throw
+      await expect(manager.start()).resolves.not.toThrow();
+
+      // PID file should be cleaned up
+      expect(fs.unlinkSync).toHaveBeenCalled();
     });
   });
 });

@@ -10,7 +10,7 @@ import { exportMetrics } from './metrics.js';
 import { loadConfig, getTargets, isConfigured } from './config.js';
 import type { ChildProcessManager, ChildProcessState } from '../services/child-process-manager.js';
 import type { PluginLoader } from '../plugins/loader.js';
-import type { PluginHealthStatus, PluginVersionInfo } from '../plugins/types.js';
+import type { PluginHealthStatus } from '../plugins/types.js';
 import type { PluginAutoUpdateService } from '../services/plugin-auto-update.js';
 
 // Get agent version from package.json at module load time
@@ -20,11 +20,11 @@ try {
   const __dirname = dirname(__filename);
   // Navigate up from dist/lib to find package.json
   const pkgPath = join(__dirname, '..', '..', 'package.json');
-  const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-  agentVersion = pkg.version || '1.0.0';
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { version?: string };
+  agentVersion = pkg.version ?? '1.0.0';
 } catch {
   // Fallback to env var or default
-  agentVersion = process.env.npm_package_version || '1.0.0';
+  agentVersion = process.env.npm_package_version ?? '1.0.0';
 }
 
 export interface HealthStatus {
@@ -139,7 +139,7 @@ export function setPluginAutoUpdateService(service: PluginAutoUpdateService | nu
 export async function getHealthStatus(): Promise<HealthStatus> {
   const config = loadConfig();
   const targets = getTargets();
-  const secretTargets = config.secretTargets || [];
+  const secretTargets = config.secretTargets ?? [];
 
   let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
 
@@ -176,7 +176,7 @@ export async function getHealthStatus(): Promise<HealthStatus> {
 
   // Collect plugin health status
   let pluginStatuses: PluginHealthStatus[] | undefined;
-  if (pluginLoader && pluginLoader.hasPlugins()) {
+  if (pluginLoader?.hasPlugins()) {
     pluginStatuses = await pluginLoader.collectHealthStatus();
 
     // Plugin status affects overall health
@@ -282,7 +282,7 @@ function createFastifyInstance(): FastifyInstance {
   // Plugin version check endpoint
   fastify.get('/plugins/versions', async (_request, reply) => {
     if (!pluginAutoUpdateService) {
-      return reply.code(503).send({
+      return await reply.code(503).send({
         error: 'Plugin auto-update service not available',
         versions: [],
       });
@@ -308,7 +308,7 @@ function createFastifyInstance(): FastifyInstance {
   // Plugin update trigger endpoint
   fastify.post('/plugins/update', async (_request, reply) => {
     if (!pluginAutoUpdateService) {
-      return reply.code(503).send({
+      return await reply.code(503).send({
         error: 'Plugin auto-update service not available',
         results: [],
       });

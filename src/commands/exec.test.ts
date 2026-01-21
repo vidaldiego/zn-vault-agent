@@ -5,10 +5,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   parseSecretMapping,
   parseSecretMappingFromConfig,
+  parseEnvFileReference,
   buildSecretEnv,
+  buildEnvFromEnvFiles,
   extractSecretIds,
   extractApiKeyNames,
+  extractEnvFileSecretIds,
   type SecretMapping,
+  type EnvFileMapping,
 } from '../lib/secret-env.js';
 
 // Mock the api module
@@ -510,5 +514,272 @@ describe('parseSecretMappingFromConfig', () => {
       expect(() => parseSecretMappingFromConfig({ env: 'VAR' }))
         .toThrow("ExecSecret must have 'secret', 'literal', or 'apiKey' property");
     });
+  });
+});
+
+describe('parseEnvFileReference', () => {
+  describe('alias format', () => {
+    it('should parse alias without prefix', () => {
+      const result = parseEnvFileReference('alias:env/prod');
+      expect(result.secretId).toBe('alias:env/prod');
+      expect(result.prefix).toBeUndefined();
+    });
+
+    it('should parse alias with prefix', () => {
+      const result = parseEnvFileReference('alias:env/prod:APP_');
+      expect(result.secretId).toBe('alias:env/prod');
+      expect(result.prefix).toBe('APP_');
+    });
+
+    it('should parse alias with nested path', () => {
+      const result = parseEnvFileReference('alias:config/env/production');
+      expect(result.secretId).toBe('alias:config/env/production');
+      expect(result.prefix).toBeUndefined();
+    });
+
+    it('should parse alias with nested path and prefix', () => {
+      const result = parseEnvFileReference('alias:config/env/production:DB_');
+      expect(result.secretId).toBe('alias:config/env/production');
+      expect(result.prefix).toBe('DB_');
+    });
+  });
+
+  describe('UUID format', () => {
+    it('should parse UUID without prefix', () => {
+      const result = parseEnvFileReference('abc123-def456');
+      expect(result.secretId).toBe('abc123-def456');
+      expect(result.prefix).toBeUndefined();
+    });
+
+    it('should parse UUID with prefix', () => {
+      const result = parseEnvFileReference('abc123:PREFIX_');
+      expect(result.secretId).toBe('abc123');
+      expect(result.prefix).toBe('PREFIX_');
+    });
+  });
+
+  describe('error handling', () => {
+    it('should throw for empty string', () => {
+      expect(() => parseEnvFileReference('')).toThrow('cannot be empty');
+    });
+
+    it('should throw for whitespace only', () => {
+      expect(() => parseEnvFileReference('   ')).toThrow('cannot be empty');
+    });
+
+    it('should throw for colon-only (empty secretId)', () => {
+      expect(() => parseEnvFileReference(':PREFIX_')).toThrow('cannot be empty');
+    });
+  });
+});
+
+describe('buildEnvFromEnvFiles', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('should build env from simple object secret', async () => {
+    mockGetSecret.mockResolvedValue({
+      id: 'test-id',
+      alias: 'env/prod',
+      type: 'opaque',
+      version: 1,
+      data: { HOST: 'localhost', PORT: '5432' },
+    });
+
+    const mappings: EnvFileMapping[] = [{ secretId: 'alias:env/prod' }];
+    const env = await buildEnvFromEnvFiles(mappings);
+
+    expect(env.HOST).toBe('localhost');
+    expect(env.PORT).toBe('5432');
+    expect(mockGetSecret).toHaveBeenCalledTimes(1);
+    expect(mockGetSecret).toHaveBeenCalledWith('alias:env/prod');
+  });
+
+  it('should apply prefix to all vars', async () => {
+    mockGetSecret.mockResolvedValue({
+      id: 'test-id',
+      alias: 'env/prod',
+      type: 'opaque',
+      version: 1,
+      data: { HOST: 'localhost', PORT: '5432' },
+    });
+
+    const mappings: EnvFileMapping[] = [{ secretId: 'alias:env/prod', prefix: 'DB_' }];
+    const env = await buildEnvFromEnvFiles(mappings);
+
+    expect(env.DB_HOST).toBe('localhost');
+    expect(env.DB_PORT).toBe('5432');
+    expect(env.HOST).toBeUndefined();
+    expect(env.PORT).toBeUndefined();
+  });
+
+  it('should JSON stringify non-string values', async () => {
+    mockGetSecret.mockResolvedValue({
+      id: 'test-id',
+      alias: 'env/prod',
+      type: 'opaque',
+      version: 1,
+      data: {
+        PORT: 5432,
+        ENABLED: true,
+        CONFIG: { nested: 'value' },
+      },
+    });
+
+    const mappings: EnvFileMapping[] = [{ secretId: 'alias:env/prod' }];
+    const env = await buildEnvFromEnvFiles(mappings);
+
+    expect(env.PORT).toBe('5432');
+    expect(env.ENABLED).toBe('true');
+    expect(env.CONFIG).toBe('{"nested":"value"}');
+  });
+
+  it('should convert null/undefined to empty string', async () => {
+    mockGetSecret.mockResolvedValue({
+      id: 'test-id',
+      alias: 'env/prod',
+      type: 'opaque',
+      version: 1,
+      data: { NULL_VAL: null, UNDEF_VAL: undefined },
+    });
+
+    const mappings: EnvFileMapping[] = [{ secretId: 'alias:env/prod' }];
+    const env = await buildEnvFromEnvFiles(mappings);
+
+    expect(env.NULL_VAL).toBe('');
+    expect(env.UNDEF_VAL).toBe('');
+  });
+
+  it('should later env file override earlier', async () => {
+    mockGetSecret
+      .mockResolvedValueOnce({
+        id: 'base-id',
+        alias: 'env/base',
+        type: 'opaque',
+        version: 1,
+        data: { HOST: 'base-host', PORT: '5432' },
+      })
+      .mockResolvedValueOnce({
+        id: 'prod-id',
+        alias: 'env/prod',
+        type: 'opaque',
+        version: 1,
+        data: { HOST: 'prod-host' },
+      });
+
+    const mappings: EnvFileMapping[] = [
+      { secretId: 'alias:env/base' },
+      { secretId: 'alias:env/prod' },
+    ];
+    const env = await buildEnvFromEnvFiles(mappings);
+
+    expect(env.HOST).toBe('prod-host');  // Later wins
+    expect(env.PORT).toBe('5432');        // From base
+  });
+
+  it('should throw for non-object data', async () => {
+    mockGetSecret.mockResolvedValue({
+      id: 'test-id',
+      alias: 'env/prod',
+      type: 'opaque',
+      version: 1,
+      data: 'not-an-object' as unknown as Record<string, unknown>,
+    });
+
+    const mappings: EnvFileMapping[] = [{ secretId: 'alias:env/prod' }];
+
+    await expect(buildEnvFromEnvFiles(mappings)).rejects.toThrow(
+      'must contain key-value pairs'
+    );
+  });
+
+  it('should throw for array data', async () => {
+    mockGetSecret.mockResolvedValue({
+      id: 'test-id',
+      alias: 'env/prod',
+      type: 'opaque',
+      version: 1,
+      data: ['item1', 'item2'] as unknown as Record<string, unknown>,
+    });
+
+    const mappings: EnvFileMapping[] = [{ secretId: 'alias:env/prod' }];
+
+    await expect(buildEnvFromEnvFiles(mappings)).rejects.toThrow(
+      'must contain key-value pairs'
+    );
+  });
+
+  it('should handle empty object data (no error)', async () => {
+    mockGetSecret.mockResolvedValue({
+      id: 'test-id',
+      alias: 'env/prod',
+      type: 'opaque',
+      version: 1,
+      data: {},
+    });
+
+    const mappings: EnvFileMapping[] = [{ secretId: 'alias:env/prod' }];
+    const env = await buildEnvFromEnvFiles(mappings);
+
+    expect(Object.keys(env)).toHaveLength(0);
+  });
+});
+
+describe('extractEnvFileSecretIds', () => {
+  it('should extract secret IDs from env file mappings', () => {
+    const mappings: EnvFileMapping[] = [
+      { secretId: 'alias:env/base' },
+      { secretId: 'alias:env/prod', prefix: 'APP_' },
+      { secretId: 'uuid-123' },
+    ];
+    const ids = extractEnvFileSecretIds(mappings);
+    expect(ids).toEqual(['alias:env/base', 'alias:env/prod', 'uuid-123']);
+  });
+
+  it('should return empty array for empty mappings', () => {
+    const ids = extractEnvFileSecretIds([]);
+    expect(ids).toEqual([]);
+  });
+});
+
+describe('Merge Precedence (env files + individual mappings)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('individual mapping should override env file value', async () => {
+    // Env file has KEY=env-value
+    mockGetSecret
+      .mockResolvedValueOnce({
+        id: 'env-id',
+        alias: 'env/prod',
+        type: 'opaque',
+        version: 1,
+        data: { KEY: 'env-value', OTHER: 'other-value' },
+      })
+      .mockResolvedValueOnce({
+        id: 'secret-id',
+        alias: 'secret/key',
+        type: 'opaque',
+        version: 1,
+        data: { value: 'individual-value' },
+      });
+
+    // Build env from env files
+    const envFileMappings: EnvFileMapping[] = [{ secretId: 'alias:env/prod' }];
+    const envFileVars = await buildEnvFromEnvFiles(envFileMappings);
+
+    // Build env from individual mappings
+    const individualMappings: (SecretMapping & { literal?: string })[] = [
+      { envVar: 'KEY', secretId: 'alias:secret/key', key: 'value' },
+    ];
+    const individualVars = await buildSecretEnv(individualMappings);
+
+    // Merge: individual wins
+    const merged = { ...envFileVars, ...individualVars };
+
+    expect(merged.KEY).toBe('individual-value');  // Individual wins
+    expect(merged.OTHER).toBe('other-value');      // From env file
   });
 });

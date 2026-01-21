@@ -544,4 +544,145 @@ describe('Exec Mode', () => {
       expect(result.stdout.trim()).toBe('alias:fake/path.key');
     });
   });
+
+  describe('Env File Injection (--env-file / -e)', () => {
+    let envFileSecret: { id: string; alias: string } | null = null;
+    let envFileSecret2: { id: string; alias: string } | null = null;
+
+    beforeAll(async () => {
+      // Create env file type secrets with key-value data
+      envFileSecret = await vault.createSecret({
+        alias: `exec/envfile-${Date.now()}`,
+        tenant: TEST_ENV.tenantId,
+        type: 'opaque',
+        data: {
+          DB_HOST: 'localhost',
+          DB_PORT: '5432',
+          DB_USER: 'testuser',
+        },
+      });
+
+      envFileSecret2 = await vault.createSecret({
+        alias: `exec/envfile2-${Date.now()}`,
+        tenant: TEST_ENV.tenantId,
+        type: 'opaque',
+        data: {
+          DB_HOST: 'prodhost',  // Override
+          APP_NAME: 'myapp',
+        },
+      });
+    });
+
+    afterAll(async () => {
+      if (envFileSecret) {
+        try {
+          await vault.deleteSecret(envFileSecret.id);
+        } catch { /* ignore */ }
+      }
+      if (envFileSecret2) {
+        try {
+          await vault.deleteSecret(envFileSecret2.id);
+        } catch { /* ignore */ }
+      }
+    });
+
+    it('EXEC-ENVFILE-01: should inject all vars from env file secret', async () => {
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo "$DB_HOST|$DB_PORT|$DB_USER"'],
+        map: [],
+        envFiles: [`alias:${envFileSecret!.alias}`],
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('localhost|5432|testuser');
+    });
+
+    it('EXEC-ENVFILE-02: should apply prefix to all vars from env file', async () => {
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo "$APP_DB_HOST|$APP_DB_PORT"'],
+        map: [],
+        envFiles: [`alias:${envFileSecret!.alias}:APP_`],
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('localhost|5432');
+    });
+
+    it('EXEC-ENVFILE-03: should let individual mapping override env file', async () => {
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo "$DB_HOST|$DB_PORT"'],
+        map: ['DB_HOST=literal:overridden-host'],
+        envFiles: [`alias:${envFileSecret!.alias}`],
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('overridden-host|5432');
+    });
+
+    it('EXEC-ENVFILE-04: should let later env file override earlier', async () => {
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo "$DB_HOST|$DB_PORT|$APP_NAME"'],
+        map: [],
+        envFiles: [
+          `alias:${envFileSecret!.alias}`,
+          `alias:${envFileSecret2!.alias}`,
+        ],
+      });
+
+      expect(result.exitCode).toBe(0);
+      // DB_HOST should be 'prodhost' (from second), DB_PORT '5432' (from first), APP_NAME 'myapp' (from second)
+      expect(result.stdout.trim()).toBe('prodhost|5432|myapp');
+    });
+
+    it('EXEC-ENVFILE-05: should write env file vars to output file', async () => {
+      const envFilePath = resolve(outputDir, 'envfile-output.env');
+
+      const result = await agent.exec({
+        command: [],
+        map: [],
+        envFiles: [`alias:${envFileSecret!.alias}`],
+        envFile: envFilePath,
+      });
+
+      expect(result.exitCode).toBe(0);
+
+      const content = readFileSync(envFilePath, 'utf-8');
+      expect(content).toContain('DB_HOST="localhost"');
+      expect(content).toContain('DB_PORT="5432"');
+      expect(content).toContain('DB_USER="testuser"');
+    });
+
+    it('EXEC-ENVFILE-06: should fail for non-existent env file secret', async () => {
+      const result = await agent.exec({
+        command: ['echo', 'test'],
+        map: [],
+        envFiles: ['alias:nonexistent/envfile/secret'],
+      });
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr.toLowerCase()).toMatch(/not found|error/);
+    });
+
+    it('EXEC-ENVFILE-07: should work with mix of env files and individual mappings', async () => {
+      const result = await agent.exec({
+        command: ['sh', '-c', 'echo "$DB_HOST|$DB_PORT|$API_KEY"'],
+        map: [`API_KEY=alias:${testSecret1!.alias}.key`],
+        envFiles: [`alias:${envFileSecret!.alias}`],
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('localhost|5432|sk-test-12345');
+    });
+
+    it('EXEC-ENVFILE-08: should require at least one env-file or secret', async () => {
+      const result = await agent.exec({
+        command: ['echo', 'test'],
+        map: [],
+        envFiles: [],
+      });
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr.toLowerCase()).toMatch(/required|secret|env-file/);
+    });
+  });
 });

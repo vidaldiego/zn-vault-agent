@@ -35,6 +35,52 @@ Real-time certificate distribution agent for ZnVault. Automatically syncs TLS ce
 - **Auto-updates**: Automatic npm-based updates with graceful restarts
 - **API key auto-renewal**: Automatic rotation before expiry
 
+## Authentication
+
+The agent supports three authentication methods:
+
+### Bootstrap Token (Recommended for Production)
+
+The most secure way to provision new agents. A one-time registration token is used to bind the agent to a managed API key with automatic rotation.
+
+```bash
+# 1. Admin creates a managed key and generates a bootstrap token
+znvault agent token create --managed-key my-server-key
+# Output: zrt_abc123... (one-time use, expires in 1h)
+
+# 2. Pass token to new server via cloud-init, Ansible, etc.
+
+# 3. Agent bootstraps with the token
+zn-vault-agent login --url https://vault.example.com \
+  --bootstrap-token zrt_abc123...
+```
+
+**Benefits:**
+- No static credentials to manage
+- Token is consumed immediately (one-time use)
+- Agent automatically uses managed key with auto-rotation
+- Short TTL (max 24h) limits exposure window
+
+### Managed API Key
+
+If you already have a managed API key, the agent auto-detects it and enables auto-rotation:
+
+```bash
+zn-vault-agent login --url https://vault.example.com \
+  --api-key znv_abc123...
+# Agent detects managed key, retrieves tenant, and binds automatically
+```
+
+### Static API Key (Not Recommended)
+
+For development or testing only. Static keys don't auto-rotate and require manual renewal:
+
+```bash
+zn-vault-agent login --url https://vault.example.com \
+  --api-key znv_abc123...
+# Warning displayed recommending managed keys
+```
+
 ## Quick Start
 
 ### Option A: npm Install (Recommended)
@@ -69,9 +115,9 @@ npm install -g @zincapp/zn-vault-agent@next      # Development
 After installation, configure and start:
 
 ```bash
-# 1. Configure the agent
+# 1. Configure the agent (RECOMMENDED: bootstrap token)
 zn-vault-agent login --url https://vault.example.com \
-  --tenant my-tenant --api-key znv_abc123...
+  --bootstrap-token zrt_abc123...
 
 # 2. Add certificate to sync
 zn-vault-agent certs add <cert-id> \
@@ -81,6 +127,14 @@ zn-vault-agent certs add <cert-id> \
 
 # 3. Start service
 sudo systemctl start zn-vault-agent
+```
+
+**Alternative: API key authentication**
+
+```bash
+# If you have a managed or static API key instead of a bootstrap token
+zn-vault-agent login --url https://vault.example.com \
+  --api-key znv_abc123...
 ```
 
 ### Option B: Using znvault CLI
@@ -271,16 +325,16 @@ curl -sk -X POST https://vault.example.com/auth/api-keys \
 #### Using Managed Keys with the Agent
 
 ```bash
-# Just use the API key - agent auto-detects it's managed
+# Just use the API key - agent auto-detects it's managed and retrieves tenant
 zn-vault-agent login \
   --url https://vault.example.com \
-  --tenant my-tenant \
   --api-key znv_managed_key_123...
 
 # Output shows managed key was detected:
 # ✓ Connection successful!
 # ✓ Configuration saved to: /etc/zn-vault-agent/config.json
 # ✓ Found 5 certificate(s) in vault
+# ✓ Tenant: my-tenant
 # ✓ Managed API key detected and bound
 # ✓ Managed key: agent-prod-server1 (rotates: 1/6/2026, 10:00 AM)
 #   Auto-rotation enabled - key will refresh before expiration
@@ -560,6 +614,7 @@ Options:
   --auto-update              Enable automatic updates
   --exec <command>           Command to execute (combined mode)
   -s, --secret <mapping>     Secret mapping for exec (repeatable)
+  -e, --env-file <ref>       Inject all vars from env secret (repeatable)
   --restart-on-change        Restart child on cert/secret changes
   --restart-delay <ms>       Delay before restart (default: 5000)
   --max-restarts <n>         Max restarts in window (default: 10)
@@ -658,7 +713,90 @@ zn-vault-agent exec \
   -- ./start.sh
 ```
 
-### Mapping Formats
+### Env File Injection (`-e/--env-file`)
+
+Inject **all key-value pairs** from a secret as environment variables in a single command. This is ideal for secrets that contain multiple environment variables.
+
+```bash
+# Single env file - injects all key-value pairs as env vars
+zn-vault-agent exec -e alias:env/production -- python app.py
+
+# Multiple env files (later overrides earlier)
+zn-vault-agent exec -e alias:env/base -e alias:env/prod -- ./start.sh
+
+# With prefix (all vars get APP_ prefix)
+zn-vault-agent exec -e alias:env/production:APP_ -- node server.js
+
+# Mixed: env files + individual mappings (individual mappings win)
+zn-vault-agent exec \
+  -e alias:env/base \
+  -s DB_PASSWORD=alias:db/creds.password \
+  -- ./start.sh
+```
+
+#### Env File Format
+
+| Format | Description | Example |
+|--------|-------------|---------|
+| `alias:path/to/secret` | All key-value pairs as env vars | `-e alias:env/prod` |
+| `alias:path/to/secret:PREFIX_` | All vars with prefix | `-e alias:env/prod:APP_` |
+| `uuid` | UUID reference | `-e abc123-def456` |
+| `uuid:PREFIX_` | UUID with prefix | `-e abc123:DB_` |
+
+#### How It Works
+
+Given a secret at `alias:env/production` with data:
+```json
+{
+  "DB_HOST": "localhost",
+  "DB_PORT": "5432",
+  "DB_USER": "app"
+}
+```
+
+Running:
+```bash
+zn-vault-agent exec -e alias:env/production -- printenv
+```
+
+Results in environment:
+```
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=app
+```
+
+With prefix:
+```bash
+zn-vault-agent exec -e alias:env/production:APP_ -- printenv
+```
+
+Results in:
+```
+APP_DB_HOST=localhost
+APP_DB_PORT=5432
+APP_DB_USER=app
+```
+
+#### Precedence Rules
+
+1. **Multiple env files**: Later files override earlier ones
+2. **Individual mappings (`-s`)**: Always override env file values
+3. **Literals**: Treated as individual mappings
+
+```bash
+# If alias:env/base has DB_HOST=base-host
+# and alias:env/prod has DB_HOST=prod-host
+# Result: DB_HOST=prod-host (later wins)
+zn-vault-agent exec -e alias:env/base -e alias:env/prod -- printenv
+
+# If alias:env/prod has DB_HOST=prod-host
+# and -s sets DB_HOST explicitly
+# Result: DB_HOST=override (individual wins)
+zn-vault-agent exec -e alias:env/prod -s DB_HOST=literal:override -- printenv
+```
+
+### Individual Mapping Formats (`-s/--secret`)
 
 | Format | Description | Example |
 |--------|-------------|---------|
@@ -972,9 +1110,9 @@ npm install -g @zincapp/zn-vault-agent
 # Setup systemd (as root)
 sudo zn-vault-agent setup
 
-# Configure
+# Configure (tenant is auto-detected from API key)
 zn-vault-agent login --url https://vault.example.com \
-  --tenant my-tenant --api-key znv_abc123...
+  --api-key znv_abc123...
 
 # Enable and start
 sudo systemctl enable --now zn-vault-agent
@@ -1050,18 +1188,11 @@ while the agent was offline:
 # Check agent logs for 401 errors
 journalctl -u zn-vault-agent | grep -i "401\|Unauthorized\|RECOVERY REQUIRED"
 
-# Create a new API key (requires admin access to vault)
-znvault api-key create agent-recovery --tenant <tenant> \
-  --permissions "certificate:read:value,certificate:read:metadata,certificate:list"
+# Create a new API key in the vault dashboard or CLI, then reconfigure
+zn-vault-agent login --url https://vault.example.com \
+  --api-key znv_your_new_key_here
 
-# Update the agent config with the new key
-sudo jq '.auth.apiKey = "znv_your_new_key_here"' \
-  /etc/zn-vault-agent/config.json > /tmp/config.json && \
-  sudo mv /tmp/config.json /etc/zn-vault-agent/config.json
-
-# Set correct permissions and restart
-sudo chown zn-vault-agent:zn-vault-agent /etc/zn-vault-agent/config.json
-sudo chmod 600 /etc/zn-vault-agent/config.json
+# Restart the agent
 sudo systemctl restart zn-vault-agent
 ```
 

@@ -13,11 +13,26 @@ import { promisify } from 'util';
 import { existsSync, writeFileSync, unlinkSync, readFileSync, statSync } from 'fs';
 import { logger } from '../lib/logger.js';
 import type { PluginConfig, PluginVersionInfo } from '../plugins/types.js';
-import type { UpdateChannel, UpdateConfig } from '../types/update.js';
-import { DEFAULT_UPDATE_CONFIG } from '../types/update.js';
+import type { UpdateChannel } from '../types/update.js';
 
 const execAsync = promisify(exec);
 const LOCK_FILE = '/var/run/zn-vault-agent.plugin-update.lock';
+
+/**
+ * Package.json structure for type-safe parsing
+ */
+interface PackageJson {
+  name?: string;
+  version?: string;
+  dependencies?: Record<string, string>;
+}
+
+/**
+ * npm list --json output structure
+ */
+interface NpmListOutput {
+  dependencies?: Record<string, { version?: string }>;
+}
 
 /**
  * Plugin update result
@@ -53,11 +68,11 @@ export class PluginAutoUpdateService {
   private initialCheckTimeout: NodeJS.Timeout | null = null;
   private readonly config: PluginAutoUpdateServiceConfig;
   private readonly plugins: PluginConfig[];
-  private readonly installedVersions: Map<string, string> = new Map();
+  private readonly installedVersions = new Map<string, string>();
 
   constructor(plugins: PluginConfig[], config: Partial<PluginAutoUpdateServiceConfig> = {}) {
     this.config = { ...DEFAULT_PLUGIN_UPDATE_CONFIG, ...config };
-    this.plugins = plugins.filter((p) => p.package && p.enabled !== false);
+    this.plugins = plugins.filter((p) => p.package !== undefined && p.enabled !== false);
   }
 
   /**
@@ -86,14 +101,14 @@ export class PluginAutoUpdateService {
 
     // Initial check after 2 minutes (let daemon stabilize, after agent self-update check)
     this.initialCheckTimeout = setTimeout(() => {
-      this.checkAndUpdateAll().catch((err) => {
+      this.checkAndUpdateAll().catch((err: unknown) => {
         logger.error({ err }, 'Initial plugin auto-update check failed');
       });
     }, 2 * 60_000);
 
     // Then check periodically
     this.checkInterval = setInterval(() => {
-      this.checkAndUpdateAll().catch((err) => {
+      this.checkAndUpdateAll().catch((err: unknown) => {
         logger.error({ err }, 'Plugin auto-update check failed');
       });
     }, this.config.checkIntervalMs);
@@ -130,8 +145,8 @@ export class PluginAutoUpdateService {
       }
 
       try {
-        const channel = plugin.autoUpdate?.channel || this.config.defaultChannel;
-        const current = this.installedVersions.get(plugin.package) || '0.0.0';
+        const channel = plugin.autoUpdate?.channel ?? this.config.defaultChannel;
+        const current = this.installedVersions.get(plugin.package) ?? '0.0.0';
         const latest = await this.getLatestVersion(plugin.package, channel);
 
         results.push({
@@ -179,7 +194,7 @@ export class PluginAutoUpdateService {
         const plugin = this.plugins.find((p) => p.package === update.package);
         if (!plugin) continue;
 
-        const channel = plugin.autoUpdate?.channel || this.config.defaultChannel;
+        const channel = plugin.autoUpdate?.channel ?? this.config.defaultChannel;
         const result = await this.updatePlugin(update.package, channel);
         results.push({
           package: update.package,
@@ -196,7 +211,7 @@ export class PluginAutoUpdateService {
           'Plugin updates complete, requesting restart'
         );
         // Schedule restart after response is sent
-        setTimeout(() => this.requestRestart(), 2000);
+        setTimeout(() => { this.requestRestart(); }, 2000);
       }
     } finally {
       this.releaseLock();
@@ -235,7 +250,7 @@ export class PluginAutoUpdateService {
         const plugin = this.plugins.find((p) => p.package === update.package);
         if (!plugin) continue;
 
-        const channel = plugin.autoUpdate?.channel || this.config.defaultChannel;
+        const channel = plugin.autoUpdate?.channel ?? this.config.defaultChannel;
         const result = await this.updatePlugin(update.package, channel);
         results.push({
           package: update.package,
@@ -307,7 +322,7 @@ export class PluginAutoUpdateService {
       for (let i = 0; i < 10; i++) {
         const pkgPath = `${dir}/package.json`;
         if (existsSync(pkgPath)) {
-          const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+          const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as PackageJson;
           if (pkg.name === '@zincapp/zn-vault-agent') {
             return dir;
           }
@@ -342,14 +357,14 @@ export class PluginAutoUpdateService {
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
-      const npmList = JSON.parse(output);
-      const dependencies = npmList.dependencies || {};
+      const npmList = JSON.parse(output) as NpmListOutput;
+      const dependencies = npmList.dependencies ?? {};
 
       for (const plugin of this.plugins) {
         if (!plugin.package) continue;
 
         const pkgInfo = dependencies[plugin.package];
-        if (pkgInfo?.version) {
+        if (pkgInfo.version) {
           this.installedVersions.set(plugin.package, pkgInfo.version);
           logger.info({ package: plugin.package, version: pkgInfo.version, location: 'local' }, 'Detected installed plugin version');
         } else {
@@ -370,8 +385,8 @@ export class PluginAutoUpdateService {
         // Check agent's local node_modules first
         const localPkgPath = `${agentDir}/node_modules/${plugin.package}/package.json`;
         if (existsSync(localPkgPath)) {
-          const pkg = JSON.parse(readFileSync(localPkgPath, 'utf-8'));
-          this.installedVersions.set(plugin.package, pkg.version || '0.0.0');
+          const pkg = JSON.parse(readFileSync(localPkgPath, 'utf-8')) as PackageJson;
+          this.installedVersions.set(plugin.package, pkg.version ?? '0.0.0');
           logger.info({ package: plugin.package, version: pkg.version, location: 'local' }, 'Detected installed plugin version via package.json');
           continue;
         }
@@ -380,8 +395,8 @@ export class PluginAutoUpdateService {
         const result = require.resolve(plugin.package);
         const pkgJsonPath = this.findPackageJson(result);
         if (pkgJsonPath) {
-          const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'));
-          this.installedVersions.set(plugin.package, pkg.version || '0.0.0');
+          const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf-8')) as PackageJson;
+          this.installedVersions.set(plugin.package, pkg.version ?? '0.0.0');
           logger.info({ package: plugin.package, version: pkg.version, location: 'resolved' }, 'Detected installed plugin version via require.resolve');
         } else {
           this.installedVersions.set(plugin.package, '0.0.0');

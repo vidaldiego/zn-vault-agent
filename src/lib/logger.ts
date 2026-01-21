@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const isDev = process.env.NODE_ENV !== 'production';
-const logFile = process.env.LOG_FILE || (isDev ? undefined : '/var/log/zn-vault-agent/agent.log');
+const logFile = process.env.LOG_FILE ?? (isDev ? undefined : '/var/log/zn-vault-agent/agent.log');
 
 /**
  * Create file stream for logging if LOG_FILE is set
@@ -33,18 +33,6 @@ function createFileStream(): pino.DestinationStream | undefined {
     });
   } catch {
     return undefined;
-  }
-}
-
-/**
- * Check if pino-pretty is available
- */
-async function hasPinoPretty(): Promise<boolean> {
-  try {
-    await import('pino-pretty');
-    return true;
-  } catch {
-    return false;
   }
 }
 

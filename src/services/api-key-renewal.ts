@@ -84,18 +84,19 @@ function makeRequest<T>(
 
     const req = protocol.request(requestOptions, (res) => {
       let data = '';
-      res.on('data', (chunk) => (data += chunk));
+      res.on('data', (chunk: Buffer | string) => (data += String(chunk)));
       res.on('end', () => {
         try {
-          if (res.statusCode && res.statusCode >= 400) {
-            const error = data ? JSON.parse(data) : { message: res.statusMessage };
-            reject(new Error(error.message || `Request failed: ${res.statusCode}`));
+          if (res.statusCode !== undefined && res.statusCode >= 400) {
+            const errorResponse = data ? (JSON.parse(data) as { message?: string }) : { message: res.statusMessage };
+            reject(new Error(errorResponse.message ?? `Request failed: ${res.statusCode}`));
             return;
           }
-          const parsed = data ? JSON.parse(data) : {};
-          resolve(parsed as T);
-        } catch (err) {
-          reject(new Error(`Failed to parse response: ${err}`));
+          const parsed = data ? (JSON.parse(data) as T) : ({} as T);
+          resolve(parsed);
+        } catch (err: unknown) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          reject(new Error(`Failed to parse response: ${errMsg}`));
         }
       });
     });
@@ -106,7 +107,7 @@ function makeRequest<T>(
       reject(new Error('Request timeout'));
     });
 
-    if (body) {
+    if (body !== undefined) {
       req.write(JSON.stringify(body));
     }
     req.end();
@@ -127,19 +128,19 @@ async function checkApiKeyStatus(): Promise<ApiKeyStatus | null> {
   try {
     const status = await makeRequest<ApiKeyStatus>('GET', '/auth/api-keys/self');
     return status;
-  } catch (err) {
-    const error = err as Error;
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err : new Error(String(err));
 
     // Check for authentication failures
-    if (error.message?.includes('401') || error.message?.includes('Unauthorized')) {
+    if (error.message.includes('401') || error.message.includes('Unauthorized')) {
       log.error({
-        keyPrefix: config.auth.apiKey?.substring(0, 8),
+        keyPrefix: config.auth.apiKey.substring(0, 8),
       }, 'API key authentication failed - key may have expired or been revoked');
 
       log.error({}, 'RECOVERY REQUIRED: The stored API key is no longer valid.');
       log.error({}, 'To recover, create a new API key and update the agent config:');
-      log.error({}, '  1. Create a new API key: znvault api-key create <name> --tenant <tenant> --permissions "certificate:read:value,certificate:read:metadata,certificate:list"');
-      log.error({}, '  2. Update /etc/zn-vault-agent/config.json with the new key');
+      log.error({}, '  1. Create a new API key in the vault dashboard or CLI');
+      log.error({}, '  2. Re-run: zn-vault-agent login --url <vault-url> --api-key <new-key>');
       log.error({}, '  3. Restart the agent: sudo systemctl restart zn-vault-agent');
     } else {
       log.error({ err }, 'Failed to check API key status');
@@ -250,13 +251,13 @@ export function startApiKeyRenewal(): void {
   }, 'Starting API key renewal service');
 
   // Check immediately on startup
-  checkAndRenewApiKey().catch(err => {
+  checkAndRenewApiKey().catch((err: unknown) => {
     log.error({ err }, 'Initial API key check failed');
   });
 
   // Schedule periodic checks
   checkTimer = setInterval(() => {
-    checkAndRenewApiKey().catch(err => {
+    checkAndRenewApiKey().catch((err: unknown) => {
       log.error({ err }, 'Periodic API key check failed');
     });
   }, CHECK_INTERVAL_MS);

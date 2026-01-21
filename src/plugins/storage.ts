@@ -25,7 +25,7 @@ function getStorageDir(): string {
   }
 
   // User config dir
-  const homeDir = process.env.HOME || process.env.USERPROFILE || '/tmp';
+  const homeDir = process.env.HOME ?? process.env.USERPROFILE ?? '/tmp';
   return path.join(homeDir, '.zn-vault-agent', 'plugin-data');
 }
 
@@ -60,8 +60,9 @@ function ensureStorageDir(): void {
  */
 function loadStorageData(pluginName: string): Record<string, unknown> {
   // Check cache first
-  if (storageCache.has(pluginName)) {
-    return storageCache.get(pluginName)!;
+  const cached = storageCache.get(pluginName);
+  if (cached !== undefined) {
+    return cached;
   }
 
   const storagePath = getStoragePath(pluginName);
@@ -110,11 +111,13 @@ function saveStorageData(pluginName: string, data: Record<string, unknown>): voi
  */
 export function getPluginStorage(pluginName: string): PluginStorage {
   return {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T is used for type inference at call site
     get<T>(key: string): T | undefined {
       const data = loadStorageData(pluginName);
       return data[key] as T | undefined;
     },
 
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- T is used for type inference at call site
     set<T>(key: string, value: T): void {
       const data = loadStorageData(pluginName);
       data[key] = value as unknown;
@@ -123,6 +126,7 @@ export function getPluginStorage(pluginName: string): PluginStorage {
 
     delete(key: string): void {
       const data = loadStorageData(pluginName);
+      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete -- key-value store API
       delete data[key];
       saveStorageData(pluginName, data);
     },

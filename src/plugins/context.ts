@@ -71,8 +71,7 @@ export function createPluginContext(
 
       // Find cert ID from targets if name given
       let certId = certIdOrName;
-      const targets = agentInternals.config.targets || [];
-      const target = targets.find(t => t.name === certIdOrName || t.certId === certIdOrName);
+      const target = agentInternals.config.targets.find(t => t.name === certIdOrName || t.certId === certIdOrName);
       if (target) {
         certId = target.certId;
       }
@@ -86,7 +85,7 @@ export function createPluginContext(
 
       return {
         id: decrypted.id,
-        name: target?.name || certId,
+        name: target?.name ?? certId,
         certificate: parts.certificate,
         privateKey: parts.privateKey,
         chain: parts.chain,
@@ -101,14 +100,14 @@ export function createPluginContext(
      * Get configured certificate targets
      */
     getCertTargets(): CertTarget[] {
-      return agentInternals.config.targets || [];
+      return agentInternals.config.targets;
     },
 
     /**
      * Get configured secret targets
      */
     getSecretTargets(): SecretTarget[] {
-      return agentInternals.config.secretTargets || [];
+      return agentInternals.config.secretTargets ?? [];
     },
 
     /**

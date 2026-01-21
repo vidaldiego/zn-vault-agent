@@ -156,14 +156,14 @@ export class AgentRunner {
    */
   async login(opts: {
     url: string;
-    tenantId: string;
+    tenantId?: string; // Deprecated: tenant is auto-detected from API key
     apiKey?: string;
     username?: string;
     password?: string;
     insecure?: boolean;
     skipTest?: boolean;
   }): Promise<AgentRunResult> {
-    const args = ['login', '--url', opts.url, '--tenant', opts.tenantId, '--yes'];
+    const args = ['login', '--url', opts.url, '--yes'];
 
     if (opts.insecure) {
       args.push('--insecure');
@@ -399,14 +399,22 @@ export class AgentRunner {
   async exec(opts: {
     command: string[];
     map: string[];
-    envFile?: string;
+    envFiles?: string[];  // -e/--env-file refs (alias:path[:PREFIX_])
+    envFile?: string;     // --output path for writing env file
   }): Promise<AgentRunResult> {
     const args = ['exec'];
 
-    for (const mapping of opts.map) {
-      args.push('--secret', mapping);  // CLI uses --secret, not --map
+    // Add env file references (-e/--env-file)
+    for (const ref of opts.envFiles ?? []) {
+      args.push('--env-file', ref);
     }
 
+    // Add individual secret mappings (-s/--secret)
+    for (const mapping of opts.map) {
+      args.push('--secret', mapping);
+    }
+
+    // Add output file path (--output)
     if (opts.envFile) {
       args.push('--output', opts.envFile);
     }

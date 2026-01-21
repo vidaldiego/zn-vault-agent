@@ -9,7 +9,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 import {
-  loadConfig,
   addSecretTarget,
   removeSecretTarget,
   getSecretTargets,
@@ -18,6 +17,13 @@ import {
   type SecretTarget,
 } from '../lib/config.js';
 import { listSecrets, getSecret, type DecryptedSecret } from '../lib/api.js';
+import type {
+  SecretsAddCommandOptions,
+  SecretsAvailableCommandOptions,
+  SecretsListCommandOptions,
+  SecretsRemoveCommandOptions,
+  SecretsSyncCommandOptions,
+} from './types.js';
 
 /**
  * Format secret data for output
@@ -32,7 +38,7 @@ function formatSecretData(
   switch (format) {
     case 'env': {
       // Add underscore only if prefix doesn't already end with one
-      const rawPrefix = options.envPrefix || '';
+      const rawPrefix = options.envPrefix ?? '';
       const prefix = rawPrefix && !rawPrefix.endsWith('_') ? `${rawPrefix}_` : rawPrefix;
       return Object.entries(data)
         .map(([k, v]) => {
@@ -115,7 +121,7 @@ function writeSecretFile(
 
   // Write to temp file first (atomic)
   const tempPath = `${filePath}.tmp.${process.pid}`;
-  fs.writeFileSync(tempPath, content, { mode: parseInt(mode || '0600', 8) });
+  fs.writeFileSync(tempPath, content, { mode: parseInt(mode ?? '0600', 8) });
 
   // Set ownership if specified and running as root
   if (owner && process.getuid?.() === 0) {
@@ -161,7 +167,7 @@ async function syncSecretTarget(target: SecretTarget): Promise<boolean> {
       try {
         execSync(target.reloadCmd, { stdio: 'inherit' });
       } catch (err) {
-        console.error(chalk.yellow(`Warning: Reload command failed: ${err}`));
+        console.error(chalk.yellow(`Warning: Reload command failed: ${err instanceof Error ? err.message : String(err)}`));
       }
     }
 
@@ -195,7 +201,7 @@ Examples:
   zn-vault-agent secret available         # Human-readable list
   zn-vault-agent secret available --json  # JSON output for scripting
 `)
-    .action(async (options) => {
+    .action(async (options: SecretsAvailableCommandOptions) => {
       if (!isConfigured()) {
         console.error(chalk.red('Not configured. Run: zn-vault-agent login'));
         process.exit(1);
@@ -207,7 +213,7 @@ Examples:
         const result = await listSecrets();
         spinner.stop();
 
-        if (options.json) {
+        if (options.json === true) {
           console.log(JSON.stringify(result.items, null, 2));
           return;
         }
@@ -283,25 +289,26 @@ Examples:
   zn-vault-agent secret add alias:database/credentials \\
     --name db-prefixed --format env --prefix DB --output /etc/myapp/db.env
 `)
-    .action(async (secretId, options) => {
+    .action(async (secretId: string, options: SecretsAddCommandOptions) => {
       if (!isConfigured()) {
         console.error(chalk.red('Not configured. Run: zn-vault-agent login'));
         process.exit(1);
       }
 
       // Validate format
+      const format = options.format ?? 'env';
       const validFormats = ['env', 'json', 'yaml', 'raw', 'template'];
-      if (!validFormats.includes(options.format)) {
+      if (!validFormats.includes(format)) {
         console.error(chalk.red(`Invalid format. Must be one of: ${validFormats.join(', ')}`));
         process.exit(1);
       }
 
       // Validate format-specific options
-      if (options.format === 'raw' && !options.key) {
+      if (format === 'raw' && !options.key) {
         console.error(chalk.red('--key is required for raw format'));
         process.exit(1);
       }
-      if (options.format === 'template' && !options.template) {
+      if (format === 'template' && !options.template) {
         console.error(chalk.red('--template is required for template format'));
         process.exit(1);
       }
@@ -325,36 +332,42 @@ Examples:
       console.log();
 
       // Gather configuration interactively if not all options provided
-      let name = options.name;
-      let output = options.output;
+      let targetName = options.name;
+      let targetOutput = options.output;
 
-      if (!name || !output) {
-        const answers = await inquirer.prompt([
+      if (!targetName || !targetOutput) {
+        const answers = await inquirer.prompt<{ name?: string; output?: string }>([
           {
             type: 'input',
             name: 'name',
             message: 'Local name for this target:',
-            default: options.name || secret.alias.replace(/[^a-zA-Z0-9-_]/g, '-'),
-            when: !name,
+            default: options.name ?? secret.alias.replace(/[^a-zA-Z0-9-_]/g, '-'),
+            when: !targetName,
           },
           {
             type: 'input',
             name: 'output',
             message: 'Output file path:',
-            default: options.output || `/etc/secrets/${secret.alias.replace(/\//g, '-')}.${options.format === 'yaml' ? 'yml' : options.format}`,
-            when: !output,
+            default: options.output ?? `/etc/secrets/${secret.alias.replace(/\//g, '-')}.${format === 'yaml' ? 'yml' : format}`,
+            when: !targetOutput,
           },
         ]);
-        name = name || answers.name;
-        output = output || answers.output;
+        targetName = targetName ?? answers.name;
+        targetOutput = targetOutput ?? answers.output;
+      }
+
+      // Ensure required values are present
+      if (!targetName || !targetOutput) {
+        console.error(chalk.red('Name and output path are required'));
+        process.exit(1);
       }
 
       // Build target configuration
       const target: SecretTarget = {
         secretId,
-        name,
-        format: options.format as SecretTarget['format'],
-        output,
+        name: targetName,
+        format,
+        output: targetOutput,
         key: options.key,
         templatePath: options.template,
         envPrefix: options.prefix,
@@ -366,10 +379,10 @@ Examples:
       // Save target
       addSecretTarget(target);
 
-      console.log(chalk.green('✓') + ` Secret target "${name}" added`);
+      console.log(chalk.green('✓') + ` Secret target "${targetName}" added`);
       console.log();
-      console.log(`Format: ${options.format}`);
-      console.log(`Output: ${output}`);
+      console.log(`Format: ${format}`);
+      console.log(`Output: ${targetOutput}`);
       console.log();
       console.log('Run ' + chalk.cyan('zn-vault-agent secret sync') + ' to deploy now');
     });
@@ -384,10 +397,10 @@ Examples:
   zn-vault-agent secret list         # Human-readable list
   zn-vault-agent secret list --json  # JSON output for scripting
 `)
-    .action(async (options) => {
+    .action((options: SecretsListCommandOptions) => {
       const targets = getSecretTargets();
 
-      if (options.json) {
+      if (options.json === true) {
         console.log(JSON.stringify(targets, null, 2));
         return;
       }
@@ -410,7 +423,7 @@ Examples:
         console.log(`  ${chalk.bold(target.name)}`);
         console.log(`    Secret: ${target.secretId}`);
         console.log(`    Format: ${target.format}`);
-        console.log(`    Output: ${target.output}`);
+        console.log(`    Output: ${target.output ?? '(none)'}`);
         console.log(`    Status: ${syncStatus}`);
         if (target.reloadCmd) {
           console.log(`    Reload: ${target.reloadCmd}`);
@@ -431,17 +444,17 @@ Examples:
   zn-vault-agent secret remove db-creds          # Interactive confirmation
   zn-vault-agent secret remove db-creds --force  # Skip confirmation
 `)
-    .action(async (name, options) => {
+    .action(async (targetName: string, options: SecretsRemoveCommandOptions) => {
       const targets = getSecretTargets();
-      const target = targets.find(t => t.name === name || t.secretId === name);
+      const target = targets.find(t => t.name === targetName || t.secretId === targetName);
 
       if (!target) {
-        console.error(chalk.red(`Target "${name}" not found`));
+        console.error(chalk.red(`Target "${targetName}" not found`));
         process.exit(1);
       }
 
       if (!options.force) {
-        const { confirm } = await inquirer.prompt([
+        const { confirm } = await inquirer.prompt<{ confirm: boolean }>([
           {
             type: 'confirm',
             name: 'confirm',
@@ -456,7 +469,7 @@ Examples:
         }
       }
 
-      removeSecretTarget(name);
+      removeSecretTarget(targetName);
       console.log(chalk.green('✓') + ` Target "${target.name}" removed`);
     });
 
@@ -470,7 +483,7 @@ Examples:
   zn-vault-agent secret sync              # Sync all configured secrets
   zn-vault-agent secret sync --name db    # Sync only "db" target
 `)
-    .action(async (options) => {
+    .action(async (options: SecretsSyncCommandOptions) => {
       if (!isConfigured()) {
         console.error(chalk.red('Not configured. Run: zn-vault-agent login'));
         process.exit(1);
@@ -503,7 +516,7 @@ Examples:
         const spinner = ora(`Syncing ${target.name}...`).start();
 
         if (await syncSecretTarget(target)) {
-          spinner.succeed(`${target.name} → ${target.output}`);
+          spinner.succeed(`${target.name} → ${target.output ?? '(subscribe-only)'}`);
           success++;
         } else {
           spinner.fail(`${target.name} failed`);

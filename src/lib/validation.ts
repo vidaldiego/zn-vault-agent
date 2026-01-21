@@ -67,8 +67,9 @@ function isValidOutputPath(filePath: string): { valid: boolean; reason?: string 
 
 /**
  * Validate a certificate target configuration
+ * Note: Uses Partial<CertTarget> to handle incomplete configs during validation
  */
-function validateTarget(target: CertTarget, index: number): { errors: ValidationError[]; warnings: ValidationWarning[] } {
+function validateTarget(target: Partial<CertTarget>, index: number): { errors: ValidationError[]; warnings: ValidationWarning[] } {
   const errors: ValidationError[] = [];
   const warnings: ValidationWarning[] = [];
   const prefix = `targets[${index}]`;
@@ -83,7 +84,7 @@ function validateTarget(target: CertTarget, index: number): { errors: Validation
   }
 
   // Outputs validation
-  if (!target.outputs || typeof target.outputs !== 'object') {
+  if (target.outputs === undefined || typeof target.outputs !== 'object') {
     errors.push({ field: `${prefix}.outputs`, message: 'At least one output path is required' });
   } else {
     const outputPaths = Object.entries(target.outputs).filter(([, v]) => v);
@@ -108,7 +109,7 @@ function validateTarget(target: CertTarget, index: number): { errors: Validation
         if (!pathCheck.valid) {
           warnings.push({
             field: `${prefix}.outputs.${key}`,
-            message: pathCheck.reason || 'Output directory may not exist',
+            message: pathCheck.reason ?? 'Output directory may not exist',
             suggestion: `Ensure directory exists: mkdir -p ${path.dirname(outputPath)}`,
           });
         }
@@ -148,8 +149,9 @@ function validateTarget(target: CertTarget, index: number): { errors: Validation
 
 /**
  * Validate the full agent configuration
+ * Note: Uses Partial<AgentConfig> to handle incomplete configs during validation
  */
-export function validateConfig(config: AgentConfig): ValidationResult {
+export function validateConfig(config: Partial<AgentConfig>): ValidationResult {
   const errors: ValidationError[] = [];
   const warnings: ValidationWarning[] = [];
 
@@ -172,7 +174,7 @@ export function validateConfig(config: AgentConfig): ValidationResult {
   }
 
   // Authentication
-  if (!config.auth) {
+  if (config.auth === undefined) {
     errors.push({ field: 'auth', message: 'Authentication configuration is required' });
   } else {
     const hasApiKey = !!config.auth.apiKey || !!process.env.ZNVAULT_API_KEY;
@@ -213,7 +215,7 @@ export function validateConfig(config: AgentConfig): ValidationResult {
   }
 
   // Targets
-  if (!config.targets || !Array.isArray(config.targets)) {
+  if (config.targets === undefined || !Array.isArray(config.targets)) {
     warnings.push({
       field: 'targets',
       message: 'No certificate targets configured',

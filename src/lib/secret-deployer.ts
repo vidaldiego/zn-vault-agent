@@ -5,6 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 import type { SecretTarget } from './config.js';
+import { chownSafe } from '../utils/shell.js';
+import { validateOutputPath } from '../utils/path.js';
 import { getSecret } from './api.js';
 import { updateSecretTargetVersion, getSecretTargets, loadConfig } from './config.js';
 import { deployLogger as log } from './logger.js';
@@ -29,7 +31,7 @@ function formatSecretData(
 ): string {
   switch (format) {
     case 'env': {
-      const prefix = options.envPrefix || '';
+      const prefix = options.envPrefix ?? '';
       return Object.entries(data)
         .map(([k, v]) => {
           const key = prefix + k.toUpperCase();
@@ -99,6 +101,9 @@ function writeSecretFile(
   owner?: string,
   mode?: string
 ): void {
+  // Validate path to prevent traversal attacks
+  validateOutputPath(filePath);
+
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -106,12 +111,12 @@ function writeSecretFile(
 
   // Write to temp file first (atomic)
   const tempPath = `${filePath}.tmp.${process.pid}`;
-  fs.writeFileSync(tempPath, content, { mode: parseInt(mode || '0600', 8) });
+  fs.writeFileSync(tempPath, content, { mode: parseInt(mode ?? '0600', 8) });
 
-  // Set ownership if specified and running as root
+  // Set ownership if specified and running as root (using safe chown)
   if (owner && process.getuid?.() === 0) {
     try {
-      execSync(`chown ${owner} "${tempPath}"`, { stdio: 'ignore' });
+      chownSafe(tempPath, owner);
     } catch {
       // Ignore chown errors
     }
@@ -225,7 +230,7 @@ export async function deploySecret(
  */
 export async function deployAllSecrets(force = false): Promise<SecretDeployResult[]> {
   const config = loadConfig();
-  const targets = config.secretTargets || [];
+  const targets = config.secretTargets ?? [];
 
   if (targets.length === 0) {
     log.debug('No secret targets configured');

@@ -127,7 +127,7 @@ async function makeClaimRequest(
   body: unknown,
   insecure: boolean
 ): Promise<ReprovisionClaimResponse> {
-  return new Promise((resolve, reject) => {
+  return await new Promise((resolve, reject) => {
     const url = new URL(path, vaultUrl);
     const isHttps = url.protocol === 'https:';
     const client = isHttps ? https : http;
@@ -148,14 +148,14 @@ async function makeClaimRequest(
 
     const req = client.request(options, (res) => {
       let data = '';
-      res.on('data', (chunk) => { data += chunk; });
+      res.on('data', (chunk: Buffer | string) => { data += String(chunk); });
       res.on('end', () => {
         try {
           const response = JSON.parse(data) as ReprovisionClaimResponse;
           if (res.statusCode === 200) {
             resolve(response);
           } else {
-            reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+            reject(new Error(`HTTP ${String(res.statusCode)}: ${data}`));
           }
         } catch {
           reject(new Error(`Failed to parse response: ${data}`));
@@ -201,7 +201,7 @@ export async function claimReprovisionToken(token: string): Promise<boolean> {
       }, 'Reprovision successful, received new credentials');
 
       // Update credentials in config
-      await updateCredentials(response.apiKey);
+      updateCredentials(response.apiKey);
 
       // Clear degraded state
       clearDegradedState();
@@ -227,7 +227,7 @@ export async function claimReprovisionToken(token: string): Promise<boolean> {
  * polling the API, since API calls require valid authentication.
  * This function is kept for potential future use with degraded auth support.
  */
-async function pollReprovisionStatus(): Promise<void> {
+function pollReprovisionStatus(): void {
   if (!state.isDegraded || !state.agentId) {
     return;
   }
@@ -250,11 +250,11 @@ function startReprovisionPolling(): void {
   }
 
   // Initial poll
-  void pollReprovisionStatus();
+  pollReprovisionStatus();
 
   // Set up interval
   state.pollTimer = setInterval(() => {
-    void pollReprovisionStatus();
+    pollReprovisionStatus();
   }, REPROVISION_POLL_INTERVAL);
 
   log.debug({ interval: REPROVISION_POLL_INTERVAL }, 'Started reprovision status polling');
@@ -273,7 +273,7 @@ function stopReprovisionPolling(): void {
 /**
  * Update credentials after successful reprovision
  */
-async function updateCredentials(newKey: string): Promise<void> {
+function updateCredentials(newKey: string): void {
   try {
     // Update API key in config file and environment
     updateApiKey(newKey);

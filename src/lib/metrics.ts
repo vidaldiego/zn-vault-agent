@@ -137,7 +137,7 @@ export function observeHistogram(
     return;
   }
 
-  const bucketBoundaries = metricHelp.get(`${name}_buckets`)?.split(',').map(Number) || DEFAULT_BUCKETS;
+  const bucketBoundaries = metricHelp.get(`${name}_buckets`)?.split(',').map(Number) ?? DEFAULT_BUCKETS;
   const labelKey = JSON.stringify(labels);
   let existing = values.find((v) => JSON.stringify(v.labels) === labelKey);
 
@@ -224,10 +224,10 @@ export function exportMetrics(): string {
     for (const v of values) {
       const labelStr = formatLabels(v.labels);
       for (const bucket of v.buckets) {
-        const leLabel = v.labels ? { ...v.labels, le: String(bucket.le) } : { le: String(bucket.le) };
+        const leLabel = { ...v.labels, le: String(bucket.le) };
         lines.push(`${name}_bucket${formatLabels(leLabel)} ${bucket.count}`);
       }
-      const infLabel = v.labels ? { ...v.labels, le: '+Inf' } : { le: '+Inf' };
+      const infLabel = { ...v.labels, le: '+Inf' };
       lines.push(`${name}_bucket${formatLabels(infLabel)} ${v.count}`);
       lines.push(`${name}_sum${labelStr} ${v.sum.toFixed(6)}`);
       lines.push(`${name}_count${labelStr} ${v.count}`);
@@ -284,37 +284,37 @@ export function initializeMetrics(): void {
 // Convenience functions for common operations
 export const metrics = {
   // Sync operations
-  syncSuccess: (certName: string) => {
+  syncSuccess: (certName: string): void => {
     incCounter('znvault_agent_sync_total', { status: 'success', cert_name: certName });
     setGauge('znvault_agent_last_sync_timestamp', Date.now() / 1000, { cert_name: certName });
   },
-  syncFailure: (certName: string, reason: string) => {
+  syncFailure: (certName: string, reason: string): void => {
     incCounter('znvault_agent_sync_total', { status: 'failure', cert_name: certName });
     incCounter('znvault_agent_sync_failures_total', { cert_name: certName, reason });
   },
-  syncDuration: (certName: string, durationMs: number) => {
+  syncDuration: (certName: string, durationMs: number): void => {
     observeHistogram('znvault_agent_sync_duration_seconds', durationMs / 1000, { cert_name: certName });
   },
 
   // WebSocket
-  wsConnected: () => { setGauge('znvault_agent_connected', 1); },
-  wsDisconnected: () => { setGauge('znvault_agent_connected', 0); },
-  wsReconnect: () => { incCounter('znvault_agent_websocket_reconnects_total'); },
+  wsConnected: (): void => { setGauge('znvault_agent_connected', 1); },
+  wsDisconnected: (): void => { setGauge('znvault_agent_connected', 0); },
+  wsReconnect: (): void => { incCounter('znvault_agent_websocket_reconnects_total'); },
 
   // API
-  apiRequest: (method: string, status: number, durationMs: number) => {
+  apiRequest: (method: string, status: number, durationMs: number): void => {
     incCounter('znvault_agent_api_requests_total', { method, status: String(status) });
     observeHistogram('znvault_agent_api_request_duration_seconds', durationMs / 1000, { method });
   },
 
   // Certificate tracking
-  setCertsTracked: (count: number) => { setGauge('znvault_agent_certs_tracked', count); },
-  setCertExpiry: (certId: string, certName: string, days: number) => {
+  setCertsTracked: (count: number): void => { setGauge('znvault_agent_certs_tracked', count); },
+  setCertExpiry: (certId: string, certName: string, days: number): void => {
     setGauge('znvault_agent_cert_expiry_days', days, { cert_id: certId, cert_name: certName });
   },
 
   // Secret operations
-  secretDeployed: (secretName: string, success: boolean, durationMs: number) => {
+  secretDeployed: (secretName: string, success: boolean, durationMs: number): void => {
     incCounter('znvault_agent_secret_sync_total', { status: success ? 'success' : 'failure', secret_name: secretName });
     if (!success) {
       incCounter('znvault_agent_secret_sync_failures_total', { secret_name: secretName });
@@ -324,16 +324,16 @@ export const metrics = {
       setGauge('znvault_agent_last_sync_timestamp', Date.now() / 1000, { secret_name: secretName });
     }
   },
-  setSecretsTracked: (count: number) => { setGauge('znvault_agent_secrets_tracked', count); },
+  setSecretsTracked: (count: number): void => { setGauge('znvault_agent_secrets_tracked', count); },
 
   // Auto-update
-  updateCheck: (status: 'success' | 'error') => {
+  updateCheck: (status: 'success' | 'error'): void => {
     incCounter('znvault_agent_update_checks_total', { status });
   },
-  updateInstall: (status: 'success' | 'error' | 'permission_denied') => {
+  updateInstall: (status: 'success' | 'error' | 'permission_denied'): void => {
     incCounter('znvault_agent_updates_total', { status });
   },
-  setVersionInfo: (version: string, channel: string) => {
+  setVersionInfo: (version: string, channel: string): void => {
     setGauge('znvault_agent_version_info', 1, { version, channel });
   },
 };

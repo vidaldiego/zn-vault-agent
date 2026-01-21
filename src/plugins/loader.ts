@@ -59,9 +59,9 @@ export interface PluginLoaderOptions {
  * Manages plugin discovery, loading, and lifecycle
  */
 export class PluginLoader extends EventEmitter {
-  private plugins: Map<string, LoadedPlugin> = new Map();
+  private readonly plugins = new Map<string, LoadedPlugin>();
   private agentInternals: AgentInternals;
-  private options: PluginLoaderOptions;
+  private readonly options: PluginLoaderOptions;
   private isStarted = false;
 
   constructor(agentInternals: AgentInternals, options: PluginLoaderOptions = {}) {
@@ -77,7 +77,7 @@ export class PluginLoader extends EventEmitter {
     log.info('Loading plugins');
 
     // Load plugins from config
-    const pluginConfigs = (config as AgentConfig & { plugins?: PluginConfig[] }).plugins || [];
+    const pluginConfigs = (config as AgentConfig & { plugins?: PluginConfig[] }).plugins ?? [];
 
     for (const pluginConfig of pluginConfigs) {
       // Skip disabled plugins
@@ -112,11 +112,11 @@ export class PluginLoader extends EventEmitter {
       throw new Error('Plugin config must specify package or path');
     }
 
-    const identifier = packageName || localPath!;
+    const identifier = packageName ?? localPath ?? 'unknown';
     log.debug({ package: packageName, path: localPath }, 'Loading plugin');
 
     try {
-      let module: { default: AgentPlugin | PluginFactory };
+      let module: { default?: AgentPlugin | PluginFactory };
 
       if (localPath) {
         // Resolve local path relative to config dir or as absolute
@@ -128,10 +128,10 @@ export class PluginLoader extends EventEmitter {
           throw new Error(`Plugin file not found: ${resolvedPath}`);
         }
 
-        module = await import(resolvedPath);
+        module = await import(resolvedPath) as { default?: AgentPlugin | PluginFactory };
       } else if (packageName) {
         // Import npm package
-        module = await import(packageName);
+        module = await import(packageName) as { default?: AgentPlugin | PluginFactory };
       } else {
         throw new Error('Plugin config must specify package or path');
       }
@@ -140,9 +140,9 @@ export class PluginLoader extends EventEmitter {
       let plugin: AgentPlugin;
       if (typeof module.default === 'function') {
         // Factory function - pass plugin options
-        plugin = (module.default as PluginFactory)(pluginOptions || {});
-      } else if (module.default && typeof module.default === 'object') {
-        // Direct export
+        plugin = (module.default)(pluginOptions ?? {});
+      } else if (module.default !== undefined) {
+        // Direct export - AgentPlugin is an object
         plugin = module.default;
       } else {
         throw new Error(`Invalid plugin export from ${identifier}`);
@@ -201,7 +201,7 @@ export class PluginLoader extends EventEmitter {
    * Validate plugin has required fields
    */
   private validatePlugin(plugin: unknown): asserts plugin is AgentPlugin {
-    if (!plugin || typeof plugin !== 'object') {
+    if (plugin === null || plugin === undefined || typeof plugin !== 'object') {
       throw new Error('Plugin must be an object');
     }
 
@@ -338,7 +338,8 @@ export class PluginLoader extends EventEmitter {
       try {
         // Register under /plugins/<name>/ prefix
         await fastify.register(async (instance) => {
-          await loaded.plugin.routes!(instance, ctx);
+          // Use bound method call to preserve 'this' context
+          await loaded.plugin.routes?.(instance, ctx);
         }, { prefix: `/plugins/${name}` });
 
         log.debug({ name, prefix: `/plugins/${name}` }, 'Plugin routes registered');
@@ -417,7 +418,7 @@ export class PluginLoader extends EventEmitter {
         statuses.push({
           name,
           status: 'unhealthy',
-          message: loaded.error?.message || 'Plugin failed to load',
+          message: loaded.error?.message ?? 'Plugin failed to load',
         });
       } else if (loaded.status === 'running') {
         // Running but no health check - assume healthy
@@ -456,7 +457,7 @@ export class PluginLoader extends EventEmitter {
   /**
    * Get all plugin statuses
    */
-  getAllPluginStatuses(): Array<{ name: string; status: LoadedPlugin['status']; error?: string }> {
+  getAllPluginStatuses(): { name: string; status: LoadedPlugin['status']; error?: string }[] {
     return Array.from(this.plugins.entries()).map(([name, loaded]) => ({
       name,
       status: loaded.status,

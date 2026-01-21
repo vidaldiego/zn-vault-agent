@@ -77,7 +77,7 @@ describe('Authentication', () => {
     it('AUTH-03: should fail login with invalid API key', async () => {
       // Clear env var so the invalid key from config is used during connection test
       const result = await agent.run(
-        ['login', '--url', TEST_ENV.vaultUrl, '--tenant', TEST_ENV.tenantId,
+        ['login', '--url', TEST_ENV.vaultUrl,
          '--api-key', 'znv_invalid_key_12345', '--yes',
          TEST_ENV.insecure ? '--insecure' : ''].filter(Boolean),
         { env: { ZNVAULT_API_KEY: '' } }  // Clear env override

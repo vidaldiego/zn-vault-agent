@@ -3,7 +3,6 @@ import inquirer from 'inquirer';
 import ora from 'ora';
 import chalk from 'chalk';
 import {
-  loadConfig,
   addTarget,
   removeTarget,
   getTargets,
@@ -11,6 +10,11 @@ import {
   type CertTarget,
 } from '../lib/config.js';
 import { listCertificates, getCertificate } from '../lib/api.js';
+import type {
+  AvailableCommandOptions,
+  CertAddCommandOptions,
+  CertRemoveCommandOptions,
+} from './types.js';
 
 export function registerCertsCommands(program: Command): void {
   // List available certificates in vault
@@ -23,7 +27,7 @@ Examples:
   zn-vault-agent available         # Human-readable list with status
   zn-vault-agent available --json  # JSON output for scripting
 `)
-    .action(async (options) => {
+    .action(async (options: AvailableCommandOptions) => {
       if (!isConfigured()) {
         console.error(chalk.red('Not configured. Run: zn-vault-agent login'));
         process.exit(1);
@@ -35,7 +39,7 @@ Examples:
         const result = await listCertificates();
         spinner.stop();
 
-        if (options.json) {
+        if (options.json === true) {
           console.log(JSON.stringify(result.items, null, 2));
           return;
         }
@@ -117,15 +121,15 @@ Examples:
     --health-cmd "curl -sf http://localhost:8080/health" \\
     --yes
 `)
-    .action(async (options) => {
+    .action(async (options: CertAddCommandOptions) => {
       if (!isConfigured()) {
         console.error(chalk.red('Not configured. Run: zn-vault-agent login'));
         process.exit(1);
       }
 
       // Determine if we can run non-interactively
-      const hasOutputPath = options.combined || options.certFile || options.keyFile || options.fullchainFile;
-      const nonInteractive = options.yes && options.cert && hasOutputPath;
+      const hasOutputPath = options.combined ?? options.certFile ?? options.keyFile ?? options.fullchainFile;
+      const nonInteractive = options.yes === true && options.cert != null && hasOutputPath != null;
 
       // If cert ID not provided, show selection
       let certId = options.cert;
@@ -145,7 +149,7 @@ Examples:
           process.exit(1);
         }
 
-        const { selectedCert } = await inquirer.prompt([
+        const { selectedCert } = await inquirer.prompt<{ selectedCert: string }>([
           {
             type: 'list',
             name: 'selectedCert',
@@ -158,6 +162,12 @@ Examples:
         ]);
 
         certId = selectedCert;
+      }
+
+      // At this point certId is guaranteed to be defined
+      if (!certId) {
+        console.error(chalk.red('No certificate selected'));
+        process.exit(1);
       }
 
       // Get certificate details
@@ -179,16 +189,16 @@ Examples:
       if (nonInteractive) {
         // Use defaults and provided options
         answers = {
-          name: options.name || cert.alias.replace(/[^a-zA-Z0-9-_]/g, '-'),
+          name: options.name ?? cert.alias.replace(/[^a-zA-Z0-9-_]/g, '-'),
           outputFormat: options.combined ? 'combined' : 'separate',
-          combined: options.combined || '',
-          certFile: options.certFile || '',
-          keyFile: options.keyFile || '',
-          chainFile: options.chainFile || '',
-          owner: options.owner || 'root:root',
-          mode: options.mode || '0640',
-          reloadCmd: options.reloadCmd || '',
-          healthCmd: options.healthCmd || '',
+          combined: options.combined ?? '',
+          certFile: options.certFile ?? '',
+          keyFile: options.keyFile ?? '',
+          chainFile: options.chainFile ?? '',
+          owner: options.owner ?? 'root:root',
+          mode: options.mode ?? '0640',
+          reloadCmd: options.reloadCmd ?? '',
+          healthCmd: options.healthCmd ?? '',
         };
       } else {
         // Gather output configuration interactively
@@ -197,7 +207,7 @@ Examples:
             type: 'input',
             name: 'name',
             message: 'Local name for this target:',
-            default: options.name || cert.alias.replace(/[^a-zA-Z0-9-_]/g, '-'),
+            default: options.name ?? cert.alias.replace(/[^a-zA-Z0-9-_]/g, '-'),
           },
           {
             type: 'list',
@@ -214,52 +224,52 @@ Examples:
             name: 'combined',
             message: 'Combined file path:',
             when: (ans) => ans.outputFormat === 'combined',
-            default: options.combined || `/etc/ssl/${cert.alias}.pem`,
+            default: options.combined ?? `/etc/ssl/${cert.alias}.pem`,
           },
           {
             type: 'input',
             name: 'certFile',
             message: 'Certificate file path:',
             when: (ans) => ans.outputFormat === 'separate',
-            default: options.certFile || `/etc/ssl/certs/${cert.alias}.crt`,
+            default: options.certFile ?? `/etc/ssl/certs/${cert.alias}.crt`,
           },
           {
             type: 'input',
             name: 'keyFile',
             message: 'Private key file path:',
             when: (ans) => ans.outputFormat === 'separate',
-            default: options.keyFile || `/etc/ssl/private/${cert.alias}.key`,
+            default: options.keyFile ?? `/etc/ssl/private/${cert.alias}.key`,
           },
           {
             type: 'input',
             name: 'chainFile',
             message: 'CA chain file path (optional):',
             when: (ans) => ans.outputFormat === 'separate',
-            default: options.chainFile || '',
+            default: options.chainFile ?? '',
           },
           {
             type: 'input',
             name: 'owner',
             message: 'File ownership (user:group):',
-            default: options.owner || 'root:root',
+            default: options.owner ?? 'root:root',
           },
           {
             type: 'input',
             name: 'mode',
             message: 'File permissions:',
-            default: options.mode || '0640',
+            default: options.mode ?? '0640',
           },
           {
             type: 'input',
             name: 'reloadCmd',
             message: 'Reload command (run after cert update):',
-            default: options.reloadCmd || 'systemctl reload haproxy',
+            default: options.reloadCmd ?? 'systemctl reload haproxy',
           },
           {
             type: 'input',
             name: 'healthCmd',
             message: 'Health check command (optional):',
-            default: options.healthCmd || '',
+            default: options.healthCmd ?? '',
           },
         ]);
       }
@@ -271,58 +281,65 @@ Examples:
         outputs: {},
         owner: answers.owner,
         mode: answers.mode,
-        reloadCmd: answers.reloadCmd || undefined,
-        healthCheckCmd: answers.healthCmd || undefined,
+        reloadCmd: answers.reloadCmd || undefined, // Empty string -> undefined
+        healthCheckCmd: answers.healthCmd || undefined, // Empty string -> undefined
       };
 
-      if (answers.outputFormat === 'combined' || options.combined) {
+      if (answers.outputFormat === 'combined' || options.combined != null) {
         target.outputs.combined = answers.combined || options.combined;
       }
-      if (answers.certFile || options.certFile) {
+      if (answers.certFile || options.certFile != null) {
         target.outputs.cert = answers.certFile || options.certFile;
       }
-      if (answers.keyFile || options.keyFile) {
+      if (answers.keyFile || options.keyFile != null) {
         target.outputs.key = answers.keyFile || options.keyFile;
       }
-      if (answers.chainFile || options.chainFile) {
+      if (answers.chainFile || options.chainFile != null) {
         target.outputs.chain = answers.chainFile || options.chainFile;
       }
-      if (options.fullchainFile) {
+      if (options.fullchainFile != null) {
         target.outputs.fullchain = options.fullchainFile;
       }
 
       // Handle custom output (only in interactive mode)
       if (!nonInteractive && answers.outputFormat === 'custom') {
-        const customAnswers = await inquirer.prompt([
+        interface CustomOutputAnswers {
+          combined: string;
+          cert: string;
+          key: string;
+          chain: string;
+          fullchain: string;
+        }
+        const customAnswers = await inquirer.prompt<CustomOutputAnswers>([
           {
             type: 'input',
             name: 'combined',
             message: 'Combined file path (leave empty to skip):',
-            default: options.combined || '',
+            default: options.combined ?? '',
           },
           {
             type: 'input',
             name: 'cert',
             message: 'Certificate file path (leave empty to skip):',
-            default: options.certFile || '',
+            default: options.certFile ?? '',
           },
           {
             type: 'input',
             name: 'key',
             message: 'Private key file path (leave empty to skip):',
-            default: options.keyFile || '',
+            default: options.keyFile ?? '',
           },
           {
             type: 'input',
             name: 'chain',
             message: 'CA chain file path (leave empty to skip):',
-            default: options.chainFile || '',
+            default: options.chainFile ?? '',
           },
           {
             type: 'input',
             name: 'fullchain',
             message: 'Fullchain file path (leave empty to skip):',
-            default: options.fullchainFile || '',
+            default: options.fullchainFile ?? '',
           },
         ]);
 
@@ -357,10 +374,10 @@ Examples:
   zn-vault-agent list         # Human-readable list
   zn-vault-agent list --json  # JSON output for scripting
 `)
-    .action(async (options) => {
+    .action((options: AvailableCommandOptions) => {
       const targets = getTargets();
 
-      if (options.json) {
+      if (options.json === true) {
         console.log(JSON.stringify(targets, null, 2));
         return;
       }
@@ -406,7 +423,7 @@ Examples:
   zn-vault-agent remove haproxy-frontend          # Interactive confirmation
   zn-vault-agent remove haproxy-frontend --force  # Skip confirmation
 `)
-    .action(async (name, options) => {
+    .action(async (name: string, options: CertRemoveCommandOptions) => {
       const targets = getTargets();
       const target = targets.find(t => t.name === name || t.certId === name);
 
@@ -415,8 +432,8 @@ Examples:
         process.exit(1);
       }
 
-      if (!options.force) {
-        const { confirm } = await inquirer.prompt([
+      if (options.force !== true) {
+        const { confirm } = await inquirer.prompt<{ confirm: boolean }>([
           {
             type: 'confirm',
             name: 'confirm',

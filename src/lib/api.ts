@@ -203,7 +203,7 @@ async function request<T>(options: RequestOptions): Promise<T> {
     }
 
     try {
-      const result = await executeRequest<T>(requestOptions, options.body, url.protocol === 'https:');
+      const result = await executeRequest(requestOptions, options.body, url.protocol === 'https:');
       const duration = Date.now() - startTime;
 
       // Record metrics
@@ -211,8 +211,8 @@ async function request<T>(options: RequestOptions): Promise<T> {
       setVaultReachable(true);
 
       if (result.statusCode >= 400) {
-        const error = result.data as unknown as ApiError;
-        const errorMessage = error?.message || `Request failed with status ${result.statusCode}`;
+        const error = result.data as ApiError | undefined;
+        const errorMessage = error?.message ?? `Request failed with status ${result.statusCode}`;
 
         lastStatusCode = result.statusCode;
         lastError = new Error(errorMessage);
@@ -234,7 +234,7 @@ async function request<T>(options: RequestOptions): Promise<T> {
       }
 
       log.debug({ path: options.path, status: result.statusCode, duration }, 'Request completed');
-      return result.data;
+      return result.data as T;
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       lastError = error;
@@ -258,28 +258,28 @@ async function request<T>(options: RequestOptions): Promise<T> {
 
   // All retries exhausted
   log.error({ path: options.path, attempts: maxAttempts, lastStatus: lastStatusCode }, 'Request failed after retries');
-  throw lastError || new Error('Request failed after retries');
+  throw lastError ?? new Error('Request failed after retries');
 }
 
 /**
  * Execute a single HTTP request
  */
-function executeRequest<T>(
+function executeRequest(
   requestOptions: https.RequestOptions,
   body: unknown,
   useHttps: boolean
-): Promise<{ statusCode: number; data: T }> {
+): Promise<{ statusCode: number; data: unknown }> {
   return new Promise((resolve, reject) => {
     const protocol = useHttps ? https : http;
     const req = protocol.request(requestOptions, (res) => {
       let data = '';
-      res.on('data', (chunk) => (data += chunk));
+      res.on('data', (chunk: Buffer | string) => { data += String(chunk); });
       res.on('end', () => {
         try {
-          const parsed = data ? JSON.parse(data) : {};
-          resolve({ statusCode: res.statusCode || 0, data: parsed as T });
+          const parsed: unknown = data ? JSON.parse(data) : {};
+          resolve({ statusCode: res.statusCode ?? 0, data: parsed });
         } catch {
-          resolve({ statusCode: res.statusCode || 0, data: data as unknown as T });
+          resolve({ statusCode: res.statusCode ?? 0, data });
         }
       });
     });
@@ -290,7 +290,7 @@ function executeRequest<T>(
       reject(new Error('Request timeout'));
     });
 
-    if (body) {
+    if (body !== undefined && body !== null) {
       req.write(JSON.stringify(body));
     }
     req.end();
@@ -520,5 +520,40 @@ export async function getApiKeySelf(): Promise<ApiKeySelfInfo> {
   return await request({
     method: 'GET',
     path: '/auth/api-keys/self',
+  });
+}
+
+/**
+ * Bootstrap response - same format as managed key bind
+ */
+export interface BootstrapResponse {
+  id: string;
+  key: string;
+  prefix: string;
+  name: string;
+  expiresAt: string;
+  gracePeriod: string;
+  graceExpiresAt?: string;
+  rotationMode: 'scheduled' | 'on-use' | 'on-bind';
+  permissions: string[];
+  nextRotationAt?: string;
+  _notice?: string;
+}
+
+/**
+ * Bootstrap an agent using a one-time registration token.
+ * This endpoint does NOT require authentication - the token is the auth.
+ *
+ * @param token - Registration token (format: zrt_<64-hex-chars>)
+ * @returns Same response as managed key /bind endpoint
+ */
+export async function bootstrapWithToken(token: string): Promise<BootstrapResponse> {
+  log.info({ tokenPrefix: token.substring(0, 8) }, 'Bootstrapping agent with registration token');
+
+  return await request({
+    method: 'POST',
+    path: '/agent/bootstrap',
+    body: { token },
+    token: 'skip', // No authentication required - token IS the auth
   });
 }

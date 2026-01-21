@@ -2,7 +2,8 @@ import type { Command } from 'commander';
 import ora from 'ora';
 import chalk from 'chalk';
 import { isConfigured, getTargets } from '../lib/config.js';
-import { deployCertificate, deployAllCertificates } from '../lib/deployer.js';
+import { deployCertificate } from '../lib/deployer.js';
+import type { SyncCommandOptions } from './types.js';
 
 export function registerSyncCommand(program: Command): void {
   program
@@ -25,7 +26,7 @@ Examples:
   # Preview what would be synced
   zn-vault-agent sync --dry-run
 `)
-    .action(async (options) => {
+    .action(async (options: SyncCommandOptions) => {
       if (!isConfigured()) {
         console.error(chalk.red('Not configured. Run: zn-vault-agent login'));
         process.exit(1);
@@ -49,7 +50,7 @@ Examples:
         process.exit(1);
       }
 
-      if (options.dryRun) {
+      if (options.dryRun === true) {
         console.log();
         console.log(chalk.bold('Dry run - would sync:'));
         console.log();
@@ -80,7 +81,7 @@ Examples:
         const spinner = ora(`Syncing ${target.name}...`).start();
 
         try {
-          const result = await deployCertificate(target, options.force);
+          const result = await deployCertificate(target, options.force ?? false);
 
           if (result.success) {
             if (result.message === 'Certificate unchanged') {
