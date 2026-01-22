@@ -56,17 +56,21 @@ export interface PluginAutoUpdateServiceConfig {
   checkIntervalMs: number;
   /** Default channel for plugins without specific channel (default: 'latest') */
   defaultChannel: UpdateChannel;
+  /** Maximum random delay before applying update for staged rollout (ms). 0 = no delay */
+  stagedRolloutMaxDelayMs: number;
 }
 
 export const DEFAULT_PLUGIN_UPDATE_CONFIG: PluginAutoUpdateServiceConfig = {
   enabled: true,
   checkIntervalMs: 5 * 60 * 1000, // 5 minutes
   defaultChannel: 'latest',
+  stagedRolloutMaxDelayMs: 30 * 60 * 1000, // 30 minutes max delay for staged rollout
 };
 
 export class PluginAutoUpdateService {
   private checkInterval: NodeJS.Timeout | null = null;
   private initialCheckTimeout: NodeJS.Timeout | null = null;
+  private stagedRolloutTimeout: NodeJS.Timeout | null = null;
   private readonly config: PluginAutoUpdateServiceConfig;
   private readonly plugins: PluginConfig[];
   private readonly installedVersions = new Map<string, string>();
@@ -126,6 +130,10 @@ export class PluginAutoUpdateService {
     if (this.checkInterval) {
       clearInterval(this.checkInterval);
       this.checkInterval = null;
+    }
+    if (this.stagedRolloutTimeout) {
+      clearTimeout(this.stagedRolloutTimeout);
+      this.stagedRolloutTimeout = null;
     }
     logger.debug('Plugin auto-update service stopped');
   }
@@ -223,6 +231,7 @@ export class PluginAutoUpdateService {
 
   /**
    * Check for updates and install if available (internal periodic check).
+   * Includes staged rollout delay to prevent thundering herd.
    */
   private async checkAndUpdateAll(): Promise<void> {
     const updates = await this.checkForUpdates();
@@ -235,8 +244,23 @@ export class PluginAutoUpdateService {
 
     logger.info(
       { updates: availableUpdates.map((u) => `${u.package}@${u.current} → ${u.latest}`) },
-      'Plugin updates available'
+      'Plugin updates available, preparing upgrade'
     );
+
+    // Staged rollout: random delay to prevent thundering herd
+    if (this.config.stagedRolloutMaxDelayMs > 0) {
+      const delay = this.calculateStagedDelay();
+      logger.info({ delaySeconds: Math.round(delay / 1000) }, 'Plugin staged rollout delay');
+      await this.sleep(delay);
+
+      // Re-check after delay - another agent may have updated
+      const recheck = await this.checkForUpdates();
+      const stillNeedUpdate = recheck.filter((u) => u.updateAvailable);
+      if (stillNeedUpdate.length === 0) {
+        logger.info('Plugin updates no longer needed after staged delay');
+        return;
+      }
+    }
 
     // Acquire lock (prevents multiple agents updating simultaneously)
     if (!this.acquireLock()) {
@@ -272,6 +296,22 @@ export class PluginAutoUpdateService {
     } finally {
       this.releaseLock();
     }
+  }
+
+  /**
+   * Calculate random delay for staged rollout.
+   */
+  private calculateStagedDelay(): number {
+    return Math.floor(Math.random() * this.config.stagedRolloutMaxDelayMs);
+  }
+
+  /**
+   * Sleep for specified milliseconds.
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      this.stagedRolloutTimeout = setTimeout(resolve, ms);
+    });
   }
 
   /**
@@ -531,6 +571,13 @@ export function loadPluginUpdateConfig(): PluginAutoUpdateServiceConfig {
     const channel = process.env.PLUGIN_AUTO_UPDATE_CHANNEL.toLowerCase();
     if (channel === 'latest' || channel === 'beta' || channel === 'next') {
       config.defaultChannel = channel;
+    }
+  }
+
+  if (process.env.PLUGIN_AUTO_UPDATE_STAGED_DELAY) {
+    const delay = parseInt(process.env.PLUGIN_AUTO_UPDATE_STAGED_DELAY, 10);
+    if (!isNaN(delay) && delay >= 0) {
+      config.stagedRolloutMaxDelayMs = delay * 1000; // Convert seconds to ms
     }
   }
 
