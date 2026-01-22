@@ -70,11 +70,11 @@ function getGlobalNpmPrefix(): string {
 }
 
 /**
- * Resolve the path to a globally installed npm package.
+ * Resolve the path to a globally installed npm package directory.
  * @param packageName The npm package name (e.g., '@zincapp/my-plugin')
- * @returns The full path to the package in global node_modules
+ * @returns The full path to the package directory in global node_modules
  */
-function resolveGlobalPackagePath(packageName: string): string {
+function resolveGlobalPackageDir(packageName: string): string {
   const prefix = getGlobalNpmPrefix();
   // On macOS/Linux: {prefix}/lib/node_modules/{package}
   // On Windows: {prefix}/node_modules/{package}
@@ -82,6 +82,55 @@ function resolveGlobalPackagePath(packageName: string): string {
   return isWindows
     ? path.join(prefix, 'node_modules', packageName)
     : path.join(prefix, 'lib', 'node_modules', packageName);
+}
+
+/**
+ * Resolve the entry point of an npm package for ESM import.
+ * Reads package.json and resolves exports or main field.
+ * @param packageDir The package directory path
+ * @returns The full path to the entry point file
+ */
+function resolvePackageEntryPoint(packageDir: string): string {
+  const pkgJsonPath = path.join(packageDir, 'package.json');
+
+  if (!fs.existsSync(pkgJsonPath)) {
+    throw new Error(`package.json not found in ${packageDir}`);
+  }
+
+  const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8')) as {
+    exports?: Record<string, unknown> | string;
+    main?: string;
+    module?: string;
+  };
+
+  // Resolve entry point from exports (ESM) or main (CJS fallback)
+  let entryPoint: string | undefined;
+
+  // Check exports field (ESM standard)
+  if (pkgJson.exports) {
+    if (typeof pkgJson.exports === 'string') {
+      // Simple string export: "exports": "./dist/index.js"
+      entryPoint = pkgJson.exports;
+    } else if (typeof pkgJson.exports === 'object') {
+      // Object exports - check for "." entry point
+      const rootExport = pkgJson.exports['.'];
+      if (typeof rootExport === 'string') {
+        entryPoint = rootExport;
+      } else if (rootExport && typeof rootExport === 'object') {
+        // Conditional exports: { ".": { "import": "./dist/index.js", "require": "./dist/index.cjs" } }
+        const conditionalExport = rootExport as Record<string, unknown>;
+        entryPoint = (conditionalExport.import ?? conditionalExport.default ?? conditionalExport.require) as string | undefined;
+      }
+    }
+  }
+
+  // Fallback to module (ESM) or main (CJS)
+  if (!entryPoint) {
+    entryPoint = pkgJson.module ?? pkgJson.main ?? 'index.js';
+  }
+
+  // Resolve relative to package directory
+  return path.join(packageDir, entryPoint);
 }
 
 /**
@@ -207,17 +256,19 @@ export class PluginLoader extends EventEmitter {
       } else if (packageName) {
         // Import npm package from global node_modules
         // Always use global npm to ensure consistent plugin versions across the system
-        const globalPackagePath = resolveGlobalPackagePath(packageName);
+        const globalPackageDir = resolveGlobalPackageDir(packageName);
 
-        if (!fs.existsSync(globalPackagePath)) {
+        if (!fs.existsSync(globalPackageDir)) {
           throw new Error(
             `Plugin package '${packageName}' not found in global npm. ` +
             `Install it with: npm install -g ${packageName}`
           );
         }
 
-        log.debug({ packageName, globalPackagePath }, 'Loading plugin from global npm');
-        module = await import(globalPackagePath) as { default?: AgentPlugin | PluginFactory };
+        // ESM requires importing the actual entry point file, not just the directory
+        const entryPoint = resolvePackageEntryPoint(globalPackageDir);
+        log.debug({ packageName, globalPackageDir, entryPoint }, 'Loading plugin from global npm');
+        module = await import(entryPoint) as { default?: AgentPlugin | PluginFactory };
       } else {
         throw new Error('Plugin config must specify package or path');
       }
