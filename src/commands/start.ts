@@ -344,6 +344,7 @@ Examples:
           healthPort: options.healthPort,
           exec: execConfig,
           pluginAutoUpdateService,
+          npmAutoUpdateService: autoUpdateService,
         });
       } catch (err) {
         logger.error({ err }, 'Daemon error');

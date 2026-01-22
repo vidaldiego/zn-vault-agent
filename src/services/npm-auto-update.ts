@@ -120,6 +120,80 @@ export class NpmAutoUpdateService {
   }
 
   /**
+   * Trigger an immediate update (bypasses staged rollout).
+   * Returns update result with version info.
+   */
+  async triggerUpdate(): Promise<{
+    success: boolean;
+    previousVersion: string;
+    newVersion: string;
+    willRestart: boolean;
+    message: string;
+  }> {
+    const info = await this.checkForUpdates();
+
+    if (!info.updateAvailable) {
+      return {
+        success: true,
+        previousVersion: info.current,
+        newVersion: info.current,
+        willRestart: false,
+        message: 'Already at latest version',
+      };
+    }
+
+    logger.info(
+      { current: info.current, latest: info.latest },
+      'Manual update triggered via HTTP'
+    );
+
+    try {
+      // Acquire lock
+      if (!this.acquireLock()) {
+        return {
+          success: false,
+          previousVersion: info.current,
+          newVersion: info.current,
+          willRestart: false,
+          message: 'Another update is in progress',
+        };
+      }
+
+      try {
+        await this.performUpdate(info.latest);
+
+        // Verify the update was successful
+        const verified = await this.verifyUpdate(info.latest);
+        if (!verified) {
+          throw new Error('Version verification failed after update');
+        }
+
+        // Request restart
+        this.requestRestart();
+
+        return {
+          success: true,
+          previousVersion: info.current,
+          newVersion: info.latest,
+          willRestart: true,
+          message: `Updated to ${info.latest}, restarting in 2 seconds`,
+        };
+      } finally {
+        this.releaseLock();
+      }
+    } catch (err) {
+      logger.error({ err }, 'Manual update failed');
+      return {
+        success: false,
+        previousVersion: info.current,
+        newVersion: info.current,
+        willRestart: false,
+        message: err instanceof Error ? err.message : 'Update failed',
+      };
+    }
+  }
+
+  /**
    * Check for updates and install if available.
    * Includes staged rollout delay and health check with rollback.
    */

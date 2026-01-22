@@ -12,6 +12,7 @@ import type { ChildProcessManager, ChildProcessState } from '../services/child-p
 import type { PluginLoader } from '../plugins/loader.js';
 import type { PluginHealthStatus } from '../plugins/types.js';
 import type { PluginAutoUpdateService } from '../services/plugin-auto-update.js';
+import type { NpmAutoUpdateService } from '../services/npm-auto-update.js';
 
 // Get agent version from package.json at module load time
 let agentVersion = '1.0.0';
@@ -68,6 +69,7 @@ let fastifyServer: FastifyInstance | null = null;
 let childProcessManager: ChildProcessManager | null = null;
 let pluginLoader: PluginLoader | null = null;
 let pluginAutoUpdateService: PluginAutoUpdateService | null = null;
+let npmAutoUpdateService: NpmAutoUpdateService | null = null;
 
 /**
  * Update WebSocket connection status for certificates
@@ -131,6 +133,13 @@ export function setPluginLoader(loader: PluginLoader | null): void {
  */
 export function setPluginAutoUpdateService(service: PluginAutoUpdateService | null): void {
   pluginAutoUpdateService = service;
+}
+
+/**
+ * Set npm auto-update service for agent version checking and updates via HTTP
+ */
+export function setNpmAutoUpdateService(service: NpmAutoUpdateService | null): void {
+  npmAutoUpdateService = service;
 }
 
 /**
@@ -336,6 +345,65 @@ function createFastifyInstance(): FastifyInstance {
       reply.code(500).send({
         error: 'Failed to update plugins',
         message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // Agent version check endpoint
+  fastify.get('/agent/version', async (_request, reply) => {
+    if (!npmAutoUpdateService) {
+      // Auto-update service not available, return current version only
+      reply.send({
+        current: agentVersion,
+        latest: agentVersion,
+        updateAvailable: false,
+        autoUpdateEnabled: false,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    try {
+      const versionInfo = await npmAutoUpdateService.checkForUpdates();
+      reply.send({
+        current: versionInfo.current,
+        latest: versionInfo.latest,
+        updateAvailable: versionInfo.updateAvailable,
+        autoUpdateEnabled: true,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      log.error({ err }, 'Failed to check agent version');
+      reply.code(500).send({
+        error: 'Failed to check agent version',
+        message: err instanceof Error ? err.message : String(err),
+        current: agentVersion,
+      });
+    }
+  });
+
+  // Agent update trigger endpoint
+  fastify.post('/agent/update', async (_request, reply) => {
+    if (!npmAutoUpdateService) {
+      return await reply.code(503).send({
+        error: 'Agent auto-update service not available',
+        success: false,
+      });
+    }
+
+    try {
+      log.info('Agent update triggered via HTTP');
+      const result = await npmAutoUpdateService.triggerUpdate();
+      reply.send({
+        ...result,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      log.error({ err }, 'Failed to update agent');
+      reply.code(500).send({
+        error: 'Failed to update agent',
+        message: err instanceof Error ? err.message : String(err),
+        success: false,
       });
     }
   });

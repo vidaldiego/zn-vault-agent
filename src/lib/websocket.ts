@@ -14,9 +14,11 @@ import {
   updateSecretStatus,
   setChildProcessManager,
   setPluginAutoUpdateService,
+  setNpmAutoUpdateService,
 } from './health.js';
 import { flushLogs, setupLogRotation } from './logger.js';
 import type { PluginAutoUpdateService } from '../services/plugin-auto-update.js';
+import type { NpmAutoUpdateService } from '../services/npm-auto-update.js';
 import { startApiKeyRenewal, stopApiKeyRenewal } from '../services/api-key-renewal.js';
 import {
   startManagedKeyRenewal,
@@ -148,6 +150,7 @@ export async function startDaemon(options: {
   healthPort?: number;
   exec?: ExecConfig;
   pluginAutoUpdateService?: PluginAutoUpdateService | null;
+  npmAutoUpdateService?: NpmAutoUpdateService | null;
 } = {}): Promise<void> {
   const config = loadConfig();
   const secretTargets = config.secretTargets ?? [];
@@ -332,6 +335,11 @@ export async function startDaemon(options: {
   // Register plugin auto-update service with health module for HTTP endpoints
   if (options.pluginAutoUpdateService) {
     setPluginAutoUpdateService(options.pluginAutoUpdateService);
+  }
+
+  // Register npm auto-update service with health module for agent version/update endpoints
+  if (options.npmAutoUpdateService) {
+    setNpmAutoUpdateService(options.npmAutoUpdateService);
   }
 
   // Start health server if port specified (pass plugin loader for routes and health aggregation)
