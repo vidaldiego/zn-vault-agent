@@ -315,85 +315,90 @@ export class PluginAutoUpdateService {
   }
 
   /**
-   * Update a single plugin via npm install.
-   * Installs into the agent's node_modules directory (not global) since
-   * Node resolves local dependencies before global ones.
+   * Update a single plugin via npm install -g.
+   * Installs globally to ensure consistent plugin versions across the system.
+   * The plugin loader always loads from global npm.
    */
   private async updatePlugin(
     packageName: string,
     channel: UpdateChannel
   ): Promise<{ success: boolean; error?: string }> {
-    logger.info({ package: packageName, channel }, 'Installing plugin update');
+    logger.info({ package: packageName, channel }, 'Installing plugin update globally');
 
     try {
-      // Get the agent's installation directory
-      // The agent runs from /usr/lib/node_modules/@zincapp/zn-vault-agent/
-      const agentDir = this.getAgentInstallDir();
-
-      // Install into agent's node_modules so it takes precedence over global
+      // Install globally so the plugin loader can find it
       const { stdout, stderr } = await execAsync(
-        `cd "${agentDir}" && npm install ${packageName}@${channel} --save`,
+        `npm install -g ${packageName}@${channel}`,
         { timeout: 5 * 60 * 1000 } // 5 minute timeout
       );
 
-      if (stdout) logger.debug({ stdout: stdout.trim() }, 'npm install stdout');
-      if (stderr) logger.debug({ stderr: stderr.trim() }, 'npm install stderr');
+      if (stdout) logger.debug({ stdout: stdout.trim() }, 'npm install -g stdout');
+      if (stderr) logger.debug({ stderr: stderr.trim() }, 'npm install -g stderr');
 
       return { success: true };
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      logger.error({ err, package: packageName }, 'Plugin update failed');
+      logger.error({ err, package: packageName }, 'Plugin global update failed');
       return { success: false, error: errorMessage };
     }
   }
 
-  /**
-   * Get the agent's installation directory.
-   * Returns the directory containing the agent's package.json.
-   */
-  private getAgentInstallDir(): string {
-    // Try to find the agent's package.json by traversing up from __dirname
-    // In production: /usr/lib/node_modules/@zincapp/zn-vault-agent/dist/services/
-    // We need: /usr/lib/node_modules/@zincapp/zn-vault-agent/
-    try {
-      const url = new URL(import.meta.url);
-      let dir = url.pathname;
+  /** Cached global npm prefix */
+  private cachedGlobalPrefix: string | null = null;
 
-      // Go up until we find package.json
-      for (let i = 0; i < 10; i++) {
-        const pkgPath = `${dir}/package.json`;
-        if (existsSync(pkgPath)) {
-          const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as PackageJson;
-          if (pkg.name === '@zincapp/zn-vault-agent') {
-            return dir;
-          }
-        }
-        const parent = dir.substring(0, dir.lastIndexOf('/'));
-        if (parent === dir || !parent) break;
-        dir = parent;
-      }
-    } catch {
-      // Fallback
+  /**
+   * Get the global npm prefix path.
+   * Results are cached for performance.
+   */
+  private getGlobalNpmPrefix(): string {
+    if (this.cachedGlobalPrefix !== null) {
+      return this.cachedGlobalPrefix;
     }
 
-    // Fallback to standard global npm path
-    return '/usr/lib/node_modules/@zincapp/zn-vault-agent';
+    try {
+      this.cachedGlobalPrefix = execSync('npm config get prefix', {
+        encoding: 'utf-8',
+        timeout: 10_000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim();
+      logger.debug({ prefix: this.cachedGlobalPrefix }, 'Resolved global npm prefix');
+      return this.cachedGlobalPrefix;
+    } catch (err) {
+      // Fallback to common paths
+      const fallbacks = ['/usr/local', '/usr'];
+      const home = process.env.HOME;
+      if (home) {
+        fallbacks.push(`${home}/.npm-global`);
+      }
+
+      for (const fallback of fallbacks) {
+        const isWindows = process.platform === 'win32';
+        const nodeModules = isWindows
+          ? `${fallback}/node_modules`
+          : `${fallback}/lib/node_modules`;
+        if (existsSync(nodeModules)) {
+          this.cachedGlobalPrefix = fallback;
+          logger.debug({ prefix: this.cachedGlobalPrefix }, 'Using fallback global npm prefix');
+          return this.cachedGlobalPrefix;
+        }
+      }
+
+      logger.warn({ err }, 'Could not determine global npm prefix');
+      this.cachedGlobalPrefix = '/usr/local';
+      return this.cachedGlobalPrefix;
+    }
   }
 
   /**
-   * Detect currently installed versions by checking the agent's local node_modules.
-   * This matches how Node.js resolves modules - local first, then global.
-   * Since we install plugins locally via npm install --save, we must check
-   * the agent's own node_modules directory, NOT global packages.
+   * Detect currently installed versions by checking global npm packages.
+   * Plugins are always installed and loaded from global npm.
    */
   private detectInstalledVersions(): void {
-    logger.debug({ plugins: this.plugins.map(p => p.package) }, 'Detecting installed plugin versions');
+    logger.debug({ plugins: this.plugins.map(p => p.package) }, 'Detecting installed plugin versions from global npm');
 
-    const agentDir = this.getAgentInstallDir();
-
-    // First try npm list in the agent's directory (checks local node_modules)
+    // First try npm list -g (checks global node_modules)
     try {
-      const output = execSync(`cd "${agentDir}" && npm list --json --depth=0`, {
+      const output = execSync('npm list -g --json --depth=0', {
         encoding: 'utf-8',
         timeout: 10000,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -405,66 +410,44 @@ export class PluginAutoUpdateService {
         if (!plugin.package) continue;
 
         const pkgInfo = dependencies[plugin.package];
-        if (pkgInfo.version) {
+        if (pkgInfo?.version) {
           this.installedVersions.set(plugin.package, pkgInfo.version);
-          logger.info({ package: plugin.package, version: pkgInfo.version, location: 'local' }, 'Detected installed plugin version');
+          logger.info({ package: plugin.package, version: pkgInfo.version, location: 'global' }, 'Detected installed plugin version');
         } else {
           this.installedVersions.set(plugin.package, '0.0.0');
-          logger.warn({ package: plugin.package }, 'Plugin not found in agent local packages');
+          logger.warn({ package: plugin.package }, 'Plugin not found in global npm packages');
         }
       }
       return;
     } catch (err) {
-      logger.warn({ err, agentDir }, 'Failed to get versions via npm list, falling back to direct package.json check');
+      logger.warn({ err }, 'Failed to get versions via npm list -g, falling back to direct package.json check');
     }
 
-    // Fallback: check package.json directly in agent's node_modules
+    // Fallback: check package.json directly in global node_modules
+    const globalPrefix = this.getGlobalNpmPrefix();
+    const isWindows = process.platform === 'win32';
+    const globalNodeModules = isWindows
+      ? `${globalPrefix}/node_modules`
+      : `${globalPrefix}/lib/node_modules`;
+
     for (const plugin of this.plugins) {
       if (!plugin.package) continue;
 
       try {
-        // Check agent's local node_modules first
-        const localPkgPath = `${agentDir}/node_modules/${plugin.package}/package.json`;
-        if (existsSync(localPkgPath)) {
-          const pkg = JSON.parse(readFileSync(localPkgPath, 'utf-8')) as PackageJson;
+        const globalPkgPath = `${globalNodeModules}/${plugin.package}/package.json`;
+        if (existsSync(globalPkgPath)) {
+          const pkg = JSON.parse(readFileSync(globalPkgPath, 'utf-8')) as PackageJson;
           this.installedVersions.set(plugin.package, pkg.version ?? '0.0.0');
-          logger.info({ package: plugin.package, version: pkg.version, location: 'local' }, 'Detected installed plugin version via package.json');
-          continue;
-        }
-
-        // Fallback to require.resolve (may find global)
-        const result = require.resolve(plugin.package);
-        const pkgJsonPath = this.findPackageJson(result);
-        if (pkgJsonPath) {
-          const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf-8')) as PackageJson;
-          this.installedVersions.set(plugin.package, pkg.version ?? '0.0.0');
-          logger.info({ package: plugin.package, version: pkg.version, location: 'resolved' }, 'Detected installed plugin version via require.resolve');
+          logger.info({ package: plugin.package, version: pkg.version, location: 'global' }, 'Detected installed plugin version via package.json');
         } else {
           this.installedVersions.set(plugin.package, '0.0.0');
-          logger.warn({ package: plugin.package }, 'Plugin not installed');
+          logger.debug({ package: plugin.package, globalPkgPath }, 'Plugin not installed globally');
         }
       } catch {
         this.installedVersions.set(plugin.package, '0.0.0');
         logger.debug({ package: plugin.package }, 'Plugin not installed or version unknown');
       }
     }
-  }
-
-  /**
-   * Find package.json by traversing up from resolved module path.
-   */
-  private findPackageJson(modulePath: string): string | null {
-    let dir = modulePath;
-    for (let i = 0; i < 10; i++) {
-      const pkgPath = `${dir}/package.json`;
-      if (existsSync(pkgPath)) {
-        return pkgPath;
-      }
-      const parent = dir.substring(0, dir.lastIndexOf('/'));
-      if (parent === dir || !parent) break;
-      dir = parent;
-    }
-    return null;
   }
 
   /**

@@ -5,6 +5,7 @@ import type { FastifyInstance } from 'fastify';
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import fs from 'node:fs';
+import { execSync } from 'node:child_process';
 import { createLogger } from '../lib/logger.js';
 import type {
   AgentPlugin,
@@ -24,6 +25,64 @@ const log = createLogger({ module: 'plugin-loader' });
 
 /** Default timeout for plugin hooks (30 seconds) */
 const PLUGIN_HOOK_TIMEOUT_MS = 30_000;
+
+/** Cached global npm prefix */
+let cachedGlobalPrefix: string | null = null;
+
+/**
+ * Get the global npm prefix path.
+ * Results are cached for performance.
+ */
+function getGlobalNpmPrefix(): string {
+  if (cachedGlobalPrefix !== null) {
+    return cachedGlobalPrefix;
+  }
+
+  try {
+    cachedGlobalPrefix = execSync('npm config get prefix', {
+      encoding: 'utf-8',
+      timeout: 10_000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    log.debug({ prefix: cachedGlobalPrefix }, 'Resolved global npm prefix');
+    return cachedGlobalPrefix;
+  } catch (err) {
+    // Fallback to common paths
+    const fallbacks = [
+      '/usr/local',
+      '/usr',
+      process.env.HOME ? path.join(process.env.HOME, '.npm-global') : null,
+    ].filter((p): p is string => p !== null);
+
+    for (const fallback of fallbacks) {
+      const nodeModules = path.join(fallback, 'lib', 'node_modules');
+      if (fs.existsSync(nodeModules)) {
+        cachedGlobalPrefix = fallback;
+        log.debug({ prefix: cachedGlobalPrefix }, 'Using fallback global npm prefix');
+        return cachedGlobalPrefix;
+      }
+    }
+
+    log.warn({ err }, 'Could not determine global npm prefix');
+    cachedGlobalPrefix = '/usr/local';
+    return cachedGlobalPrefix;
+  }
+}
+
+/**
+ * Resolve the path to a globally installed npm package.
+ * @param packageName The npm package name (e.g., '@zincapp/my-plugin')
+ * @returns The full path to the package in global node_modules
+ */
+function resolveGlobalPackagePath(packageName: string): string {
+  const prefix = getGlobalNpmPrefix();
+  // On macOS/Linux: {prefix}/lib/node_modules/{package}
+  // On Windows: {prefix}/node_modules/{package}
+  const isWindows = process.platform === 'win32';
+  return isWindows
+    ? path.join(prefix, 'node_modules', packageName)
+    : path.join(prefix, 'lib', 'node_modules', packageName);
+}
 
 /**
  * Execute a plugin hook with timeout protection
@@ -146,8 +205,19 @@ export class PluginLoader extends EventEmitter {
 
         module = await import(resolvedPath) as { default?: AgentPlugin | PluginFactory };
       } else if (packageName) {
-        // Import npm package
-        module = await import(packageName) as { default?: AgentPlugin | PluginFactory };
+        // Import npm package from global node_modules
+        // Always use global npm to ensure consistent plugin versions across the system
+        const globalPackagePath = resolveGlobalPackagePath(packageName);
+
+        if (!fs.existsSync(globalPackagePath)) {
+          throw new Error(
+            `Plugin package '${packageName}' not found in global npm. ` +
+            `Install it with: npm install -g ${packageName}`
+          );
+        }
+
+        log.debug({ packageName, globalPackagePath }, 'Loading plugin from global npm');
+        module = await import(globalPackagePath) as { default?: AgentPlugin | PluginFactory };
       } else {
         throw new Error('Plugin config must specify package or path');
       }
