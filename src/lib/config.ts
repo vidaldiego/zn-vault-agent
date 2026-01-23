@@ -38,6 +38,7 @@ export {
   fetchConfigFromVault,
   isConfigFromVaultEnabled,
   getMinimalConfigForVaultMode,
+  discoverAgentIdentity,
 } from './config/index.js';
 
 export type {

@@ -245,6 +245,123 @@ export async function fetchConfigFromVault(options: FetchConfigOptions): Promise
 }
 
 /**
+ * Response from vault's agent identity endpoint
+ */
+interface AgentIdentityResponse {
+  agentId: string;
+  hostname: string;
+  tenantId: string;
+  hostConfigId: string | null;
+  hostConfigName: string | null;
+  configVersion: number | null;
+}
+
+/**
+ * Discover agent identity from vault
+ *
+ * Calls GET /v1/agent/identity to get the agent's ID and info.
+ * This is useful when migrating to config-from-vault mode without
+ * going through the bootstrap flow.
+ *
+ * @param options Connection options
+ * @returns Agent identity or null if not found
+ */
+export async function discoverAgentIdentity(options: {
+  vaultUrl: string;
+  apiKey: string;
+  hostname?: string;
+  tenantId?: string;
+  insecure?: boolean;
+  timeout?: number;
+}): Promise<AgentIdentityResponse | null> {
+  const {
+    vaultUrl,
+    apiKey,
+    hostname,
+    tenantId,
+    insecure = false,
+    timeout = 30000,
+  } = options;
+
+  log.info({ vaultUrl, hostname }, 'Discovering agent identity from vault');
+
+  return new Promise((resolve) => {
+    const url = new URL(vaultUrl);
+    const isHttps = url.protocol === 'https:';
+
+    // Build path with query params
+    const params = new URLSearchParams();
+    if (hostname) params.set('hostname', hostname);
+    if (tenantId) params.set('tenantId', tenantId);
+    const path = `/v1/agent/identity${params.toString() ? `?${params}` : ''}`;
+
+    const requestOptions: https.RequestOptions = {
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path,
+      method: 'GET',
+      headers: {
+        'X-API-Key': apiKey,
+        'Accept': 'application/json',
+        'User-Agent': `zn-vault-agent/${os.hostname()}`,
+      },
+      rejectUnauthorized: !insecure,
+      timeout,
+    };
+
+    const httpModule = isHttps ? https : http;
+    const req = httpModule.request(requestOptions, (res) => {
+      let data = '';
+      res.on('data', (chunk: Buffer) => {
+        data += chunk.toString();
+      });
+
+      res.on('end', () => {
+        if (res.statusCode === 404) {
+          log.info({ hostname }, 'Agent not found in vault (may need to connect first)');
+          resolve(null);
+          return;
+        }
+
+        if (res.statusCode !== 200) {
+          log.warn(
+            { statusCode: res.statusCode, body: data },
+            'Failed to discover agent identity'
+          );
+          resolve(null);
+          return;
+        }
+
+        try {
+          const response = JSON.parse(data) as AgentIdentityResponse;
+          log.info(
+            { agentId: response.agentId, hostname: response.hostname },
+            'Agent identity discovered'
+          );
+          resolve(response);
+        } catch (err) {
+          log.error({ err, data }, 'Failed to parse identity response');
+          resolve(null);
+        }
+      });
+    });
+
+    req.on('error', (err: Error) => {
+      log.error({ err, vaultUrl }, 'Identity discovery request failed');
+      resolve(null);
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      log.warn({ vaultUrl, timeout }, 'Identity discovery request timed out');
+      resolve(null);
+    });
+
+    req.end();
+  });
+}
+
+/**
  * Check if local config has configFromVault enabled
  */
 export function isConfigFromVaultEnabled(config: Partial<AgentConfig>): boolean {

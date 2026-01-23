@@ -51,6 +51,7 @@ export {
   fetchConfigFromVault,
   isConfigFromVaultEnabled,
   getMinimalConfigForVaultMode,
+  discoverAgentIdentity,
   type FetchConfigOptions,
   type FetchConfigResult,
 } from './vault-loader.js';

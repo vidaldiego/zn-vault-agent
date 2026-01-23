@@ -12,6 +12,7 @@ import {
   setConfigInMemory,
   fetchConfigFromVault,
   isConfigFromVaultEnabled,
+  discoverAgentIdentity,
   saveConfig,
   type ExecConfig,
   type AgentConfig,
@@ -154,6 +155,39 @@ Examples:
 
       // Config-from-vault mode: fetch config from vault server at startup
       if (isConfigFromVaultEnabled(config)) {
+        // Auto-discover agent ID if not set (enables linking to host config)
+        if (!config.agentId && config.auth?.apiKey) {
+          console.log(chalk.cyan('Discovering agent identity from vault...'));
+          const identity = await discoverAgentIdentity({
+            vaultUrl: config.vaultUrl,
+            apiKey: config.auth.apiKey,
+            hostname: config.hostname,
+            tenantId: config.tenantId,
+            insecure: config.insecure,
+          });
+
+          if (identity) {
+            config.agentId = identity.agentId;
+            console.log(chalk.green(`Agent ID discovered: ${identity.agentId}`));
+            logger.info({ agentId: identity.agentId }, 'Agent ID discovered from vault');
+
+            // Persist agentId to config so future restarts don't need to discover
+            try {
+              await saveConfig({
+                ...config,
+                agentId: identity.agentId,
+              });
+              logger.debug({ agentId: identity.agentId }, 'Agent ID persisted to config');
+            } catch (err) {
+              // Non-fatal: we can still proceed without persisting
+              logger.warn({ err }, 'Failed to persist agentId to config');
+            }
+          } else {
+            console.log(chalk.yellow('Agent ID not found (agent may need to connect once first)'));
+            logger.debug('Agent identity not found, will continue without agentId');
+          }
+        }
+
         console.log(chalk.cyan('Config-from-vault mode enabled, fetching config from vault...'));
         logger.info({ vaultUrl: config.vaultUrl }, 'Fetching config from vault');
 
