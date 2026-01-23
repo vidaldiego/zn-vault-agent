@@ -21,6 +21,7 @@ export function saveConfig(config: AgentConfig): void {
       fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
     }
     fs.writeFileSync(configFile, JSON.stringify(config, null, 2), { mode: 0o600 });
+    log.debug({ path: configFile }, 'Config saved (env override)');
     return;
   }
 
@@ -30,10 +31,28 @@ export function saveConfig(config: AgentConfig): void {
       fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
     }
     fs.writeFileSync(configFile, JSON.stringify(config, null, 2), { mode: 0o600 });
-  } else {
-    // Save to user config
-    userConfig.store = config;
+    log.debug({ path: configFile }, 'Config saved (root)');
+    return;
   }
+
+  // If system config file exists and is writable, use it
+  // This handles the case where agent runs as non-root user (e.g., zn-vault-agent)
+  // but has write access to /etc/zn-vault-agent/config.json
+  if (fs.existsSync(configFile)) {
+    try {
+      fs.accessSync(configFile, fs.constants.W_OK);
+      fs.writeFileSync(configFile, JSON.stringify(config, null, 2), { mode: 0o600 });
+      log.debug({ path: configFile }, 'Config saved (system config)');
+      return;
+    } catch {
+      // File exists but not writable, fall through to user config
+      log.debug({ path: configFile }, 'System config not writable, using user config');
+    }
+  }
+
+  // Fall back to user config
+  userConfig.store = config;
+  log.debug({ path: userConfig.path }, 'Config saved (user config)');
 }
 
 /**
