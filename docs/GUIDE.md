@@ -363,38 +363,77 @@ Create a one-time token to provision a new agent:
 znvault host bootstrap-token payara-prod-1 --expires 1h
 
 # Output:
-# ✓ Bootstrap token created
-#   Token: zrt_a1b2c3d4e5f6...
-#   Expires: 2025-01-23T12:00:00Z
+# ✓ Bootstrap token generated
 #
-#   Bootstrap command:
-#   curl -sSL 'https://vault.example.com/agent/bootstrap.sh?hostname=payara-prod-1&configFromVault=true' | ZNVAULT_TOKEN=zrt_a1b2c3d4e5f6... bash
+# Bootstrap Token for payara-prod-1
+#
+#   Token:   zrt_a1b2c3d4e5f6...
+#   Expires: 1/23/2025, 1:00:00 PM
+#
+# Quick Start (One Command)
+#
+#   Run this on the target server to install and configure the agent:
+#
+#     curl -sL "https://vault.example.com/v1/hosts/payara-prod-1/bootstrap?token=zrt_a1b2c3d4e5f6..." | sudo bash
+#
+# Review First (Recommended)
+#
+#   Download the script, review it, then run:
+#
+#     curl -sL "https://vault.example.com/v1/hosts/payara-prod-1/bootstrap?token=zrt_a1b2c3d4e5f6..." -o bootstrap-payara-prod-1.sh
+#     less bootstrap-payara-prod-1.sh
+#     sudo bash bootstrap-payara-prod-1.sh
 ```
 
 #### 4. Bootstrap the Agent
 
-On the target server, run the bootstrap command:
+On the target server, run the one-command bootstrap:
 
 ```bash
-# One-liner bootstrap (installs agent, configures, starts service)
-curl -sSL 'https://vault.example.com/agent/bootstrap.sh?hostname=payara-prod-1&configFromVault=true' \
-  | ZNVAULT_TOKEN=zrt_a1b2c3d4e5f6... bash
+# Quick Start - One command to install, configure, and start the agent
+curl -sL "https://vault.example.com/v1/hosts/payara-prod-1/bootstrap?token=zrt_xxx" | sudo bash
 ```
 
-Or manually:
+**What the bootstrap script does:**
+
+1. **Installs Node.js** - Detects OS (Ubuntu/Debian/RHEL) and installs Node.js 18+ if needed
+2. **Installs the agent** - Runs `npm install -g @zincapp/zn-vault-agent`
+3. **Creates system user** - Sets up `zn-vault-agent` user and group
+4. **Configures directories** - Creates and sets permissions on target directories from host config
+5. **Sets up sudoers** - Adds passwordless sudo rules for reload commands (if needed)
+6. **Installs systemd service** - Creates service file with appropriate security hardening
+7. **Starts the service** - Enables and starts the agent
+
+**Security hardening:**
+
+The generated script analyzes your host configuration to determine the appropriate systemd security profile:
+
+- **Strict profile** (default): Full hardening with `NoNewPrivileges=true`, empty `CapabilityBoundingSet`
+- **Relaxed profile** (when sudo needed): Allows SUID/SGID for sudo operations like `systemctl reload haproxy`
+
+**First-start registration:**
+
+When the agent starts for the first time, it automatically:
+1. Exchanges the bootstrap token for an API key via `POST /v1/hosts/:hostname/register`
+2. Persists the API key to `/etc/zn-vault-agent/config.json`
+3. Removes the bootstrap token from config
+4. Pulls configuration from vault
+5. Begins syncing certificates and secrets
+
+**Manual installation (alternative):**
+
+If you prefer not to pipe to bash, you can install manually:
 
 ```bash
 # Install agent
-npm install -g @zincapp/zn-vault-agent
+sudo npm install -g @zincapp/zn-vault-agent
 
-# Bootstrap with token
-zn-vault-agent login \
-  --url https://vault.example.com \
-  --bootstrap-token zrt_a1b2c3d4e5f6... \
-  --config-from-vault
+# Download and review the bootstrap script
+curl -sL "https://vault.example.com/v1/hosts/payara-prod-1/bootstrap?token=zrt_xxx" -o bootstrap.sh
+less bootstrap.sh
 
-# Start service
-sudo systemctl enable --now zn-vault-agent
+# Run the reviewed script
+sudo bash bootstrap.sh
 ```
 
 ### Managing Host Configurations

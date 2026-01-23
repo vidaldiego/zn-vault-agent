@@ -12,6 +12,7 @@ import {
   setConfigInMemory,
   fetchConfigFromVault,
   isConfigFromVaultEnabled,
+  saveConfig,
   type ExecConfig,
   type AgentConfig,
   DEFAULT_EXEC_CONFIG,
@@ -19,6 +20,11 @@ import {
 import { validateConfig, formatValidationResult } from '../lib/validation.js';
 import { startDaemon } from '../lib/websocket.js';
 import { logger } from '../lib/logger.js';
+import {
+  needsBootstrapRegistration,
+  exchangeBootstrapToken,
+  applyRegistrationResult,
+} from '../lib/auth/bootstrap.js';
 import { NpmAutoUpdateService, loadUpdateConfig } from '../services/npm-auto-update.js';
 import { PluginAutoUpdateService, loadPluginUpdateConfig } from '../services/plugin-auto-update.js';
 import { parseSecretMapping, isSensitiveEnvVar, type ExecSecret } from '../lib/secret-env.js';
@@ -103,6 +109,48 @@ Examples:
       }
 
       let config = loadConfig();
+
+      // ========================================================================
+      // Bootstrap Registration (one-command deployment)
+      // ========================================================================
+      // If config has a bootstrap token but no API key, register with vault first
+      if (needsBootstrapRegistration(config)) {
+        console.log(chalk.cyan('Bootstrap mode detected, registering with vault...'));
+        logger.info({ vaultUrl: config.vaultUrl, hostname: config.hostname }, 'Starting bootstrap registration');
+
+        try {
+          const result = await exchangeBootstrapToken(config);
+
+          // Apply registration result to config
+          config = applyRegistrationResult(config, result);
+
+          // Persist updated config (removes bootstrap token, adds API key)
+          saveConfig(config);
+
+          console.log(chalk.green('Registration successful!'));
+          console.log(`  Agent ID:    ${result.agentId}`);
+          console.log(`  Tenant:      ${result.tenantId}`);
+          if (result.managedKeyName) {
+            console.log(`  Managed Key: ${result.managedKeyName}`);
+          }
+          console.log();
+
+          logger.info(
+            {
+              agentId: result.agentId,
+              tenantId: result.tenantId,
+              hostConfigId: result.hostConfigId,
+              managedKeyName: result.managedKeyName,
+            },
+            'Bootstrap registration complete, config persisted'
+          );
+        } catch (err) {
+          console.error(chalk.red('Bootstrap registration failed:'), err instanceof Error ? err.message : String(err));
+          console.error(chalk.yellow('Hint: Ensure the vault server is reachable and your bootstrap token is valid.'));
+          logger.error({ err }, 'Bootstrap registration failed');
+          process.exit(1);
+        }
+      }
 
       // Config-from-vault mode: fetch config from vault server at startup
       if (isConfigFromVaultEnabled(config)) {

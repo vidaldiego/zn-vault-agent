@@ -103,7 +103,8 @@ export function getConfig<K extends keyof AgentConfig>(key: K): AgentConfig[K] {
 
 /**
  * Check if agent is configured
- * Considers both config file and environment variables
+ * Considers both config file and environment variables.
+ * Bootstrap tokens count as valid auth (will be exchanged for API key on startup).
  */
 export function isConfigured(): boolean {
   const config = loadConfig();
@@ -111,7 +112,8 @@ export function isConfigured(): boolean {
     config.auth.apiKey !== undefined ||
     process.env.ZNVAULT_API_KEY !== undefined ||
     config.auth.username !== undefined ||
-    process.env.ZNVAULT_USERNAME !== undefined;
+    process.env.ZNVAULT_USERNAME !== undefined ||
+    config.auth.bootstrapToken !== undefined; // Bootstrap token counts as pending auth
   return config.vaultUrl !== '' && config.tenantId !== '' && hasAuth;
 }
 

@@ -143,7 +143,16 @@ export interface AgentConfig {
     /** Or username/password */
     username?: string;
     password?: string;
+    /**
+     * Bootstrap token for initial registration (one-time use).
+     * When present, agent will call /v1/hosts/:hostname/register to exchange
+     * the token for an API key on first startup.
+     * After successful registration, this field is removed and apiKey is set.
+     */
+    bootstrapToken?: string;
   };
+  /** Hostname for config-from-vault mode (used in bootstrap registration) */
+  hostname?: string;
   /** Managed API key configuration (enables auto-rotation) */
   managedKey?: ManagedKeyConfig;
   /** Skip TLS verification */
