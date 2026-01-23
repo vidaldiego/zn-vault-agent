@@ -156,7 +156,7 @@ zn-vault-agent --version
 
 ## Config-from-Vault Mode
 
-Config-from-vault mode centralizes agent configuration in the vault server, enabling unified management across all hosts. Instead of maintaining separate config files on each server, you define host configurations in the vault and agents pull their config at startup.
+Config-from-vault mode centralizes agent configuration in the vault server, enabling unified management across all hosts. Instead of maintaining separate config files on each server, you define **host templates** in the vault and agents pull their config at startup.
 
 ### Why Config-from-Vault?
 
@@ -184,7 +184,7 @@ Config-from-vault mode centralizes agent configuration in the vault server, enab
 ┌─────────────────────────────────────────────────────────────────┐
 │                       VAULT SERVER                              │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │ Host Configurations (centralized)                       │    │
+│  │ Host Templates (centralized)                            │    │
 │  │                                                         │    │
 │  │  payara-prod-1:     payara-prod-2:    haproxy-1:       │    │
 │  │  ├── targets[]      ├── targets[]     ├── targets[]    │    │
@@ -279,28 +279,28 @@ Config-from-vault mode centralizes agent configuration in the vault server, enab
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-### Setting Up Host Configurations
+### Setting Up Host Templates
 
-#### 1. Create a Host Config in Vault
+#### 1. Create a Host Template in Vault
 
-Use the `znvault host` CLI commands to manage host configurations:
+Use the `znvault host` CLI commands to manage host templates:
 
 ```bash
-# Create a host config with a managed API key
+# Create a host template with a managed API key
 znvault host create payara-prod-1 \
   --managed-key payara-prod-1-key \
   --description "Payara production server 1"
 
 # Output:
-# ✓ Host config created
+# ✓ Host template created
 #   Hostname: payara-prod-1
 #   Managed Key: payara-prod-1-key
 #   Status: pending
 ```
 
-#### 2. Configure the Host
+#### 2. Configure the Host Template
 
-Edit the host configuration to add targets, secrets, and plugins:
+Edit the host template to add targets, secrets, and plugins:
 
 ```bash
 # Open in editor
@@ -400,14 +400,14 @@ curl -sL "https://vault.example.com/v1/hosts/payara-prod-1/bootstrap?token=zrt_x
 1. **Installs Node.js** - Detects OS (Ubuntu/Debian/RHEL) and installs Node.js 18+ if needed
 2. **Installs the agent** - Runs `npm install -g @zincapp/zn-vault-agent`
 3. **Creates system user** - Sets up `zn-vault-agent` user and group
-4. **Configures directories** - Creates and sets permissions on target directories from host config
+4. **Configures directories** - Creates and sets permissions on target directories from host template
 5. **Sets up sudoers** - Adds passwordless sudo rules for reload commands (if needed)
 6. **Installs systemd service** - Creates service file with appropriate security hardening
 7. **Starts the service** - Enables and starts the agent
 
 **Security hardening:**
 
-The generated script analyzes your host configuration to determine the appropriate systemd security profile:
+The generated script analyzes your host template to determine the appropriate systemd security profile:
 
 - **Strict profile** (default): Full hardening with `NoNewPrivileges=true`, empty `CapabilityBoundingSet`
 - **Relaxed profile** (when sudo needed): Allows SUID/SGID for sudo operations like `systemctl reload haproxy`
@@ -437,10 +437,10 @@ less bootstrap.sh
 sudo bash bootstrap.sh
 ```
 
-### Managing Host Configurations
+### Managing Host Templates
 
 ```bash
-# List all host configs
+# List all host templates
 znvault host list
 znvault host list --status active --json
 
@@ -460,13 +460,13 @@ znvault host config payara-prod-1 --import ./new-config.json
 # Push config update to running agent
 znvault host sync payara-prod-1
 
-# Delete host config
+# Delete host template
 znvault host delete payara-prod-1 [-y]
 ```
 
 ### Configuration Updates
 
-When you update a host configuration in the vault, agents are notified via WebSocket:
+When you update a host template in the vault, agents are notified via WebSocket:
 
 ```
 Admin: znvault host config payara-prod-1 --edit
@@ -1909,7 +1909,7 @@ Agent on HAProxy node
 
 ### Multi-Host Template Deployments
 
-Deploy identical configurations to multiple servers running the same service (HAProxy, nginx, Apache, etc.). A single host config acts as a template, and multiple agents bootstrap to it with different hostnames.
+Deploy identical configurations to multiple servers running the same service (HAProxy, nginx, Apache, etc.). A single host template serves multiple agents, and each agent bootstraps with a different hostname.
 
 #### Architecture
 
@@ -1917,7 +1917,7 @@ Deploy identical configurations to multiple servers running the same service (HA
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            VAULT SERVER                                      │
 │                                                                             │
-│  Host Config: "haproxy-production"                                          │
+│  Host Template: "haproxy-production"                                        │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │ targets:                                                            │    │
 │  │   - vault-ssl-cert → /etc/ssl/vault.example.com.pem                 │    │
@@ -1934,7 +1934,7 @@ Deploy identical configurations to multiple servers running the same service (HA
 │  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐               │
 │  │ Agent Record    │ │ Agent Record    │ │ Agent Record    │               │
 │  │ haproxy-prod-1  │ │ haproxy-prod-2  │ │ haproxy-prod-3  │               │
-│  │ hostConfigId: X │ │ hostConfigId: X │ │ hostConfigId: X │ (same config) │
+│  │ templateId: X   │ │ templateId: X   │ │ templateId: X   │ (same template)│
 │  └─────────────────┘ └─────────────────┘ └─────────────────┘               │
 └─────────────────────────────────────────────────────────────────────────────┘
             │                     │                     │
@@ -1955,19 +1955,19 @@ Deploy identical configurations to multiple servers running the same service (HA
 
 | Aspect | Description |
 |--------|-------------|
-| **Single source of truth** | One config template, multiple servers |
+| **Single source of truth** | One host template, multiple servers |
 | **Instant propagation** | Update config once, all agents receive via WebSocket |
 | **Consistent state** | All servers guaranteed to have identical config |
 | **Centralized management** | View all agents in `znvault host get` |
 | **Shared API key rotation** | Managed key rotates across all agents simultaneously |
-| **Easy scaling** | Add new servers by bootstrapping with same config |
+| **Easy scaling** | Add new servers by bootstrapping with same template |
 
-#### Setup: One Config, Multiple Hosts
+#### Setup: One Template, Multiple Hosts
 
-**Step 1: Create the host config template**
+**Step 1: Create the host template**
 
 ```bash
-# Create host config with managed API key
+# Create host template with managed API key
 znvault host create haproxy-production \
   --managed-key haproxy-prod-key \
   --description "HAProxy production load balancers"
@@ -2177,10 +2177,10 @@ This pattern works for any service that runs identically across multiple hosts:
 
 #### Managed API Key Sharing
 
-All agents bootstrapped from the same host config share the managed API key:
+All agents bootstrapped from the same host template share the managed API key:
 
 ```
-Host Config: haproxy-production
+Host Template: haproxy-production
 └── Managed Key: haproxy-prod-key
     ├── haproxy-prod-1 → uses haproxy-prod-key
     ├── haproxy-prod-2 → uses haproxy-prod-key
@@ -2228,6 +2228,159 @@ Enable and start:
 sudo systemctl daemon-reload
 sudo systemctl enable --now zn-vault-agent
 ```
+
+### Node.js Application with Environment File
+
+This pattern is used for Node.js (or any) applications that load configuration from environment files. The agent syncs secrets from vault to an env file, and systemd loads that file via `EnvironmentFile`.
+
+**Example: ZN-Admin (NestJS application)**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  systemd                                                             │
+│     │                                                                │
+│     ├── zn-vault-agent.service (daemon mode)                        │
+│     │      └── Syncs secrets to /etc/zn-admin/env                   │
+│     │      └── Runs: sudo systemctl restart zn-admin                │
+│     │                                                                │
+│     └── zn-admin.service                                            │
+│            └── EnvironmentFile=/etc/zn-admin/env                    │
+│            └── ExecStart=/usr/bin/node dist/main.js                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Step 1: Create host template in vault**
+
+```bash
+# Create host template with managed API key
+znvault host create zn-admin \
+  --description "ZN-Admin Fleet Management Server" \
+  --managed-key zn-admin-prod
+```
+
+**Step 2: Configure secret target**
+
+Create `host-template.json`:
+```json
+{
+  "secretTargets": [
+    {
+      "name": "env-file",
+      "secretId": "<secret-id-of-zn-admin/config>",
+      "output": "/etc/zn-admin/env",
+      "format": "env",
+      "mode": "0600",
+      "owner": "zn-vault-agent:zn-vault-agent",
+      "reloadCmd": "sudo systemctl restart zn-admin"
+    }
+  ],
+  "autoUpdate": {
+    "enabled": true
+  }
+}
+```
+
+Import the template config:
+```bash
+znvault host config zn-admin --import host-template.json
+```
+
+**Step 3: Setup agent on server**
+
+```bash
+# Install and setup agent
+sudo npm install -g @zincapp/zn-vault-agent
+sudo zn-vault-agent setup -y
+
+# Create env file directory
+sudo mkdir -p /etc/zn-admin
+sudo chown zn-vault-agent:zn-vault-agent /etc/zn-admin
+
+# Create drop-in config for additional permissions
+sudo mkdir -p /etc/systemd/system/zn-vault-agent.service.d
+sudo tee /etc/systemd/system/zn-vault-agent.service.d/app.conf << 'EOF'
+[Service]
+ReadWritePaths=/etc/zn-admin
+NoNewPrivileges=false
+RestrictSUIDSGID=false
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+EOF
+
+# Setup sudoers for reload command
+echo 'zn-vault-agent ALL=(root) NOPASSWD: /usr/bin/systemctl restart zn-admin' | \
+  sudo tee /etc/sudoers.d/zn-vault-agent
+sudo chmod 440 /etc/sudoers.d/zn-vault-agent
+
+sudo systemctl daemon-reload
+```
+
+**Step 4: Configure agent for config-from-vault**
+
+```bash
+sudo tee /var/lib/zn-vault-agent/.config/zn-vault-agent-nodejs/config.json << 'EOF'
+{
+  "vaultUrl": "https://vault.example.com",
+  "tenantId": "mycompany",
+  "auth": { "apiKey": "znv_..." },
+  "configFromVault": true,
+  "hostname": "zn-admin",
+  "managedKey": { "name": "zn-admin-prod" }
+}
+EOF
+sudo chown -R zn-vault-agent:zn-vault-agent /var/lib/zn-vault-agent/.config
+```
+
+**Step 5: Create application service**
+
+`/etc/systemd/system/zn-admin.service`:
+```ini
+[Unit]
+Description=ZN-Admin Server
+After=network.target zn-vault-agent.service
+Wants=zn-vault-agent.service
+
+[Service]
+Type=simple
+User=sysadmin
+WorkingDirectory=/opt/zn-admin/packages/server
+
+# Load secrets from env file (synced by agent)
+EnvironmentFile=/etc/zn-admin/env
+
+# Static environment
+Environment=NODE_ENV=production
+Environment=PORT=3500
+
+ExecStart=/usr/bin/node dist/main.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Step 6: Start services**
+
+```bash
+sudo systemctl start zn-vault-agent
+sleep 5  # Wait for secrets to sync
+sudo systemctl start zn-admin
+
+# Verify
+curl -s http://localhost:9100/health | jq .   # Agent health
+curl -s http://localhost:3500/api/health      # App health
+```
+
+**Benefits of this pattern:**
+
+| Aspect | Benefit |
+|--------|---------|
+| **Secrets in env file** | Not visible in `ps aux` or command line |
+| **Native systemd** | Process management by systemd, not agent |
+| **Simple services** | Clean ExecStart, no complex flags |
+| **Auto-restart** | reloadCmd triggers app restart on secret change |
+| **Dashboard visibility** | Host template visible in vault dashboard |
+| **Consistent pattern** | Same approach for all Node.js apps |
 
 ## Troubleshooting
 

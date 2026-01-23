@@ -416,11 +416,28 @@ export class NpmAutoUpdateService {
   }
 
   /**
+   * Check if running as root user.
+   * If not root, we'll need sudo for npm global installs.
+   */
+  private isRoot(): boolean {
+    return process.getuid?.() === 0;
+  }
+
+  /**
+   * Get the sudo prefix if running as non-root.
+   * Returns 'sudo ' for non-root users, empty string for root.
+   */
+  private getSudoPrefix(): string {
+    return this.isRoot() ? '' : 'sudo ';
+  }
+
+  /**
    * Clear npm cache to ensure clean install.
    * This helps prevent issues from interrupted previous installs.
    */
   private async clearNpmCache(): Promise<void> {
     try {
+      // npm cache clean doesn't require sudo
       await execAsync('npm cache clean --force', { timeout: 60_000 });
       logger.debug('npm cache cleared');
     } catch (err) {
@@ -432,13 +449,15 @@ export class NpmAutoUpdateService {
   /**
    * Perform the npm update with retry logic.
    * Includes cache clearing and retries for transient errors.
+   * Uses sudo for non-root users (requires appropriate sudoers config).
    */
   private async performUpdate(targetVersion: string): Promise<void> {
     const tag = this.config.channel;
     const maxRetries = 2;
+    const sudoPrefix = this.getSudoPrefix();
 
     logger.info(
-      { package: PACKAGE_NAME, channel: tag, targetVersion },
+      { package: PACKAGE_NAME, channel: tag, targetVersion, usingSudo: !this.isRoot() },
       'Installing update via npm'
     );
 
@@ -447,23 +466,24 @@ export class NpmAutoUpdateService {
 
     // Step 2: Perform install with retries
     let lastError: Error | null = null;
+    const installCmd = `${sudoPrefix}npm install -g ${PACKAGE_NAME}@${tag}`;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const { stdout, stderr } = await execAsync(`npm install -g ${PACKAGE_NAME}@${tag}`, {
+        const { stdout, stderr } = await execAsync(installCmd, {
           timeout: 5 * 60 * 1000, // 5 minute timeout
         });
 
         if (stdout) logger.debug({ stdout: stdout.trim() }, 'npm install stdout');
         if (stderr) logger.debug({ stderr: stderr.trim() }, 'npm install stderr');
 
-        logger.info({ attempt }, 'npm install succeeded');
+        logger.info({ attempt, usingSudo: !this.isRoot() }, 'npm install succeeded');
         return; // Success
       } catch (err) {
         lastError = err as Error;
         if (attempt < maxRetries) {
           logger.warn(
-            { attempt, maxRetries, err },
+            { attempt, maxRetries, err, usingSudo: !this.isRoot() },
             'npm install failed, retrying after delay'
           );
           await this.sleep(5000); // Wait 5s before retry
@@ -471,7 +491,7 @@ export class NpmAutoUpdateService {
       }
     }
 
-    logger.error({ err: lastError, attempts: maxRetries }, 'npm install failed after all retries');
+    logger.error({ err: lastError, attempts: maxRetries, usingSudo: !this.isRoot() }, 'npm install failed after all retries');
     throw lastError ?? new Error('npm install failed after all retries');
   }
 
@@ -628,13 +648,15 @@ export class NpmAutoUpdateService {
 
   /**
    * Rollback to previous version after failed update.
+   * Uses sudo for non-root users.
    */
   private async rollback(previousVersion: string): Promise<void> {
-    logger.warn({ previousVersion }, 'Rolling back to previous version');
+    logger.warn({ previousVersion, usingSudo: !this.isRoot() }, 'Rolling back to previous version');
 
     try {
+      const sudoPrefix = this.getSudoPrefix();
       const { stdout, stderr } = await execAsync(
-        `npm install -g ${PACKAGE_NAME}@${previousVersion}`,
+        `${sudoPrefix}npm install -g ${PACKAGE_NAME}@${previousVersion}`,
         { timeout: 5 * 60 * 1000 }
       );
 
