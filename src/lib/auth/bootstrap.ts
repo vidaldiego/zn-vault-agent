@@ -171,7 +171,11 @@ export function applyRegistrationResult(
     },
     agentId: result.agentId,
     hostConfigId: result.hostConfigId,
-    configVersion: result.configVersion,
+    // NOTE: Don't set configVersion here. The version should only be set
+    // AFTER the agent fetches and applies the actual config content.
+    // Setting it here would cause the first fetch to return 304 (not modified)
+    // even though the agent doesn't have the config yet.
+    configVersion: undefined,
     managedKeyName: result.managedKeyName ?? undefined,
   };
 }
