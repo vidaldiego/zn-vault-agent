@@ -19,6 +19,7 @@ Comprehensive documentation for the ZnVault Certificate Agent.
 - [Auto-Update System](#auto-update-system)
 - [Use Cases](#use-cases)
   - [HAProxy Full Configuration Management](#haproxy-full-configuration-management)
+  - [Multi-Host Template Deployments](#multi-host-template-deployments)
 - [Troubleshooting](#troubleshooting)
 - [API Reference](#api-reference)
 - [API Key Auto-Renewal](#api-key-auto-renewal)
@@ -1905,6 +1906,288 @@ Agent on HAProxy node
   │
   └─► Failure: delete temp, log error, alert
 ```
+
+### Multi-Host Template Deployments
+
+Deploy identical configurations to multiple servers running the same service (HAProxy, nginx, Apache, etc.). A single host config acts as a template, and multiple agents bootstrap to it with different hostnames.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            VAULT SERVER                                      │
+│                                                                             │
+│  Host Config: "haproxy-production"                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ targets:                                                            │    │
+│  │   - vault-ssl-cert → /etc/ssl/vault.example.com.pem                 │    │
+│  │   - app-ssl-cert   → /etc/ssl/app.example.com.pem                   │    │
+│  │ secretTargets:                                                      │    │
+│  │   - haproxy-config → /etc/haproxy/haproxy.cfg                       │    │
+│  │   - cors-lua       → /etc/haproxy/cors.lua                          │    │
+│  │ managedKey: "haproxy-prod-key"                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              │                                              │
+│            ┌─────────────────┼─────────────────┐                            │
+│            │                 │                 │                            │
+│            ▼                 ▼                 ▼                            │
+│  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐               │
+│  │ Agent Record    │ │ Agent Record    │ │ Agent Record    │               │
+│  │ haproxy-prod-1  │ │ haproxy-prod-2  │ │ haproxy-prod-3  │               │
+│  │ hostConfigId: X │ │ hostConfigId: X │ │ hostConfigId: X │ (same config) │
+│  └─────────────────┘ └─────────────────┘ └─────────────────┘               │
+└─────────────────────────────────────────────────────────────────────────────┘
+            │                     │                     │
+            │ WebSocket           │ WebSocket           │ WebSocket
+            ▼                     ▼                     ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│ haproxy-prod-1  │     │ haproxy-prod-2  │     │ haproxy-prod-3  │
+│ 172.16.220.25   │     │ 172.16.220.26   │     │ 172.16.220.27   │
+│                 │     │                 │     │                 │
+│ Same config:    │     │ Same config:    │     │ Same config:    │
+│ - 5 certs       │     │ - 5 certs       │     │ - 5 certs       │
+│ - 3 secrets     │     │ - 3 secrets     │     │ - 3 secrets     │
+│ - haproxy.cfg   │     │ - haproxy.cfg   │     │ - haproxy.cfg   │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+#### Benefits
+
+| Aspect | Description |
+|--------|-------------|
+| **Single source of truth** | One config template, multiple servers |
+| **Instant propagation** | Update config once, all agents receive via WebSocket |
+| **Consistent state** | All servers guaranteed to have identical config |
+| **Centralized management** | View all agents in `znvault host get` |
+| **Shared API key rotation** | Managed key rotates across all agents simultaneously |
+| **Easy scaling** | Add new servers by bootstrapping with same config |
+
+#### Setup: One Config, Multiple Hosts
+
+**Step 1: Create the host config template**
+
+```bash
+# Create host config with managed API key
+znvault host create haproxy-production \
+  --managed-key haproxy-prod-key \
+  --description "HAProxy production load balancers"
+```
+
+**Step 2: Configure targets and secrets**
+
+```bash
+# Edit the config (or use --import)
+znvault host config haproxy-production --edit
+```
+
+Example configuration:
+
+```json
+{
+  "targets": [
+    {
+      "certId": "alias:certs/vault-example-com",
+      "name": "vault-ssl",
+      "outputs": { "combined": "/etc/ssl/vault.example.com.pem" },
+      "owner": "zn-vault-agent:zn-vault-agent",
+      "mode": "0644",
+      "reloadCmd": "sudo systemctl reload haproxy",
+      "healthCheckCmd": "curl -sf http://localhost:8404/stats"
+    },
+    {
+      "certId": "alias:certs/app-example-com",
+      "name": "app-ssl",
+      "outputs": { "combined": "/etc/ssl/app.example.com.pem" },
+      "owner": "zn-vault-agent:zn-vault-agent",
+      "mode": "0644",
+      "reloadCmd": "sudo systemctl reload haproxy",
+      "healthCheckCmd": "curl -sf http://localhost:8404/stats"
+    }
+  ],
+  "secretTargets": [
+    {
+      "secretId": "alias:infra/haproxy-prod/config",
+      "name": "haproxy-config",
+      "format": "raw",
+      "key": "text",
+      "output": "/etc/haproxy/haproxy.cfg",
+      "owner": "zn-vault-agent:zn-vault-agent",
+      "mode": "0644",
+      "reloadCmd": "haproxy -c -f /etc/haproxy/haproxy.cfg && sudo systemctl reload haproxy"
+    },
+    {
+      "secretId": "alias:infra/haproxy-prod/cors-lua",
+      "name": "cors-lua",
+      "format": "raw",
+      "key": "text",
+      "output": "/etc/haproxy/cors.lua",
+      "owner": "zn-vault-agent:zn-vault-agent",
+      "mode": "0644"
+    }
+  ],
+  "pollInterval": 3600
+}
+```
+
+**Step 3: Bootstrap each server with different hostnames**
+
+Generate tokens with unique agent hostnames using `--agent-hostname`:
+
+```bash
+# First server
+znvault host bootstrap-token haproxy-production \
+  --agent-hostname haproxy-prod-1 \
+  --expires 1h
+
+# Second server
+znvault host bootstrap-token haproxy-production \
+  --agent-hostname haproxy-prod-2 \
+  --expires 1h
+
+# Third server
+znvault host bootstrap-token haproxy-production \
+  --agent-hostname haproxy-prod-3 \
+  --expires 1h
+```
+
+Each command outputs a ready-to-use curl command with the token and hostname embedded.
+
+**Step 4: Run bootstrap on each server**
+
+The CLI outputs the exact command to run. The URL format is:
+```
+/v1/hosts/<template>/bootstrap?token=<token>&hostname=<agent-hostname>
+```
+
+```bash
+# On haproxy-prod-1 (172.16.220.25) - use the URL from CLI output
+curl -sL "https://vault.example.com/v1/hosts/haproxy-production/bootstrap?token=zrt_xxx&hostname=haproxy-prod-1" | sudo bash
+
+# On haproxy-prod-2 (172.16.220.26)
+curl -sL "https://vault.example.com/v1/hosts/haproxy-production/bootstrap?token=zrt_yyy&hostname=haproxy-prod-2" | sudo bash
+
+# On haproxy-prod-3 (172.16.220.27)
+curl -sL "https://vault.example.com/v1/hosts/haproxy-production/bootstrap?token=zrt_zzz&hostname=haproxy-prod-3" | sudo bash
+```
+
+#### Real-Time Updates
+
+When you update a secret, all agents receive the change simultaneously:
+
+```bash
+# Update the haproxy config secret
+znvault secret update infra/haproxy-prod/config --data '{"text": "...new config..."}'
+
+# Within seconds, all three servers:
+# 1. Receive WebSocket notification
+# 2. Fetch updated secret
+# 3. Write to /etc/haproxy/haproxy.cfg
+# 4. Run: haproxy -c -f /etc/haproxy/haproxy.cfg && sudo systemctl reload haproxy
+```
+
+Monitor updates in real-time:
+
+```bash
+# Watch logs on all servers
+for host in 172.16.220.25 172.16.220.26 172.16.220.27; do
+  ssh sysadmin@$host 'sudo journalctl -u zn-vault-agent -f' &
+done
+```
+
+#### Verify All Agents Are Synced
+
+```bash
+# Check all agents linked to the config
+znvault host get haproxy-production
+
+# Output shows:
+#   Agents: 3
+#   - haproxy-prod-1 (v1.20.5) - healthy, config v6
+#   - haproxy-prod-2 (v1.20.5) - healthy, config v6
+#   - haproxy-prod-3 (v1.20.5) - healthy, config v6
+```
+
+Or check individual agent health:
+
+```bash
+for host in 172.16.220.25 172.16.220.26 172.16.220.27; do
+  echo "=== $host ==="
+  curl -s http://$host:9100/health | jq '{status, certificates, secrets}'
+done
+```
+
+#### Adding a New Server
+
+Scale out by bootstrapping another server with the same config:
+
+```bash
+# Generate token for new server
+znvault host bootstrap-token haproxy-production \
+  --agent-hostname haproxy-prod-4 \
+  --expires 1h
+
+# CLI outputs the full curl command - copy and run on the new server:
+# curl -sL "https://vault.example.com/v1/hosts/haproxy-production/bootstrap?token=zrt_new&hostname=haproxy-prod-4" | sudo bash
+
+# New server immediately gets all certs and secrets
+```
+
+#### Other Use Cases
+
+This pattern works for any service that runs identically across multiple hosts:
+
+**nginx reverse proxies:**
+```json
+{
+  "targets": [
+    { "certId": "alias:certs/wildcard", "outputs": { "fullchain": "/etc/nginx/ssl/cert.pem", "key": "/etc/nginx/ssl/key.pem" } }
+  ],
+  "secretTargets": [
+    { "secretId": "alias:infra/nginx/config", "output": "/etc/nginx/nginx.conf", "reloadCmd": "nginx -t && systemctl reload nginx" }
+  ]
+}
+```
+
+**Apache web servers:**
+```json
+{
+  "targets": [
+    { "certId": "alias:certs/web", "outputs": { "cert": "/etc/apache2/ssl/cert.crt", "key": "/etc/apache2/ssl/cert.key", "chain": "/etc/apache2/ssl/chain.crt" } }
+  ],
+  "secretTargets": [
+    { "secretId": "alias:infra/apache/vhosts", "output": "/etc/apache2/sites-enabled/vhosts.conf", "reloadCmd": "apachectl configtest && systemctl reload apache2" }
+  ]
+}
+```
+
+**Application servers (Tomcat, Payara, etc.):**
+```json
+{
+  "targets": [
+    { "certId": "alias:certs/app", "outputs": { "cert": "/opt/tomcat/conf/server.crt", "key": "/opt/tomcat/conf/server.key" } }
+  ],
+  "secretTargets": [
+    { "secretId": "alias:app/db-config", "format": "env", "output": "/opt/tomcat/conf/db.env" }
+  ],
+  "plugins": [
+    { "name": "@zincapp/znvault-plugin-payara", "config": { "domainDir": "/opt/payara/glassfish/domains/domain1" } }
+  ]
+}
+```
+
+#### Managed API Key Sharing
+
+All agents bootstrapped from the same host config share the managed API key:
+
+```
+Host Config: haproxy-production
+└── Managed Key: haproxy-prod-key
+    ├── haproxy-prod-1 → uses haproxy-prod-key
+    ├── haproxy-prod-2 → uses haproxy-prod-key
+    └── haproxy-prod-3 → uses haproxy-prod-key
+```
+
+When the managed key rotates (manually or via auto-rotation), all agents receive the new key via WebSocket and update their local config automatically.
 
 ### Application mTLS
 

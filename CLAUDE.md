@@ -222,16 +222,54 @@ From `vitest.integration.config.ts`:
 - Sequential tests within files
 - 1 retry for flaky network tests
 
-## Releases
+## Release Process
 
-Published to npm via GitHub Actions when tags are pushed:
+**Publishing is handled automatically by GitHub Actions CI/CD.**
+
+### Steps to Release
+
+1. Update version in `package.json`:
+   ```bash
+   npm version patch  # or minor/major
+   ```
+
+2. Commit the version bump:
+   ```bash
+   git add package.json package-lock.json
+   git commit -m "chore(release): vX.Y.Z"
+   ```
+
+3. Create and push tag:
+   ```bash
+   git tag vX.Y.Z
+   git push origin main
+   git push origin vX.Y.Z
+   ```
+
+4. GitHub Actions automatically:
+   - Runs tests
+   - Builds the package
+   - Publishes to npm using OIDC authentication
+
+### npm Package
+
+- **Package:** `@zincapp/zn-vault-agent`
+- **Registry:** https://www.npmjs.com/package/@zincapp/zn-vault-agent
+- **Channels:** `latest` (stable), `beta` (pre-release), `next` (dev builds)
+
+### Verification
 
 ```bash
-# Bump version
-npm version patch  # or minor/major
+# Check published version
+npm view @zincapp/zn-vault-agent version
 
-# Push with tag
-git push && git push --tags
+# Install latest
+npm install -g @zincapp/zn-vault-agent
 ```
 
-Channels: `latest` (stable), `beta` (pre-release), `next` (dev builds)
+### CI/CD Configuration
+
+The GitHub Actions workflow (`.github/workflows/publish.yml`) handles:
+- Running tests on PRs
+- Publishing to npm on version tags (`v*`)
+- OIDC-based npm authentication (provenance enabled)

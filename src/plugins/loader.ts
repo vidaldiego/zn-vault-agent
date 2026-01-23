@@ -630,6 +630,20 @@ export class PluginLoader extends EventEmitter {
   }
 
   /**
+   * Get plugin info for registration with vault.
+   * Returns basic info about loaded plugins.
+   */
+  getPluginInfo(): { name: string; package: string; version: string }[] {
+    return Array.from(this.plugins.values())
+      .filter(l => l.status !== 'error')
+      .map(l => ({
+        name: l.plugin.name,
+        package: l.plugin.name, // For now use plugin name; in future can track npm package name
+        version: l.plugin.version,
+      }));
+  }
+
+  /**
    * Update agent internals (called when config changes)
    */
   updateInternals(internals: Partial<AgentInternals>): void {

@@ -193,7 +193,8 @@ export async function fetchConfigFromVault(options: FetchConfigOptions): Promise
             // Config-from-vault metadata
             configFromVault: true,
             configVersion: response.version,
-            managedKeyName: response.managedKeyName ?? undefined,
+            // Convert managedKeyName to managedKey object for rotation service
+            managedKey: response.managedKeyName ? { name: response.managedKeyName } : undefined,
             // Preserve identifiers for subsequent fetches
             hostConfigId,
             agentId,

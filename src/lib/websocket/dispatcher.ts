@@ -24,6 +24,7 @@ import {
   handleVaultPublicKey,
 } from '../../services/dynamic-secrets/index.js';
 import { getHostname, getAgentVersion } from './connection.js';
+import { getPluginLoader } from '../../plugins/loader.js';
 
 /**
  * Message dispatcher for handling incoming WebSocket messages.
@@ -173,11 +174,15 @@ export class MessageDispatcher {
     this.registeredAgentId = message.agentId ?? null;
     log.info({ agentId: this.registeredAgentId }, 'Connection established with server');
 
-    // Now that connection is fully established, send registration with capabilities/publicKey
+    // Now that connection is fully established, send registration with capabilities/publicKey/plugins
     // This must happen AFTER connection_established to ensure vault has ws.agentId set
     if (ws && ws.readyState === ws.OPEN) {
       const dynamicSecretsMetadata = getDynamicSecretsMetadata();
-      if (dynamicSecretsMetadata.publicKey || isDynamicSecretsEnabled()) {
+      const pluginLoader = getPluginLoader();
+      const plugins = pluginLoader?.getPluginInfo() ?? [];
+
+      // Always send registration if we have plugins or dynamic secrets
+      if (dynamicSecretsMetadata.publicKey || isDynamicSecretsEnabled() || plugins.length > 0) {
         const registerMessage = {
           type: 'register',
           metadata: {
@@ -186,10 +191,14 @@ export class MessageDispatcher {
             platform: process.platform,
             capabilities: ['secrets', 'certificates', ...getDynamicSecretsCapabilities()],
             publicKey: dynamicSecretsMetadata.publicKey,
+            plugins: plugins.length > 0 ? plugins : undefined,
           },
         };
         ws.send(JSON.stringify(registerMessage));
-        log.debug({ hasPublicKey: !!dynamicSecretsMetadata.publicKey }, 'Sent registration with capabilities');
+        log.debug({
+          hasPublicKey: !!dynamicSecretsMetadata.publicKey,
+          pluginCount: plugins.length,
+        }, 'Sent registration with capabilities and plugins');
       }
     }
   }
