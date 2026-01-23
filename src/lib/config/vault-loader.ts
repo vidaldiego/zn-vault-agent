@@ -40,6 +40,8 @@ export interface FetchConfigOptions {
   insecure?: boolean;
   /** Agent ID (for tracking) */
   agentId?: string;
+  /** Host config ID (preferred for fetching config) */
+  hostConfigId?: string;
   /** Last known config version (for conditional GET) */
   configVersion?: number;
   /** Request timeout in ms (default: 30000) */
@@ -74,17 +76,28 @@ export async function fetchConfigFromVault(options: FetchConfigOptions): Promise
     apiKey,
     insecure = false,
     agentId,
+    hostConfigId,
     configVersion,
     timeout = 30000,
   } = options;
 
-  // Get hostname for the request
-  const hostname = os.hostname();
+  // Build URL - prefer hostConfigId, fall back to system hostname
+  let url: URL;
+  let logContext: Record<string, string | undefined>;
 
-  // Build URL
-  const url = new URL(`/v1/hosts/${encodeURIComponent(hostname)}/config`, vaultUrl);
+  if (hostConfigId) {
+    // Fetch by host config ID (preferred for linked agents)
+    url = new URL(`/v1/agent/config`, vaultUrl);
+    url.searchParams.set('hostConfigId', hostConfigId);
+    logContext = { vaultUrl, hostConfigId };
+  } else {
+    // Fall back to hostname lookup (legacy mode)
+    const hostname = os.hostname();
+    url = new URL(`/v1/hosts/${encodeURIComponent(hostname)}/config`, vaultUrl);
+    logContext = { vaultUrl, hostname };
+  }
 
-  log.debug({ vaultUrl, hostname }, 'Fetching config from vault');
+  log.debug(logContext, 'Fetching config from vault');
 
   return new Promise((resolve) => {
     const isHttps = url.protocol === 'https:';
@@ -129,7 +142,7 @@ export async function fetchConfigFromVault(options: FetchConfigOptions): Promise
       res.on('end', () => {
         // Handle 304 Not Modified
         if (res.statusCode === 304) {
-          log.debug({ hostname, version: configVersion }, 'Config not modified');
+          log.debug({ ...logContext, version: configVersion }, 'Config not modified');
           resolve({
             success: true,
             modified: false,
@@ -182,7 +195,7 @@ export async function fetchConfigFromVault(options: FetchConfigOptions): Promise
           };
 
           log.info({
-            hostname,
+            ...logContext,
             version: response.version,
             targets: config.targets.length,
             secretTargets: config.secretTargets?.length ?? 0,

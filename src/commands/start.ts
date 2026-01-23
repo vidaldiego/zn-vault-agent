@@ -162,6 +162,7 @@ Examples:
           apiKey: config.auth.apiKey ?? '',
           insecure: config.insecure,
           agentId: config.agentId,
+          hostConfigId: config.hostConfigId,
           configVersion: config.configVersion,
         });
 
