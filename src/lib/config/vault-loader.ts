@@ -174,6 +174,8 @@ export async function fetchConfigFromVault(options: FetchConfigOptions): Promise
           const response = JSON.parse(data) as VaultConfigResponse;
 
           // Merge with local auth to create full config
+          // IMPORTANT: Preserve hostConfigId and agentId from options
+          // These are needed for subsequent config fetches after restart
           const config: AgentConfig = {
             vaultUrl: response.vaultUrl,
             tenantId: response.tenantId,
@@ -192,6 +194,9 @@ export async function fetchConfigFromVault(options: FetchConfigOptions): Promise
             configFromVault: true,
             configVersion: response.version,
             managedKeyName: response.managedKeyName ?? undefined,
+            // Preserve identifiers for subsequent fetches
+            hostConfigId,
+            agentId,
           };
 
           log.info({
