@@ -673,6 +673,7 @@ export async function startDaemon(options: {
         apiKey: config.auth.apiKey ?? '',
         insecure: config.insecure,
         agentId: config.agentId,
+        hostConfigId: config.hostConfigId,
         configVersion: event.force ? undefined : config.configVersion,
       });
 
