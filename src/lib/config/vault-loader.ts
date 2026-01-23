@@ -89,6 +89,8 @@ export async function fetchConfigFromVault(options: FetchConfigOptions): Promise
     // Fetch by host config ID (preferred for linked agents)
     url = new URL(`/v1/agent/config`, vaultUrl);
     url.searchParams.set('hostConfigId', hostConfigId);
+    // Include hostname for server-side agent tracking
+    url.searchParams.set('hostname', os.hostname());
     logContext = { vaultUrl, hostConfigId };
   } else {
     // Fall back to hostname lookup (legacy mode)
