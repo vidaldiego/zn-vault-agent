@@ -9,7 +9,11 @@ import {
   getTargets,
   getSecretTargets,
   isManagedKeyMode,
+  setConfigInMemory,
+  fetchConfigFromVault,
+  isConfigFromVaultEnabled,
   type ExecConfig,
+  type AgentConfig,
   DEFAULT_EXEC_CONFIG,
 } from '../lib/config.js';
 import { validateConfig, formatValidationResult } from '../lib/validation.js';
@@ -98,7 +102,52 @@ Examples:
         process.exit(1);
       }
 
-      const config = loadConfig();
+      let config = loadConfig();
+
+      // Config-from-vault mode: fetch config from vault server at startup
+      if (isConfigFromVaultEnabled(config)) {
+        console.log(chalk.cyan('Config-from-vault mode enabled, fetching config from vault...'));
+        logger.info({ vaultUrl: config.vaultUrl }, 'Fetching config from vault');
+
+        const result = await fetchConfigFromVault({
+          vaultUrl: config.vaultUrl,
+          apiKey: config.auth.apiKey ?? '',
+          insecure: config.insecure,
+          agentId: config.agentId,
+          configVersion: config.configVersion,
+        });
+
+        if (!result.success) {
+          console.error(chalk.red('Failed to fetch config from vault:'), result.error);
+          console.error(chalk.yellow('Hint: Ensure the vault server is reachable and your API key is valid.'));
+          logger.error({ error: result.error }, 'Failed to fetch config from vault');
+          process.exit(1);
+        }
+
+        if (result.config) {
+          // Merge vault config with local auth (keep local API key)
+          config = {
+            ...result.config,
+            auth: config.auth, // Keep local auth
+            agentId: config.agentId, // Keep local agent ID
+          };
+
+          // Update in-memory config for daemon (don't persist to disk)
+          setConfigInMemory(config);
+
+          console.log(chalk.green(`Config fetched from vault (version ${result.version})`));
+          logger.info({
+            version: result.version,
+            targets: config.targets?.length ?? 0,
+            secretTargets: config.secretTargets?.length ?? 0,
+            plugins: (config as AgentConfig & { plugins?: unknown[] }).plugins?.length ?? 0,
+          }, 'Config loaded from vault');
+        } else if (!result.modified) {
+          console.log(chalk.gray('Config unchanged (using cached version)'));
+          logger.debug({ version: result.version }, 'Config not modified');
+        }
+      }
+
       const targets = getTargets();
       const secretTargets = getSecretTargets();
 
@@ -200,6 +249,9 @@ Examples:
       console.log();
       console.log(`  Vault:       ${config.vaultUrl}`);
       console.log(`  Tenant:      ${config.tenantId}`);
+      if (isConfigFromVaultEnabled(config)) {
+        console.log(`  Config:      ${chalk.cyan('from vault')} (version ${config.configVersion ?? 0})`);
+      }
       console.log(`  Certs:       ${targets.length} certificate(s)`);
       console.log(`  Secrets:     ${secretTargets.length} secret(s)`);
       console.log(`  Poll:        every ${config.pollInterval ?? 3600}s`);
@@ -345,6 +397,7 @@ Examples:
           exec: execConfig,
           pluginAutoUpdateService,
           npmAutoUpdateService: autoUpdateService,
+          configFromVault: isConfigFromVaultEnabled(config),
         });
       } catch (err) {
         logger.error({ err }, 'Daemon error');

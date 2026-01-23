@@ -134,8 +134,8 @@ export interface ManagedKeyConfig {
 export interface AgentConfig {
   /** Vault server URL */
   vaultUrl: string;
-  /** Tenant ID */
-  tenantId: string;
+  /** Tenant ID (can be omitted if using configFromVault) */
+  tenantId?: string;
   /** Authentication */
   auth: {
     /** API key (current value - updated automatically for managed keys) */
@@ -162,6 +162,25 @@ export interface AgentConfig {
   verbose?: boolean;
   /** Plugin configurations */
   plugins?: PluginConfig[];
+
+  // ============================================================================
+  // Config-from-vault mode (unified agent deployment)
+  // ============================================================================
+
+  /**
+   * Pull config from vault at startup instead of using local config file.
+   * When true, only vaultUrl, auth, and configFromVault fields are used locally.
+   * All other config (targets, plugins, etc.) comes from the vault server.
+   */
+  configFromVault?: boolean;
+  /** Host config ID assigned during bootstrap (set automatically) */
+  hostConfigId?: string;
+  /** Last known config version from vault (for change detection) */
+  configVersion?: number;
+  /** Managed key name for this host (used with config-from-vault) */
+  managedKeyName?: string;
+  /** Agent ID assigned during registration (set automatically) */
+  agentId?: string;
 }
 
 /**
@@ -175,4 +194,5 @@ export const EMPTY_CONFIG: AgentConfig = {
   secretTargets: [],
   pollInterval: 3600,
   verbose: false,
+  configFromVault: false,
 };

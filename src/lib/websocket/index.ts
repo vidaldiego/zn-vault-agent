@@ -7,6 +7,7 @@ export type {
   SecretEvent,
   AgentUpdateEvent,
   ApiKeyRotationEvent,
+  HostConfigEvent,
   DegradedReason,
   DegradedConnectionInfo,
   ReprovisionEvent,

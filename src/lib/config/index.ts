@@ -14,7 +14,15 @@ export type {
 export { DEFAULT_EXEC_CONFIG, EMPTY_CONFIG } from './types.js';
 
 // Loading
-export { loadConfig, getConfig, isConfigured, getConfigPath } from './loader.js';
+export {
+  loadConfig,
+  getConfig,
+  isConfigured,
+  getConfigPath,
+  setConfigInMemory,
+  clearConfigInMemory,
+  isConfigInMemory,
+} from './loader.js';
 
 // Saving
 export { saveConfig, setConfig, updateApiKey } from './saver.js';
@@ -37,3 +45,12 @@ export {
   isManagedKeyMode,
   syncManagedKeyFile,
 } from './managed-key.js';
+
+// Vault config loader (config-from-vault mode)
+export {
+  fetchConfigFromVault,
+  isConfigFromVaultEnabled,
+  getMinimalConfigForVaultMode,
+  type FetchConfigOptions,
+  type FetchConfigResult,
+} from './vault-loader.js';

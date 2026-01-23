@@ -7,6 +7,7 @@ import {
   type SecretEvent,
   type AgentUpdateEvent,
   type ApiKeyRotationEvent,
+  type HostConfigEvent,
   type DegradedConnectionInfo,
   type ReprovisionEvent,
   type UnifiedAgentEvent,
@@ -34,6 +35,7 @@ export class MessageDispatcher {
     secret: [],
     update: [],
     apiKeyRotation: [],
+    hostConfig: [],
     degradedConnection: [],
     reprovisionAvailable: [],
     connect: [],
@@ -154,6 +156,15 @@ export class MessageDispatcher {
       void notifyManagedKeyRotationEvent(event.apiKeyName);
 
       this.handlers.apiKeyRotation.forEach(h => { h(event); });
+    } else if (message.topic === 'hostconfig' && message.data) {
+      const event = message.data as HostConfigEvent;
+      log.info({
+        event: event.event,
+        hostname: event.hostname,
+        version: event.version,
+        force: event.force,
+      }, 'Received host config event');
+      this.handlers.hostConfig.forEach(h => { h(event); });
     }
   }
 
@@ -236,6 +247,10 @@ export class MessageDispatcher {
     this.handlers.apiKeyRotation.push(handler);
   }
 
+  onHostConfigEvent(handler: (event: HostConfigEvent) => void): void {
+    this.handlers.hostConfig.push(handler);
+  }
+
   onDegradedConnection(handler: (info: DegradedConnectionInfo) => void): void {
     this.handlers.degradedConnection.push(handler);
   }
@@ -275,6 +290,7 @@ export class MessageDispatcher {
     this.handlers.secret = [];
     this.handlers.update = [];
     this.handlers.apiKeyRotation = [];
+    this.handlers.hostConfig = [];
     this.handlers.degradedConnection = [];
     this.handlers.reprovisionAvailable = [];
     this.handlers.connect = [];

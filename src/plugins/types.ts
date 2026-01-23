@@ -144,8 +144,8 @@ export interface PluginContext {
   /** Vault URL */
   vaultUrl: string;
 
-  /** Current tenant ID */
-  tenantId: string;
+  /** Current tenant ID (may be undefined in config-from-vault mode before config fetch) */
+  tenantId: string | undefined;
 
   /**
    * Fetch a secret from vault by alias or ID.

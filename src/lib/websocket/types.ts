@@ -82,12 +82,24 @@ export interface ReprovisionEvent {
 }
 
 /**
+ * Host config updated event (config-from-vault mode)
+ */
+export interface HostConfigEvent {
+  event: 'config.updated';
+  hostname: string;
+  version: number;
+  force?: boolean;
+  tenantId: string;
+  timestamp: string;
+}
+
+/**
  * Unified agent event (from /v1/ws/agent)
  */
 export interface UnifiedAgentEvent {
   type: 'pong' | 'event' | 'subscribed' | 'registered' | 'error' | 'connection_established' | 'degraded_connection' | 'reprovision_available' | 'dynamic-secrets';
-  topic?: 'certificates' | 'secrets' | 'updates' | 'apikeys' | 'reprovision' | 'dynamic-secrets';
-  data?: CertificateEvent | SecretEvent | AgentUpdateEvent | ApiKeyRotationEvent | ReprovisionEvent | DegradedConnectionInfo;
+  topic?: 'certificates' | 'secrets' | 'updates' | 'apikeys' | 'reprovision' | 'dynamic-secrets' | 'hostconfig';
+  data?: CertificateEvent | SecretEvent | AgentUpdateEvent | ApiKeyRotationEvent | ReprovisionEvent | DegradedConnectionInfo | HostConfigEvent;
   subscriptions?: { certificates: string[]; secrets: string[]; managedKeys: string[]; updates: string | null };
   agentId?: string;
   message?: string;
@@ -122,6 +134,7 @@ export interface UnifiedWebSocketClient {
   onSecretEvent(handler: (event: SecretEvent) => void): void;
   onUpdateEvent(handler: (event: AgentUpdateEvent) => void): void;
   onApiKeyRotationEvent(handler: (event: ApiKeyRotationEvent) => void): void;
+  onHostConfigEvent(handler: (event: HostConfigEvent) => void): void;
   onDegradedConnection(handler: (info: DegradedConnectionInfo) => void): void;
   onReprovisionAvailable(handler: (expiresAt: string) => void): void;
   onConnect(handler: (agentId: string) => void): void;
@@ -158,6 +171,7 @@ export interface EventHandlers {
   secret: ((event: SecretEvent) => void)[];
   update: ((event: AgentUpdateEvent) => void)[];
   apiKeyRotation: ((event: ApiKeyRotationEvent) => void)[];
+  hostConfig: ((event: HostConfigEvent) => void)[];
   degradedConnection: ((info: DegradedConnectionInfo) => void)[];
   reprovisionAvailable: ((expiresAt: string) => void)[];
   connect: ((agentId: string) => void)[];

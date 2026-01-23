@@ -8,7 +8,15 @@ import { EMPTY_CONFIG } from './types.js';
 import { getConfigFile, userConfig } from './storage.js';
 
 /**
- * Load configuration from file or user config, with environment variable overrides
+ * In-memory config cache for config-from-vault mode.
+ * When set, loadConfig() returns this instead of loading from disk.
+ */
+let inMemoryConfig: AgentConfig | null = null;
+
+/**
+ * Load configuration from file or user config, with environment variable overrides.
+ * If setConfigInMemory() has been called (config-from-vault mode), returns the
+ * in-memory config instead of loading from disk.
  *
  * Environment variables:
  * - ZNVAULT_URL: Override vault URL
@@ -19,6 +27,15 @@ import { getConfigFile, userConfig } from './storage.js';
  * - ZNVAULT_INSECURE: Set to "true" to skip TLS verification
  */
 export function loadConfig(): AgentConfig {
+  // Return in-memory config if set (config-from-vault mode)
+  if (inMemoryConfig !== null) {
+    // Still apply env var overrides for auth (important for API key rotation)
+    if (process.env.ZNVAULT_API_KEY) {
+      inMemoryConfig.auth.apiKey = process.env.ZNVAULT_API_KEY;
+    }
+    return inMemoryConfig;
+  }
+
   let config: AgentConfig;
 
   // Try system config first
@@ -107,4 +124,30 @@ export function getConfigPath(): string {
     return configFile;
   }
   return userConfig.path;
+}
+
+/**
+ * Set the in-memory config for config-from-vault mode.
+ * When set, loadConfig() returns this instead of loading from disk.
+ * This allows the agent to run with config fetched from vault without
+ * persisting it to disk.
+ */
+export function setConfigInMemory(config: AgentConfig): void {
+  inMemoryConfig = config;
+  log.debug({ configFromVault: config.configFromVault, version: config.configVersion }, 'In-memory config set');
+}
+
+/**
+ * Clear the in-memory config, reverting to disk-based config loading.
+ */
+export function clearConfigInMemory(): void {
+  inMemoryConfig = null;
+  log.debug('In-memory config cleared');
+}
+
+/**
+ * Check if in-memory config is currently active.
+ */
+export function isConfigInMemory(): boolean {
+  return inMemoryConfig !== null;
 }

@@ -18,6 +18,9 @@ export {
   getConfig,
   isConfigured,
   getConfigPath,
+  setConfigInMemory,
+  clearConfigInMemory,
+  isConfigInMemory,
   saveConfig,
   setConfig,
   updateApiKey,
@@ -32,4 +35,12 @@ export {
   updateManagedKey,
   isManagedKeyMode,
   syncManagedKeyFile,
+  fetchConfigFromVault,
+  isConfigFromVaultEnabled,
+  getMinimalConfigForVaultMode,
+} from './config/index.js';
+
+export type {
+  FetchConfigOptions,
+  FetchConfigResult,
 } from './config/index.js';

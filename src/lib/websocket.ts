@@ -2,7 +2,14 @@
 // WebSocket client for real-time certificate and secret updates (unified mode)
 // This file re-exports from the websocket/ module and provides the startDaemon function
 
-import { loadConfig, syncManagedKeyFile, type ExecConfig, type AgentConfig } from './config.js';
+import {
+  loadConfig,
+  syncManagedKeyFile,
+  setConfigInMemory,
+  fetchConfigFromVault,
+  type ExecConfig,
+  type AgentConfig,
+} from './config.js';
 import { deployCertificate, deployAllCertificates } from './deployer.js';
 import { deploySecret, deployAllSecrets, findSecretTarget } from './secret-deployer.js';
 import { wsLogger as log } from './logger.js';
@@ -71,6 +78,7 @@ export type {
   SecretEvent,
   AgentUpdateEvent,
   ApiKeyRotationEvent,
+  HostConfigEvent,
   DegradedReason,
   DegradedConnectionInfo,
   ReprovisionEvent,
@@ -94,6 +102,7 @@ import type {
   CertificateEvent,
   SecretEvent,
   ApiKeyRotationEvent,
+  HostConfigEvent,
 } from './websocket/index.js';
 
 // Track active deployments for graceful shutdown
@@ -151,6 +160,7 @@ export async function startDaemon(options: {
   exec?: ExecConfig;
   pluginAutoUpdateService?: PluginAutoUpdateService | null;
   npmAutoUpdateService?: NpmAutoUpdateService | null;
+  configFromVault?: boolean;
 } = {}): Promise<void> {
   const config = loadConfig();
   const secretTargets = config.secretTargets ?? [];
@@ -636,6 +646,82 @@ export async function startDaemon(options: {
       log.error({ err }, 'Error handling API key rotation event');
     });
   });
+
+  // Handle host config update events (config-from-vault mode)
+  async function handleHostConfigEvent(event: HostConfigEvent): Promise<void> {
+    if (getIsShuttingDown()) {
+      log.debug({ event: event.event }, 'Ignoring host config event during shutdown');
+      return;
+    }
+
+    // Only process if in config-from-vault mode
+    if (!options.configFromVault) {
+      log.debug({ hostname: event.hostname }, 'Ignoring host config event (not in config-from-vault mode)');
+      return;
+    }
+
+    log.info({
+      hostname: event.hostname,
+      version: event.version,
+      force: event.force,
+    }, 'Processing host config update event');
+
+    try {
+      // Fetch the latest config from vault
+      const result = await fetchConfigFromVault({
+        vaultUrl: config.vaultUrl,
+        apiKey: config.auth.apiKey ?? '',
+        insecure: config.insecure,
+        agentId: config.agentId,
+        configVersion: event.force ? undefined : config.configVersion,
+      });
+
+      if (!result.success) {
+        log.error({ error: result.error }, 'Failed to fetch updated config from vault');
+        return;
+      }
+
+      if (!result.modified) {
+        log.debug({ version: result.version }, 'Config not modified, skipping reload');
+        return;
+      }
+
+      if (result.config) {
+        // Update in-memory config (preserving local auth)
+        const updatedConfig = {
+          ...result.config,
+          auth: config.auth,
+          agentId: config.agentId,
+        };
+        setConfigInMemory(updatedConfig);
+
+        log.info({
+          version: result.version,
+          targets: updatedConfig.targets?.length ?? 0,
+          secretTargets: updatedConfig.secretTargets?.length ?? 0,
+        }, 'Config reloaded from vault');
+
+        // TODO: In a future enhancement, we could:
+        // - Restart plugins if plugin config changed
+        // - Re-sync certificates if targets changed
+        // - Re-sync secrets if secretTargets changed
+        // For now, we just log that the config was updated.
+        // A full restart may be required for changes to take effect.
+      }
+    } catch (err) {
+      log.error({ err }, 'Failed to process host config update event');
+    }
+  }
+
+  // Only register handler if in config-from-vault mode
+  if (options.configFromVault) {
+    unifiedClient.onHostConfigEvent((event) => {
+      handleHostConfigEvent(event).catch((err: unknown) => {
+        log.error({ err }, 'Error handling host config event');
+      });
+    });
+    log.info('Config-from-vault mode: subscribed to host config updates');
+  }
 
   unifiedClient.onConnect((agentId) => {
     log.info({ agentId }, 'Connected to vault');

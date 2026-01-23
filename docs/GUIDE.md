@@ -7,6 +7,7 @@ Comprehensive documentation for the ZnVault Certificate Agent.
 - [Introduction](#introduction)
 - [Architecture](#architecture)
 - [Installation](#installation)
+- [Config-from-Vault Mode](#config-from-vault-mode)
 - [Authentication](#authentication)
 - [Configuration](#configuration)
 - [CLI Commands](#cli-commands)
@@ -151,6 +152,349 @@ sudo ./deploy/install.sh
 # Verify
 zn-vault-agent --version
 ```
+
+## Config-from-Vault Mode
+
+Config-from-vault mode centralizes agent configuration in the vault server, enabling unified management across all hosts. Instead of maintaining separate config files on each server, you define host configurations in the vault and agents pull their config at startup.
+
+### Why Config-from-Vault?
+
+**Traditional approach (file-based):**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Each server has its own config file                            │
+│                                                                 │
+│  Server 1:                 Server 2:                            │
+│  /etc/zn-vault-agent/      /etc/zn-vault-agent/                 │
+│  └── config.json           └── config.json                      │
+│      ├── vaultUrl              ├── vaultUrl                     │
+│      ├── targets[]             ├── targets[]                    │
+│      ├── secretTargets[]       ├── secretTargets[]              │
+│      └── plugins[]             └── plugins[]                    │
+│                                                                 │
+│  ❌ Config drift between servers                                │
+│  ❌ Manual updates required on each server                      │
+│  ❌ No central visibility of agent configurations               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Config-from-vault approach:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       VAULT SERVER                              │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ Host Configurations (centralized)                       │    │
+│  │                                                         │    │
+│  │  payara-prod-1:     payara-prod-2:    haproxy-1:       │    │
+│  │  ├── targets[]      ├── targets[]     ├── targets[]    │    │
+│  │  ├── secrets[]      ├── secrets[]     └── reloadCmd    │    │
+│  │  └── plugins[]      └── plugins[]                      │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                           │                                     │
+│            GET /v1/hosts/:hostname/config                       │
+│            WebSocket: config.updated event                      │
+└─────────────────────────────────────────────────────────────────┘
+                            │
+              ┌─────────────┼─────────────┐
+              │             │             │
+              ▼             ▼             ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│  payara-prod-1  │ │  payara-prod-2  │ │   haproxy-1     │
+│                 │ │                 │ │                 │
+│  Minimal local  │ │  Minimal local  │ │  Minimal local  │
+│  config:        │ │  config:        │ │  config:        │
+│  - vaultUrl     │ │  - vaultUrl     │ │  - vaultUrl     │
+│  - apiKey       │ │  - apiKey       │ │  - apiKey       │
+│  - configFrom   │ │  - configFrom   │ │  - configFrom   │
+│    Vault: true  │ │    Vault: true  │ │    Vault: true  │
+└─────────────────┘ └─────────────────┘ └─────────────────┘
+
+✅ Single source of truth
+✅ Real-time config updates via WebSocket
+✅ Central visibility and management
+✅ Consistent configs across hosts
+```
+
+### Benefits
+
+| Aspect | File-Based | Config-from-Vault |
+|--------|------------|-------------------|
+| **Config location** | Each server | Vault (centralized) |
+| **Updates** | Manual per server | Push from vault |
+| **Visibility** | SSH to each server | `znvault host list` |
+| **Config drift** | Likely | Impossible |
+| **Bootstrap** | Copy config file | One-time token |
+| **Audit** | Per-server logs | Centralized audit |
+
+### Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                        VAULT SERVER                                 │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐ │
+│  │ host_configs    │  │ agents          │  │ registration_tokens │ │
+│  │ table           │  │ table           │  │ table               │ │
+│  │                 │  │                 │  │                     │ │
+│  │ - hostname      │◄─┤ - host_config_id│◄─┤ - host_config_id    │ │
+│  │ - config (JSON) │  │ - agent_id      │  │ - token             │ │
+│  │ - version       │  │ - config_version│  └─────────────────────┘ │
+│  │ - managed_key   │  └─────────────────┘                          │
+│  └─────────────────┘                                               │
+│           │                                                        │
+│           │  API Endpoints:                                        │
+│           │  • GET  /v1/hosts/:hostname/config (agent pulls)       │
+│           │  • POST /v1/hosts/:hostname/bootstrap-token            │
+│           │  • POST /v1/hosts/:hostname/sync (push update)         │
+│           │                                                        │
+│           │  WebSocket Event:                                      │
+│           │  • config.updated (hostname, version)                  │
+└───────────┼────────────────────────────────────────────────────────┘
+            │
+            │ Agent startup:
+            │ 1. Load minimal local config
+            │ 2. GET /v1/hosts/:hostname/config
+            │ 3. Merge vault config with local auth
+            │ 4. Subscribe to config.updated events
+            │
+            ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  HOST: payara-prod-1                                               │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │  zn-vault-agent.service                                      │  │
+│  │                                                              │  │
+│  │  Local config (/etc/zn-vault-agent/config.json):             │  │
+│  │  {                                                           │  │
+│  │    "vaultUrl": "https://vault.example.com",                  │  │
+│  │    "auth": { "apiKey": "znv_..." },                          │  │
+│  │    "configFromVault": true   ◄── enables config pull         │  │
+│  │  }                                                           │  │
+│  │                                                              │  │
+│  │  Config pulled from vault:                                   │  │
+│  │  - targets (certificates)                                    │  │
+│  │  - secretTargets                                             │  │
+│  │  - plugins (payara, etc.)                                    │  │
+│  │  - exec configuration                                        │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### Setting Up Host Configurations
+
+#### 1. Create a Host Config in Vault
+
+Use the `znvault host` CLI commands to manage host configurations:
+
+```bash
+# Create a host config with a managed API key
+znvault host create payara-prod-1 \
+  --managed-key payara-prod-1-key \
+  --description "Payara production server 1"
+
+# Output:
+# ✓ Host config created
+#   Hostname: payara-prod-1
+#   Managed Key: payara-prod-1-key
+#   Status: pending
+```
+
+#### 2. Configure the Host
+
+Edit the host configuration to add targets, secrets, and plugins:
+
+```bash
+# Open in editor
+znvault host config payara-prod-1 --edit
+
+# Or import from a JSON file
+znvault host config payara-prod-1 --import ./payara-config.json
+```
+
+Example configuration (`payara-config.json`):
+
+```json
+{
+  "targets": [
+    {
+      "certId": "alias:certs/payara-ssl",
+      "name": "payara-ssl",
+      "outputs": {
+        "cert": "/opt/payara/glassfish/domains/domain1/config/server.crt",
+        "key": "/opt/payara/glassfish/domains/domain1/config/server.key"
+      },
+      "owner": "payara:payara",
+      "mode": "0640"
+    }
+  ],
+  "secretTargets": [
+    {
+      "secretId": "alias:database/payara-prod",
+      "name": "db-credentials",
+      "format": "env",
+      "output": "/opt/payara/config/db.env",
+      "owner": "payara:payara",
+      "mode": "0600"
+    }
+  ],
+  "plugins": [
+    {
+      "name": "@zincapp/znvault-plugin-payara",
+      "config": {
+        "domainDir": "/opt/payara/glassfish/domains/domain1",
+        "asadminPath": "/opt/payara/bin/asadmin",
+        "healthCheckUrl": "http://localhost:8080/health"
+      }
+    }
+  ],
+  "exec": {
+    "command": ["/opt/payara/bin/asadmin", "start-domain", "--verbose", "domain1"],
+    "secrets": [
+      { "env": "DB_PASSWORD", "secret": "alias:database/payara-prod.password" }
+    ],
+    "restartOnChange": true
+  }
+}
+```
+
+#### 3. Generate a Bootstrap Token
+
+Create a one-time token to provision a new agent:
+
+```bash
+znvault host bootstrap-token payara-prod-1 --expires 1h
+
+# Output:
+# ✓ Bootstrap token created
+#   Token: zrt_a1b2c3d4e5f6...
+#   Expires: 2025-01-23T12:00:00Z
+#
+#   Bootstrap command:
+#   curl -sSL 'https://vault.example.com/agent/bootstrap.sh?hostname=payara-prod-1&configFromVault=true' | ZNVAULT_TOKEN=zrt_a1b2c3d4e5f6... bash
+```
+
+#### 4. Bootstrap the Agent
+
+On the target server, run the bootstrap command:
+
+```bash
+# One-liner bootstrap (installs agent, configures, starts service)
+curl -sSL 'https://vault.example.com/agent/bootstrap.sh?hostname=payara-prod-1&configFromVault=true' \
+  | ZNVAULT_TOKEN=zrt_a1b2c3d4e5f6... bash
+```
+
+Or manually:
+
+```bash
+# Install agent
+npm install -g @zincapp/zn-vault-agent
+
+# Bootstrap with token
+zn-vault-agent login \
+  --url https://vault.example.com \
+  --bootstrap-token zrt_a1b2c3d4e5f6... \
+  --config-from-vault
+
+# Start service
+sudo systemctl enable --now zn-vault-agent
+```
+
+### Managing Host Configurations
+
+```bash
+# List all host configs
+znvault host list
+znvault host list --status active --json
+
+# Get host details
+znvault host get payara-prod-1
+znvault host get payara-prod-1 --json
+
+# View current config
+znvault host config payara-prod-1
+
+# Edit config (opens in $EDITOR)
+znvault host config payara-prod-1 --edit
+
+# Import config from file
+znvault host config payara-prod-1 --import ./new-config.json
+
+# Push config update to running agent
+znvault host sync payara-prod-1
+
+# Delete host config
+znvault host delete payara-prod-1 [-y]
+```
+
+### Configuration Updates
+
+When you update a host configuration in the vault, agents are notified via WebSocket:
+
+```
+Admin: znvault host config payara-prod-1 --edit
+         │
+         ▼
+Vault: Saves new config, increments version
+         │
+         ▼
+Vault: Broadcasts WebSocket event
+       { "event": "config.updated", "hostname": "payara-prod-1", "version": 2 }
+         │
+         ▼
+Agent: Receives event, pulls new config
+         │
+         ▼
+Agent: Applies changes (restarts plugins, resyncs targets)
+```
+
+To force an immediate sync without WebSocket:
+
+```bash
+# Push config to agent (useful if WebSocket disconnected)
+znvault host sync payara-prod-1
+
+# Check which agents have outdated configs
+znvault host get payara-prod-1
+# Shows: agents linked, their config versions, last pull time
+```
+
+### Minimal Local Config
+
+Agents in config-from-vault mode only need minimal local configuration:
+
+```json
+{
+  "vaultUrl": "https://vault.example.com",
+  "auth": {
+    "apiKey": "znv_..."
+  },
+  "configFromVault": true
+}
+```
+
+All other configuration (targets, secretTargets, plugins, exec) comes from the vault.
+
+### Config Version Tracking
+
+The agent tracks the config version and uses conditional GET requests:
+
+```
+Agent → Vault: GET /v1/hosts/payara-prod-1/config
+               X-Agent-Config-Version: 2
+
+Vault → Agent: 304 Not Modified (if version unchanged)
+         OR
+Vault → Agent: 200 OK with new config (if version changed)
+```
+
+This minimizes bandwidth and ensures agents only reload when necessary.
+
+### Backwards Compatibility
+
+Config-from-vault mode is **opt-in** and fully backwards compatible:
+
+- Existing agents with `configFromVault: false` (default) continue unchanged
+- Local config files work exactly as before
+- Mix both modes in the same tenant
+- Gradual migration: bootstrap new servers with config-from-vault, leave existing ones on file-based
 
 ## Authentication
 
