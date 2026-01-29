@@ -12,6 +12,7 @@ import { registerStartCommand } from './commands/start.js';
 import { registerStatusCommand } from './commands/status.js';
 import { registerExecCommand } from './commands/exec.js';
 import { registerSetupCommand } from './commands/setup.js';
+import { registerTLSCommands } from './commands/tls.js';
 
 // Read version from package.json at runtime
 function getVersion(): string {
@@ -43,6 +44,7 @@ registerStartCommand(program);
 registerStatusCommand(program);
 registerExecCommand(program);
 registerSetupCommand(program);
+registerTLSCommands(program);
 
 // Parse arguments
 program.parse();

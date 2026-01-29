@@ -557,3 +557,121 @@ export async function bootstrapWithToken(token: string): Promise<BootstrapRespon
     token: 'skip', // No authentication required - token IS the auth
   });
 }
+
+// =============================================================================
+// Agent TLS Certificate API
+// =============================================================================
+
+/**
+ * Response from agent TLS certificate request/renew
+ */
+export interface AgentTLSCertificateResponse {
+  agentTlsCertId: string;
+  certificate: string;  // PEM-encoded certificate + private key
+  expiresAt: string;
+  hostname?: string;
+}
+
+/**
+ * Response from get agent TLS certificate
+ */
+export interface AgentTLSCertificateInfo {
+  id: string;
+  agentId: string;
+  certificateId: string;
+  status: 'PENDING' | 'ACTIVE' | 'SUPERSEDED' | 'REVOKED';
+  issuedAt: string;
+  expiresAt: string;
+  activatedAt: string | null;
+  certificate: {
+    subjectCn: string;
+    fingerprintSha256: string;
+    notBefore: string;
+    notAfter: string;
+  } | null;
+}
+
+/**
+ * Response from get agent TLS CA
+ */
+export interface AgentTLSCAResponse {
+  caId: string;
+  certificate: string;  // PEM-encoded CA certificate
+  fingerprintSha256: string;
+  subjectCn: string;
+  notBefore: string;
+  notAfter: string;
+}
+
+/**
+ * Request a TLS certificate for this agent.
+ * Requires PKI_CERT_SIGN permission.
+ */
+export async function requestAgentTLSCertificate(
+  agentId: string,
+  options?: {
+    hostname?: string;
+    ipAddresses?: string[];
+    validitySeconds?: number;
+  }
+): Promise<AgentTLSCertificateResponse> {
+  log.info({ agentId }, 'Requesting agent TLS certificate');
+
+  return await request({
+    method: 'POST',
+    path: `/v1/agents/${agentId}/tls/request`,
+    body: options ?? {},
+  });
+}
+
+/**
+ * Get current TLS certificate for this agent.
+ */
+export async function getAgentTLSCertificate(agentId: string): Promise<AgentTLSCertificateInfo> {
+  log.debug({ agentId }, 'Getting agent TLS certificate');
+
+  return await request({
+    method: 'GET',
+    path: `/v1/agents/${agentId}/tls/certificate`,
+  });
+}
+
+/**
+ * Renew TLS certificate for this agent.
+ */
+export async function renewAgentTLSCertificate(agentId: string): Promise<AgentTLSCertificateResponse> {
+  log.info({ agentId }, 'Renewing agent TLS certificate');
+
+  return await request({
+    method: 'POST',
+    path: `/v1/agents/${agentId}/tls/renew`,
+  });
+}
+
+/**
+ * Activate TLS certificate (acknowledge receipt and installation).
+ */
+export async function activateAgentTLSCertificate(
+  agentId: string,
+  agentTlsCertId: string
+): Promise<{ activated: boolean; activatedAt: string }> {
+  log.debug({ agentId, agentTlsCertId }, 'Activating agent TLS certificate');
+
+  return await request({
+    method: 'POST',
+    path: `/v1/agents/${agentId}/tls/activate`,
+    body: { agentTlsCertId },
+  });
+}
+
+/**
+ * Get CA certificate for agent TLS verification.
+ */
+export async function getAgentTLSCA(): Promise<AgentTLSCAResponse> {
+  log.debug('Getting agent TLS CA certificate');
+
+  return await request({
+    method: 'GET',
+    path: '/v1/agents/tls/ca',
+  });
+}

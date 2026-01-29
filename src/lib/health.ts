@@ -1,10 +1,11 @@
 // Path: src/lib/health.ts
-// HTTP health and metrics endpoint for zn-vault-agent using Fastify
+// HTTP and HTTPS health and metrics endpoint for zn-vault-agent using Fastify
 
 import Fastify, { type FastifyInstance } from 'fastify';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync, watchFile, unwatchFile } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import type { Server as HttpsServer } from 'node:https';
 import { healthLogger as log } from './logger.js';
 import { exportMetrics } from './metrics.js';
 import { loadConfig, getTargets, isConfigured } from './config.js';
@@ -66,6 +67,9 @@ let certErrors = 0;
 let syncedSecrets = 0;
 let secretErrors = 0;
 let fastifyServer: FastifyInstance | null = null;
+let httpsServer: FastifyInstance | null = null;
+let tlsCertPath: string | null = null;
+let tlsKeyPath: string | null = null;
 let childProcessManager: ChildProcessManager | null = null;
 let pluginLoader: PluginLoader | null = null;
 let pluginAutoUpdateService: PluginAutoUpdateService | null = null;
@@ -244,15 +248,9 @@ export async function getHealthStatus(): Promise<HealthStatus> {
 }
 
 /**
- * Create Fastify instance with core routes
+ * Add health routes to a Fastify instance
  */
-function createFastifyInstance(): FastifyInstance {
-  const fastify = Fastify({
-    logger: false, // We use our own pino logger
-    trustProxy: true,
-    bodyLimit: 500 * 1024 * 1024, // 500MB for WAR file uploads
-  });
-
+function addHealthRoutes(fastify: FastifyInstance): void {
   // CORS support for monitoring tools
   fastify.addHook('onRequest', async (request, reply) => {
     reply.header('Access-Control-Allow-Origin', '*');
@@ -407,6 +405,19 @@ function createFastifyInstance(): FastifyInstance {
       });
     }
   });
+}
+
+/**
+ * Create Fastify instance with core routes
+ */
+function createFastifyInstance(): FastifyInstance {
+  const fastify = Fastify({
+    logger: false, // We use our own pino logger
+    trustProxy: true,
+    bodyLimit: 500 * 1024 * 1024, // 500MB for WAR file uploads
+  });
+
+  addHealthRoutes(fastify);
 
   return fastify;
 }
@@ -453,6 +464,146 @@ export async function startHealthServer(
 }
 
 /**
+ * Start the HTTPS health server with TLS
+ */
+export async function startHTTPSHealthServer(
+  port: number = 9443,
+  certPath: string,
+  keyPath: string,
+  loader?: PluginLoader
+): Promise<FastifyInstance | null> {
+  // Verify certificate files exist
+  if (!existsSync(certPath)) {
+    log.warn({ certPath }, 'TLS certificate file not found, HTTPS server not started');
+    return null;
+  }
+  if (!existsSync(keyPath)) {
+    log.warn({ keyPath }, 'TLS key file not found, HTTPS server not started');
+    return null;
+  }
+
+  if (httpsServer) {
+    log.warn('HTTPS server already running');
+    return httpsServer;
+  }
+
+  // Store paths for hot-reload
+  tlsCertPath = certPath;
+  tlsKeyPath = keyPath;
+
+  // Set plugin loader if provided
+  if (loader) {
+    pluginLoader = loader;
+  }
+
+  // Read TLS files
+  let cert: string;
+  let key: string;
+  try {
+    cert = readFileSync(certPath, 'utf-8');
+    key = readFileSync(keyPath, 'utf-8');
+  } catch (err) {
+    log.error({ err, certPath, keyPath }, 'Failed to read TLS certificate files');
+    return null;
+  }
+
+  // Create Fastify instance with HTTPS
+  httpsServer = Fastify({
+    logger: false,
+    trustProxy: true,
+    bodyLimit: 500 * 1024 * 1024,
+    https: {
+      key,
+      cert,
+    },
+  });
+
+  // Add same routes as HTTP server
+  addHealthRoutes(httpsServer);
+
+  // Register plugin routes if loader provided
+  if (pluginLoader) {
+    await pluginLoader.registerRoutes(httpsServer);
+  }
+
+  try {
+    await httpsServer.listen({ port, host: '0.0.0.0' });
+    log.info({ port }, 'HTTPS health server started');
+
+    // Set up certificate file watching for hot-reload
+    setupCertificateWatcher(certPath, keyPath);
+
+    return httpsServer;
+  } catch (err) {
+    const error = err as NodeJS.ErrnoException;
+    if (error.code === 'EADDRINUSE') {
+      log.error({ port }, 'HTTPS health server port already in use');
+    } else {
+      log.error({ err: error }, 'HTTPS health server error');
+    }
+    httpsServer = null;
+    return null;
+  }
+}
+
+/**
+ * Set up file watchers for certificate hot-reload
+ */
+function setupCertificateWatcher(certPath: string, keyPath: string): void {
+  const reloadCertificate = async () => {
+    if (!httpsServer) return;
+
+    log.info('Certificate file changed, reloading HTTPS server');
+
+    try {
+      // Read new certificate files
+      const cert = readFileSync(certPath, 'utf-8');
+      const key = readFileSync(keyPath, 'utf-8');
+
+      // Get the underlying Node.js HTTPS server
+      const server = httpsServer.server as HttpsServer;
+
+      // Update the TLS context with new certificate
+      server.setSecureContext({ cert, key });
+
+      log.info('HTTPS server certificate reloaded successfully');
+    } catch (err) {
+      log.error({ err }, 'Failed to reload HTTPS certificate');
+    }
+  };
+
+  // Watch both cert and key files
+  watchFile(certPath, { interval: 1000 }, reloadCertificate);
+  watchFile(keyPath, { interval: 1000 }, reloadCertificate);
+
+  log.debug({ certPath, keyPath }, 'Certificate file watchers set up');
+}
+
+/**
+ * Hot-reload HTTPS server certificate (called by TLS certificate manager)
+ */
+export async function reloadHTTPSCertificate(certPath: string, keyPath: string): Promise<boolean> {
+  if (!httpsServer) {
+    log.warn('HTTPS server not running, cannot reload certificate');
+    return false;
+  }
+
+  try {
+    const cert = readFileSync(certPath, 'utf-8');
+    const key = readFileSync(keyPath, 'utf-8');
+
+    const server = httpsServer.server as HttpsServer;
+    server.setSecureContext({ cert, key });
+
+    log.info('HTTPS server certificate hot-reloaded via callback');
+    return true;
+  } catch (err) {
+    log.error({ err }, 'Failed to hot-reload HTTPS certificate');
+    return false;
+  }
+}
+
+/**
  * Stop the health HTTP server
  */
 export async function stopHealthServer(): Promise<void> {
@@ -471,6 +622,34 @@ export async function stopHealthServer(): Promise<void> {
 }
 
 /**
+ * Stop the HTTPS health server
+ */
+export async function stopHTTPSHealthServer(): Promise<void> {
+  // Clean up file watchers
+  if (tlsCertPath) {
+    unwatchFile(tlsCertPath);
+  }
+  if (tlsKeyPath) {
+    unwatchFile(tlsKeyPath);
+  }
+
+  if (!httpsServer) {
+    return;
+  }
+
+  try {
+    await httpsServer.close();
+    log.info('HTTPS health server stopped');
+  } catch (err) {
+    log.warn({ err }, 'Error closing HTTPS health server');
+  } finally {
+    httpsServer = null;
+    tlsCertPath = null;
+    tlsKeyPath = null;
+  }
+}
+
+/**
  * Check if health server is running
  */
 export function isHealthServerRunning(): boolean {
@@ -478,8 +657,22 @@ export function isHealthServerRunning(): boolean {
 }
 
 /**
+ * Check if HTTPS health server is running
+ */
+export function isHTTPSHealthServerRunning(): boolean {
+  return httpsServer !== null;
+}
+
+/**
  * Get the Fastify instance (for testing or advanced use)
  */
 export function getFastifyInstance(): FastifyInstance | null {
   return fastifyServer;
+}
+
+/**
+ * Get the HTTPS Fastify instance
+ */
+export function getHTTPSFastifyInstance(): FastifyInstance | null {
+  return httpsServer;
 }

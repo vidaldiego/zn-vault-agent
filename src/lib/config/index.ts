@@ -7,11 +7,12 @@ export type {
   SecretTarget,
   ExecConfig,
   ManagedKeyConfig,
+  TLSConfig,
   AgentConfig,
   ExecSecret,
 } from './types.js';
 
-export { DEFAULT_EXEC_CONFIG, EMPTY_CONFIG } from './types.js';
+export { DEFAULT_EXEC_CONFIG, DEFAULT_TLS_CONFIG, EMPTY_CONFIG } from './types.js';
 
 // Loading
 export {

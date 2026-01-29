@@ -981,6 +981,161 @@ znvault_agent_sync_duration_seconds{cert_name}
 znvault_agent_api_request_duration_seconds{method}
 ```
 
+## TLS/HTTPS Configuration
+
+The agent can expose its health/metrics endpoints over HTTPS using TLS certificates. There are two modes:
+
+### Auto-Managed TLS (Recommended)
+
+Let the vault issue and manage TLS certificates automatically:
+
+```bash
+# Enable auto-managed TLS
+zn-vault-agent tls enable
+
+# The agent will:
+# 1. Request a TLS certificate from vault on startup
+# 2. Start HTTPS server on port 9443
+# 3. Auto-renew certificate before expiry
+# 4. Hot-reload certificate without restart
+```
+
+**Requirements:**
+- Agent must be registered with vault (has agentId)
+- Tenant must have a CA assigned for `agent-tls` purpose
+- Agent needs permission to request certificates
+
+### Manual TLS
+
+Use your own certificate files:
+
+```bash
+# Enable with explicit certificate paths
+zn-vault-agent tls enable \
+  --cert-path /etc/ssl/agent.crt \
+  --key-path /etc/ssl/agent.key
+```
+
+### TLS Commands
+
+| Command | Description |
+|---------|-------------|
+| `tls enable` | Enable TLS for HTTPS health server |
+| `tls disable` | Disable TLS |
+| `tls status` | Show TLS configuration and certificate status |
+| `tls ca` | Fetch CA certificate for client verification |
+
+### TLS Options
+
+```bash
+zn-vault-agent tls enable [options]
+
+Options:
+  -p, --port <port>          HTTPS port (default: 9443)
+  -r, --renew-days <days>    Renew certificate before expiry (default: 7)
+  --keep-http                Keep HTTP server alongside HTTPS (default: true)
+  --no-keep-http             Disable HTTP when HTTPS is enabled
+  --cert-path <path>         Path to TLS certificate (manual mode)
+  --key-path <path>          Path to TLS private key (manual mode)
+```
+
+### Configuration File
+
+TLS can also be configured in `config.json`:
+
+```json
+{
+  "vaultUrl": "https://vault.example.com",
+  "tenantId": "my-tenant",
+  "auth": { "apiKey": "znv_..." },
+  "tls": {
+    "enabled": true,
+    "httpsPort": 9443,
+    "renewBeforeDays": 7,
+    "keepHttpServer": true
+  },
+  "targets": [...]
+}
+```
+
+For manual mode, add certificate paths:
+
+```json
+{
+  "tls": {
+    "enabled": true,
+    "certPath": "/etc/ssl/agent.crt",
+    "keyPath": "/etc/ssl/agent.key",
+    "httpsPort": 9443
+  }
+}
+```
+
+### CLI Options
+
+TLS can also be enabled via command line when starting the daemon:
+
+```bash
+# Enable auto-managed TLS
+zn-vault-agent start --tls --health-port 9100
+
+# With custom HTTPS port
+zn-vault-agent start --tls --tls-https-port 8443 --health-port 9100
+
+# With manual certificate paths
+zn-vault-agent start \
+  --tls \
+  --tls-cert /etc/ssl/agent.crt \
+  --tls-key /etc/ssl/agent.key \
+  --health-port 9100
+
+# HTTPS only (no HTTP)
+zn-vault-agent start --tls --no-tls-keep-http
+```
+
+### Verifying HTTPS Connections
+
+After enabling TLS, you can verify using curl:
+
+```bash
+# Fetch the CA certificate for verification
+zn-vault-agent tls ca --raw > /tmp/agent-ca.crt
+
+# Connect with CA verification
+curl --cacert /tmp/agent-ca.crt https://agent-host:9443/health
+
+# Or skip verification for testing
+curl -k https://agent-host:9443/health
+```
+
+### TLS Status
+
+Check TLS configuration and certificate status:
+
+```bash
+zn-vault-agent tls status
+
+# Output:
+# TLS Configuration
+#
+#   Status:      enabled
+#   Mode:        auto-managed (vault-issued certificate)
+#   HTTPS Port:  9443
+#   HTTP Server: enabled
+#   Auto-Renew:  7 days before expiry
+#
+# Certificate Status
+#   Cert ID:     abc12345...
+#   Expires:     4/26/2026 (82 days)
+#   Renewed:     1/26/2026, 10:00:00 AM
+#   Last Check:  1/26/2026, 5:00:00 PM
+#
+# Runtime
+#   Manager:     running
+#   Cert Path:   /var/lib/zn-vault-agent/tls/agent-001.crt
+#   Key Path:    /var/lib/zn-vault-agent/tls/agent-001.key
+```
+
 ## Plugin System
 
 The agent supports plugins that extend functionality without modifying core code. Plugins can:

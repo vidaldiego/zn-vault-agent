@@ -58,6 +58,12 @@ export function registerStartCommand(program: Command): void {
     .option('--restart-delay <ms>', 'Delay in ms before restarting child (default: 5000)', parseInt)
     .option('--max-restarts <n>', 'Max restarts in window (default: 10)', parseInt)
     .option('--restart-window <ms>', 'Restart count window in ms (default: 300000)', parseInt)
+    // TLS options for HTTPS health server
+    .option('--tls', 'Enable HTTPS health server')
+    .option('--tls-cert <path>', 'Path to TLS certificate (PEM format)')
+    .option('--tls-key <path>', 'Path to TLS private key (PEM format)')
+    .option('--tls-https-port <port>', 'HTTPS port (default: 9443)', parseInt)
+    .option('--no-tls-keep-http', 'Disable HTTP server when HTTPS is enabled')
     .addHelpText('after', `
 Examples:
   # Start in foreground (default)
@@ -98,6 +104,16 @@ Examples:
     -s ZINC_CONFIG_VAULT_API_KEY=api-key:my-key \\
     --secrets-to-files \\
     --health-port 9100
+
+  # Enable HTTPS health server with TLS
+  zn-vault-agent start \\
+    --health-port 9100 \\
+    --tls --tls-cert /etc/znvault/tls.crt --tls-key /etc/znvault/tls.key
+
+  # HTTPS only (disable HTTP server)
+  zn-vault-agent start \\
+    --tls --tls-cert /etc/znvault/tls.crt --tls-key /etc/znvault/tls.key \\
+    --no-tls-keep-http
 
   # Production setup (systemd)
   # See docs/GUIDE.md for systemd service file
@@ -173,7 +189,7 @@ Examples:
 
             // Persist agentId to config so future restarts don't need to discover
             try {
-              await saveConfig({
+              saveConfig({
                 ...config,
                 agentId: identity.agentId,
               });
@@ -343,6 +359,47 @@ Examples:
         console.log(`  Metrics:     http://0.0.0.0:${options.healthPort}/metrics`);
       }
 
+      // TLS status (from CLI options or config)
+      const tlsEnabled = options.tls ?? config.tls?.enabled ?? false;
+      const tlsCertPath = options.tlsCert ?? config.tls?.certPath;
+      const tlsKeyPath = options.tlsKey ?? config.tls?.keyPath;
+      const tlsHttpsPort = options.tlsHttpsPort ?? config.tls?.httpsPort ?? 9443;
+      const tlsKeepHttp = options.tlsKeepHttp ?? config.tls?.keepHttpServer ?? true;
+      const tlsRenewBeforeDays = config.tls?.renewBeforeDays ?? 7;
+
+      if (tlsEnabled) {
+        const hasExplicitPaths = tlsCertPath && tlsKeyPath;
+        const hasExistingCert = config.tls?.agentTlsCertId;
+
+        if (hasExplicitPaths) {
+          // Using explicit cert paths (manual mode)
+          console.log(`  TLS Mode:    ${chalk.green('manual')} (using provided certificate paths)`);
+          console.log(`  HTTPS:       https://0.0.0.0:${tlsHttpsPort}/health`);
+          console.log(`  Cert Path:   ${tlsCertPath}`);
+          console.log(`  Key Path:    ${tlsKeyPath}`);
+        } else if (hasExistingCert) {
+          // Auto-managed with existing cert
+          const expiresAt = config.tls?.certExpiresAt ? new Date(config.tls.certExpiresAt) : null;
+          const daysLeft = expiresAt ? Math.ceil((expiresAt.getTime() - Date.now()) / (24 * 60 * 60 * 1000)) : null;
+          console.log(`  TLS Mode:    ${chalk.cyan('auto-managed')} (vault-issued certificate)`);
+          console.log(`  HTTPS:       https://0.0.0.0:${tlsHttpsPort}/health`);
+          if (expiresAt && daysLeft !== null) {
+            const expiryColor = daysLeft <= tlsRenewBeforeDays ? chalk.yellow : chalk.green;
+            console.log(`  Cert Expiry: ${expiresAt.toLocaleDateString()} (${expiryColor(`${daysLeft} days`)})`);
+          }
+          console.log(`  Auto-Renew:  ${tlsRenewBeforeDays} days before expiry`);
+        } else {
+          // Auto-fetch mode - will request cert from vault on startup
+          console.log(`  TLS Mode:    ${chalk.cyan('auto-managed')} (will fetch from vault)`);
+          console.log(`  HTTPS:       https://0.0.0.0:${tlsHttpsPort}/health ${chalk.gray('(pending cert)')}`);
+          console.log(`  Auto-Renew:  ${tlsRenewBeforeDays} days before expiry`);
+        }
+
+        if (!tlsKeepHttp && !options.healthPort) {
+          console.log(`  HTTP:        ${chalk.gray('disabled')}`);
+        }
+      }
+
       // Auth mode status
       if (isManagedKeyMode()) {
         const nextRotation = config.managedKey?.nextRotationAt
@@ -481,6 +538,14 @@ Examples:
           pluginAutoUpdateService,
           npmAutoUpdateService: autoUpdateService,
           configFromVault: isConfigFromVaultEnabled(config),
+          // TLS options
+          tls: tlsEnabled ? {
+            enabled: tlsEnabled,
+            certPath: tlsCertPath,
+            keyPath: tlsKeyPath,
+            httpsPort: tlsHttpsPort,
+            keepHttpServer: tlsKeepHttp,
+          } : undefined,
         });
       } catch (err) {
         logger.error({ err }, 'Daemon error');

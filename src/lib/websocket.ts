@@ -9,6 +9,7 @@ import {
   fetchConfigFromVault,
   type ExecConfig,
   type AgentConfig,
+  type TLSConfig,
 } from './config.js';
 import { deployCertificate, deployAllCertificates } from './deployer.js';
 import { deploySecret, deployAllSecrets, findSecretTarget } from './secret-deployer.js';
@@ -17,12 +18,21 @@ import { metrics, initializeMetrics } from './metrics.js';
 import {
   startHealthServer,
   stopHealthServer,
+  startHTTPSHealthServer,
+  stopHTTPSHealthServer,
+  reloadHTTPSCertificate,
   updateCertStatus,
   updateSecretStatus,
   setChildProcessManager,
   setPluginAutoUpdateService,
   setNpmAutoUpdateService,
 } from './health.js';
+import {
+  isTLSEnabled,
+  onCertificateUpdated,
+  ensureCertificateReady,
+  stopTLSCertificateManager,
+} from '../services/tls-certificate-manager.js';
 import { flushLogs, setupLogRotation } from './logger.js';
 import type { PluginAutoUpdateService } from '../services/plugin-auto-update.js';
 import type { NpmAutoUpdateService } from '../services/npm-auto-update.js';
@@ -161,6 +171,7 @@ export async function startDaemon(options: {
   pluginAutoUpdateService?: PluginAutoUpdateService | null;
   npmAutoUpdateService?: NpmAutoUpdateService | null;
   configFromVault?: boolean;
+  tls?: TLSConfig;
 } = {}): Promise<void> {
   const config = loadConfig();
   const secretTargets = config.secretTargets ?? [];
@@ -353,11 +364,62 @@ export async function startDaemon(options: {
   }
 
   // Start health server if port specified (pass plugin loader for routes and health aggregation)
-  if (options.healthPort) {
+  // Skip HTTP server if TLS is enabled and keepHttpServer is false
+  const tlsEnabledForSkipCheck = options.tls?.enabled || isTLSEnabled();
+  const skipHttpServer = tlsEnabledForSkipCheck && options.tls?.keepHttpServer === false;
+  if (options.healthPort && !skipHttpServer) {
     try {
       await startHealthServer(options.healthPort, pluginLoader ?? undefined);
     } catch (err) {
       log.error({ err }, 'Failed to start health server');
+    }
+  }
+
+  // Start HTTPS health server if TLS is enabled
+  // TLS can be enabled via CLI options (options.tls) or config file (isTLSEnabled())
+  const tlsEnabled = options.tls?.enabled || isTLSEnabled();
+  if (tlsEnabled) {
+    try {
+      // Set up certificate update callback for hot-reload BEFORE starting manager
+      onCertificateUpdated((certPath, keyPath) => {
+        reloadHTTPSCertificate(certPath, keyPath).then(success => {
+          if (success) {
+            log.info({ certPath, keyPath }, 'HTTPS certificate hot-reloaded');
+          }
+        }).catch((err: unknown) => {
+          log.error({ err }, 'Failed to hot-reload HTTPS certificate');
+        });
+      });
+
+      // Ensure certificate is ready (auto-fetch from vault if needed)
+      // This starts the TLS manager which will request a cert if none exists
+      log.info('TLS enabled - ensuring certificate is ready');
+      const tlsReady = await ensureCertificateReady();
+
+      if (tlsReady) {
+        // Use CLI-provided paths if available, otherwise use auto-detected paths
+        const certPath = options.tls?.certPath ?? tlsReady.certPath;
+        const keyPath = options.tls?.keyPath ?? tlsReady.keyPath;
+        const httpsPort = options.tls?.httpsPort ?? tlsReady.httpsPort;
+
+        const httpsServer = await startHTTPSHealthServer(
+          httpsPort,
+          certPath,
+          keyPath,
+          pluginLoader ?? undefined
+        );
+
+        if (httpsServer) {
+          log.info({ httpsPort, certPath }, 'HTTPS health server started with TLS');
+        } else {
+          log.warn('HTTPS health server could not be started - check certificate paths');
+        }
+      } else {
+        log.warn('TLS certificate not available - HTTPS server not started');
+        log.warn('Ensure agent has API key and is registered with vault to auto-fetch certificates');
+      }
+    } catch (err) {
+      log.error({ err }, 'Failed to start HTTPS health server');
     }
   }
 
@@ -956,8 +1018,12 @@ export async function startDaemon(options: {
       log.warn({ active: activeDeployments }, 'Forcing shutdown with active deployments');
     }
 
-    // Stop health server
+    // Stop TLS certificate manager
+    stopTLSCertificateManager();
+
+    // Stop health servers
     await stopHealthServer();
+    await stopHTTPSHealthServer();
 
     // Flush logs
     await flushLogs();

@@ -7,12 +7,14 @@ export type {
   SecretTarget,
   ExecConfig,
   ManagedKeyConfig,
+  TLSConfig,
   AgentConfig,
   ExecSecret,
 } from './config/index.js';
 
 export {
   DEFAULT_EXEC_CONFIG,
+  DEFAULT_TLS_CONFIG,
   EMPTY_CONFIG,
   loadConfig,
   getConfig,

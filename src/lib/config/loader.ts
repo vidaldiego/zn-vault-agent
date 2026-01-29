@@ -25,6 +25,14 @@ let inMemoryConfig: AgentConfig | null = null;
  * - ZNVAULT_USERNAME: Override username
  * - ZNVAULT_PASSWORD: Override password (preferred over config file)
  * - ZNVAULT_INSECURE: Set to "true" to skip TLS verification
+ *
+ * TLS environment variables (for HTTPS health server):
+ * - ZNVAULT_TLS_ENABLED: Set to "true" to enable HTTPS health server
+ * - ZNVAULT_TLS_CERT_PATH: Path to TLS certificate (PEM format)
+ * - ZNVAULT_TLS_KEY_PATH: Path to TLS private key (PEM format)
+ * - ZNVAULT_TLS_HTTPS_PORT: HTTPS port (default: 9443)
+ * - ZNVAULT_TLS_KEEP_HTTP: Set to "false" to disable HTTP server when HTTPS enabled
+ * - ZNVAULT_CA_CERT_PATH: Custom CA certificate for vault connection
  */
 export function loadConfig(): AgentConfig {
   // Return in-memory config if set (config-from-vault mode)
@@ -88,6 +96,39 @@ export function loadConfig(): AgentConfig {
   }
   if (process.env.ZNVAULT_INSECURE === 'true') {
     config.insecure = true;
+  }
+
+  // Custom CA certificate for vault connection
+  if (process.env.ZNVAULT_CA_CERT_PATH) {
+    config.caCertPath = process.env.ZNVAULT_CA_CERT_PATH;
+  }
+
+  // TLS environment variable overrides for HTTPS health server
+  // Helper to ensure TLS config exists with required fields
+  const ensureTlsConfig = () => {
+    if (!config.tls) {
+      config.tls = { enabled: false };
+    }
+    return config.tls;
+  };
+
+  if (process.env.ZNVAULT_TLS_ENABLED === 'true') {
+    ensureTlsConfig().enabled = true;
+  }
+  if (process.env.ZNVAULT_TLS_CERT_PATH) {
+    ensureTlsConfig().certPath = process.env.ZNVAULT_TLS_CERT_PATH;
+  }
+  if (process.env.ZNVAULT_TLS_KEY_PATH) {
+    ensureTlsConfig().keyPath = process.env.ZNVAULT_TLS_KEY_PATH;
+  }
+  if (process.env.ZNVAULT_TLS_HTTPS_PORT) {
+    const port = parseInt(process.env.ZNVAULT_TLS_HTTPS_PORT, 10);
+    if (!isNaN(port) && port > 0 && port <= 65535) {
+      ensureTlsConfig().httpsPort = port;
+    }
+  }
+  if (process.env.ZNVAULT_TLS_KEEP_HTTP === 'false') {
+    ensureTlsConfig().keepHttpServer = false;
   }
 
   return config;

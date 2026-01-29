@@ -138,6 +138,12 @@ export interface StartCommandOptions {
   restartDelay?: number;
   maxRestarts?: number;
   restartWindow?: number;
+  // TLS options for HTTPS health server
+  tls?: boolean;
+  tlsCert?: string;
+  tlsKey?: string;
+  tlsHttpsPort?: number;
+  tlsKeepHttp?: boolean;
 }
 
 /**

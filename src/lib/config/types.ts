@@ -129,6 +129,40 @@ export interface ManagedKeyConfig {
 }
 
 /**
+ * TLS configuration for agent HTTPS server
+ */
+export interface TLSConfig {
+  /** Enable HTTPS health server (default: false) */
+  enabled: boolean;
+  /** Path to TLS certificate file (PEM format, includes private key if issued by vault) */
+  certPath?: string;
+  /** Path to TLS private key file (PEM format, optional if key is in certPath) */
+  keyPath?: string;
+  /** Path to CA certificate for client verification (optional, for mTLS) */
+  clientCaCertPath?: string;
+  /** Auto-renew certificate before expiry in days (default: 7) */
+  renewBeforeDays?: number;
+  /** HTTPS port for health server (default: 9443) */
+  httpsPort?: number;
+  /** Keep HTTP server running alongside HTTPS (default: true) */
+  keepHttpServer?: boolean;
+  /** Last certificate expiry (ISO timestamp, set automatically) */
+  certExpiresAt?: string;
+  /** Agent TLS certificate ID in vault (set automatically) */
+  agentTlsCertId?: string;
+}
+
+/**
+ * Default TLS configuration values
+ */
+export const DEFAULT_TLS_CONFIG: Partial<TLSConfig> = {
+  enabled: false,
+  renewBeforeDays: 7,
+  httpsPort: 9443,
+  keepHttpServer: true,
+};
+
+/**
  * Agent configuration
  */
 export interface AgentConfig {
@@ -155,8 +189,12 @@ export interface AgentConfig {
   hostname?: string;
   /** Managed API key configuration (enables auto-rotation) */
   managedKey?: ManagedKeyConfig;
-  /** Skip TLS verification */
+  /** Skip TLS verification for vault connection */
   insecure?: boolean;
+  /** Custom CA certificate for vault connection (PEM path) */
+  caCertPath?: string;
+  /** TLS configuration for agent HTTPS server */
+  tls?: TLSConfig;
   /** Certificate targets */
   targets: CertTarget[];
   /** Secret targets */
