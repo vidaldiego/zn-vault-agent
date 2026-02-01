@@ -184,6 +184,183 @@ The core daemon module handles:
 - Managed key rotation events
 - Child process restart coordination (combined mode)
 
+## Helping Users Configure Agents
+
+**This section is for AI assistants helping users set up agents.**
+
+### Decision Tree: Which Approach?
+
+When a user asks about configuring an agent, first determine their use case:
+
+```
+Q1: Are you deploying multiple servers with the same role?
+    (e.g., 3 HAProxy nodes, 5 app servers, auto-scaling group)
+
+    YES → PATH A: Host Templates + Config-from-Vault
+    NO  → Q2
+
+Q2: Are you deploying a single unique server?
+    (e.g., one database server, one monitoring server)
+
+    YES → PATH B: Bootstrap Token + Local Config
+    NO  → Q3
+
+Q3: Are you just running a command with secrets? (no daemon needed)
+    (e.g., CI/CD pipeline, one-off script, container entrypoint)
+
+    YES → PATH C: Exec Mode (One-Shot)
+```
+
+### Path A: Host Templates (Fleet/Multiple Servers)
+
+**When to use:** Multiple identical servers pulling same config.
+
+**Admin steps (vault side):**
+```bash
+# 1. Create host template with managed key
+znvault host create haproxy-prod --managed-key haproxy-key
+
+# 2. Configure the template
+znvault host config haproxy-prod --edit
+# Or: znvault host config haproxy-prod --import config.json
+
+# 3. Generate bootstrap token (one per server)
+znvault host token haproxy-prod
+# Output: zrt_abc123...
+```
+
+**Server steps (hostname auto-detected, or use --host-name to override):**
+```bash
+# Option A: One-command bootstrap
+curl -fsSL https://vault.example.com/v1/hosts/bootstrap.sh | \
+  BOOTSTRAP_TOKEN=zrt_abc123... bash
+
+# Option B: Manual (hostname auto-detected)
+npm install -g @zincapp/zn-vault-agent
+sudo zn-vault-agent setup
+zn-vault-agent login --url https://vault.example.com \
+  --bootstrap-token zrt_abc123...
+sudo systemctl enable --now zn-vault-agent
+
+# Option C: With explicit hostname
+zn-vault-agent login --url https://vault.example.com \
+  --bootstrap-token zrt_abc123... \
+  --host-name haproxy-prod-01
+```
+
+**Result:** Agent has `configFromVault: true` and pulls config from template.
+
+### Path B: Bootstrap Token + Local Config (Single Server)
+
+**When to use:** Unique server that doesn't share config with others.
+
+```bash
+# 1. Install
+npm install -g @zincapp/zn-vault-agent
+sudo zn-vault-agent setup
+
+# 2. Bootstrap (admin provides token, hostname auto-detected)
+zn-vault-agent login --url https://vault.example.com \
+  --bootstrap-token zrt_abc123...
+
+# Or with explicit hostname:
+zn-vault-agent login --url https://vault.example.com \
+  --bootstrap-token zrt_abc123... \
+  --host-name my-unique-server
+
+# 3. Configure locally
+zn-vault-agent certs add <cert-id> \
+  --name nginx-ssl \
+  --fullchain /etc/nginx/ssl/cert.pem \
+  --key /etc/nginx/ssl/key.pem \
+  --reload "systemctl reload nginx"
+
+# 4. Start
+sudo systemctl enable --now zn-vault-agent
+```
+
+**Result:** Agent has local config with targets defined in `/etc/zn-vault-agent/config.json`.
+
+### Path C: Exec Mode (One-Shot)
+
+**When to use:** Scripts, CI/CD, containers - no daemon needed.
+
+```bash
+# Basic: inject secrets and run command
+zn-vault-agent exec \
+  --url https://vault.example.com \
+  --api-key znv_abc123... \
+  -s DB_PASSWORD=alias:db/prod.password \
+  -- ./deploy.sh
+
+# With env file (inject all key-value pairs from secret)
+zn-vault-agent exec \
+  -e alias:env/production \
+  -- python app.py
+
+# Mixed: secrets + managed API key + literal
+zn-vault-agent exec \
+  -s DB_PASSWORD=alias:db/prod.password \
+  -s VAULT_KEY=api-key:my-managed-key \
+  -s ENV=literal:production \
+  -- ./start.sh
+```
+
+**No config file needed** - everything via CLI args or env vars.
+
+### Common Mistakes to Avoid
+
+1. **Don't mix approaches:** Either use `configFromVault: true` OR local config, not both.
+
+2. **Don't skip bootstrap tokens:** Using raw API keys is less secure. Bootstrap tokens:
+   - Are one-time use
+   - Expire in 1 hour
+   - Automatically bind to managed keys
+
+3. **Don't forget the tenant:** If using API key directly (not bootstrap), the agent auto-detects tenant from the key via `/auth/api-keys/self`.
+
+4. **Don't confuse host template with config file:**
+   - Host template = config stored ON VAULT SERVER
+   - Config file = config stored ON AGENT SERVER
+
+5. **Check auto-detected hostname:** The agent uses `os.hostname()` by default. If your machine hostname doesn't match your naming convention, use `--host-name` to override:
+   ```bash
+   # Uses machine hostname (auto-detected)
+   zn-vault-agent login --url ... --bootstrap-token zrt_...
+
+   # Override with explicit hostname
+   zn-vault-agent login --url ... --bootstrap-token zrt_... --host-name my-server-01
+   ```
+
+6. **Secret mapping syntax:**
+   - `alias:path/to/secret.field` - specific field
+   - `alias:path/to/secret` - entire secret as JSON
+   - `api-key:key-name` - managed API key
+   - `literal:value` - pass-through
+
+### Key Relationships
+
+```
+Bootstrap Token ─────► Managed API Key ─────► Host Template
+     │                      │                      │
+     │ (one-time)          │ (auto-rotation)      │ (config source)
+     │                      │                      │
+     ▼                      ▼                      ▼
+  Agent Registration    Agent Auth           Agent Config
+     │                      │                      │
+     └──────────────────────┼──────────────────────┘
+                            │
+                      Agent Runtime
+```
+
+### Detailed Reference
+
+See `docs/CONFIGURATION_GUIDE.md` for:
+- Complete configuration schema
+- Full examples for each path
+- Troubleshooting guide
+- Common patterns (auto-scaling, blue-green, etc.)
+
 ## Code Standards
 
 ### ESLint Configuration
@@ -273,3 +450,37 @@ The GitHub Actions workflow (`.github/workflows/publish.yml`) handles:
 - Running tests on PRs
 - Publishing to npm on version tags (`v*`)
 - OIDC-based npm authentication (provenance enabled)
+
+## Known Issues & Important Fixes
+
+### Plugin Managed Key Tracking (Fixed in v1.20.12)
+
+**Issue:** In daemon mode with plugins, managed API key rotation events were not dispatched to plugins. This caused plugins like `znvault-plugin-payara` to have stale API key files after key rotation.
+
+**Root Cause:** The rotation event handler in `websocket.ts` only checked `execManagedKeyNames` which was populated only in exec mode. In daemon mode, this array was empty, so all rotation events were ignored.
+
+**Fix Location:** `src/lib/websocket.ts` - Created `allManagedKeyNames` array that combines:
+- Exec mode managed keys
+- Plugin `api-key:` secrets extracted from plugin configs
+- Agent's own managed key (`config.managedKey.name`)
+
+**Symptoms (if running < v1.20.12):**
+- WebSocket subscriptions show `managedKeys: []` (empty)
+- Logs show "Received rotation event for untracked managed key"
+- Plugin's `onKeyRotated` hook never called
+- API key files become stale, causing authentication errors
+
+**Verification:**
+```bash
+# Check logs for proper tracking (v1.20.12+)
+grep "Managed API keys tracked" /var/log/zn-vault-agent/agent.log
+# Should show: {"totalManagedKeys":N,...}
+
+# Check WebSocket subscription
+grep "Subscriptions updated" /var/log/zn-vault-agent/agent.log | tail -1
+# Should show: "managedKeys":["your-key-name"]
+```
+
+**Workaround (if upgrade not possible):** Restart the agent - it auto-fixes stale API key files on startup.
+
+See `docs/TROUBLESHOOTING.md` for more details.
