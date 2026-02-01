@@ -250,6 +250,15 @@ export async function startDaemon(options: {
     execManagedKeyNames = extractApiKeyNames(execSecretMappings);
   }
 
+  // Track all managed key names (exec + plugins + agent's own key)
+  // This is populated after plugins are loaded
+  let allManagedKeyNames: string[] = [...execManagedKeyNames];
+
+  // Add agent's own managed key if configured
+  if (config.managedKey?.name) {
+    allManagedKeyNames.push(config.managedKey.name);
+  }
+
   log.info({
     vault: config.vaultUrl,
     certTargets: config.targets.length,
@@ -312,6 +321,32 @@ export async function startDaemon(options: {
       await pluginLoader.initializePlugins();
 
       log.info({ plugins: pluginLoader.getAllPluginStatuses() }, 'Plugins initialized');
+
+      // Extract managed key names from plugin configs (e.g., "api-key:my-key" in secrets)
+      // This ensures we subscribe to rotation events for keys used by plugins
+      for (const pluginConfig of pluginConfigs) {
+        const pc = pluginConfig as { config?: { secrets?: Record<string, string> } };
+        if (pc.config?.secrets) {
+          for (const value of Object.values(pc.config.secrets)) {
+            if (typeof value === 'string' && value.startsWith('api-key:')) {
+              const keyName = value.substring(8); // Remove 'api-key:' prefix
+              if (keyName && !allManagedKeyNames.includes(keyName)) {
+                allManagedKeyNames.push(keyName);
+                log.debug({ keyName, source: 'plugin' }, 'Tracking managed key from plugin config');
+              }
+            }
+          }
+        }
+      }
+
+      if (allManagedKeyNames.length > execManagedKeyNames.length) {
+        log.info({
+          totalManagedKeys: allManagedKeyNames.length,
+          fromExec: execManagedKeyNames.length,
+          fromPlugins: allManagedKeyNames.length - execManagedKeyNames.length - (config.managedKey?.name ? 1 : 0),
+          fromAgent: config.managedKey?.name ? 1 : 0,
+        }, 'Managed API keys tracked for rotation events');
+      }
     } catch (err) {
       log.error({ err }, 'Failed to initialize plugins');
       // Continue running agent without plugins
@@ -427,7 +462,7 @@ export async function startDaemon(options: {
   metrics.setCertsTracked(config.targets.length);
 
   // Create unified WebSocket client with exec secret IDs and managed key names
-  const unifiedClient = createUnifiedWebSocketClient(execSecretIds, execManagedKeyNames);
+  const unifiedClient = createUnifiedWebSocketClient(execSecretIds, allManagedKeyNames);
 
   // Initialize degraded mode handler
   initDegradedModeHandler({
@@ -619,9 +654,9 @@ export async function startDaemon(options: {
       return;
     }
 
-    // Check if this key is one we're using
-    if (!execManagedKeyNames.includes(event.apiKeyName)) {
-      log.debug({ keyName: event.apiKeyName }, 'Received rotation event for untracked managed key');
+    // Check if this key is one we're using (exec mode, plugins, or agent's own key)
+    if (!allManagedKeyNames.includes(event.apiKeyName)) {
+      log.debug({ keyName: event.apiKeyName, tracked: allManagedKeyNames }, 'Received rotation event for untracked managed key');
       return;
     }
 
@@ -750,11 +785,16 @@ export async function startDaemon(options: {
       }
 
       if (result.config) {
-        // Update in-memory config (preserving local auth)
+        // Update in-memory config (preserving local auth and managed key file settings)
         const updatedConfig = {
           ...result.config,
           auth: config.auth,
           agentId: config.agentId,
+          // Merge managedKey: vault provides key name, local provides file write settings
+          managedKey: result.config.managedKey ? {
+            ...config.managedKey,  // Local settings (filePath, fileOwner, fileMode)
+            ...result.config.managedKey,  // Vault settings (name, rotation metadata)
+          } : config.managedKey,
         };
         setConfigInMemory(updatedConfig);
 
