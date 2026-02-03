@@ -68,6 +68,7 @@ export interface LoginCommandOptions {
   apiKey?: string;
   managedKey?: string;
   bootstrapToken?: string;
+  hostName?: string;
   username?: string;
   password?: string;
   insecure?: boolean;

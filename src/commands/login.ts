@@ -1,9 +1,11 @@
 import type { Command } from 'commander';
+import os from 'node:os';
 import inquirer from 'inquirer';
 import ora from 'ora';
 import chalk from 'chalk';
 import { loadConfig, saveConfig, getConfigPath } from '../lib/config.js';
-import { login as apiLogin, listCertificates, getApiKeySelf, bindManagedApiKey, bootstrapWithToken } from '../lib/api.js';
+import { login as apiLogin, listCertificates, getApiKeySelf, bindManagedApiKey } from '../lib/api.js';
+import { exchangeBootstrapToken, applyRegistrationResult } from '../lib/auth/bootstrap.js';
 import type { LoginCommandOptions } from './types.js';
 
 /**
@@ -57,6 +59,7 @@ function isValidBootstrapToken(token: string): boolean {
 /**
  * Handle bootstrap token authentication flow.
  * This is the recommended secure way to provision new agents.
+ * Uses host-based registration which links the agent to a host template.
  */
 async function handleBootstrapToken(
   options: LoginCommandOptions,
@@ -83,45 +86,54 @@ async function handleBootstrapToken(
     process.exit(1);
   }
 
+  // Use provided hostname or fall back to machine hostname
+  const hostname = options.hostName ?? os.hostname();
+
   const insecure = options.insecure ?? false;
 
   console.log(`  Vault URL:   ${options.url}`);
+  console.log(`  Hostname:    ${hostname}${options.hostName ? '' : chalk.gray(' (auto-detected)')}`);
   console.log(`  Token:       ${token.substring(0, 8)}...`);
   console.log(`  TLS Verify:  ${insecure ? 'disabled' : 'enabled'}`);
   console.log();
 
-  // Save URL and insecure flag first (needed for API call)
+  // Set up config for the registration request
   config.vaultUrl = options.url;
   config.insecure = insecure;
+  config.hostname = hostname;
+  config.auth = {
+    ...config.auth,
+    bootstrapToken: token,
+  };
   saveConfig(config);
 
-  const spinner = ora('Bootstrapping agent with registration token...').start();
+  const spinner = ora('Registering agent with vault server...').start();
 
   try {
-    // Call bootstrap endpoint (no auth required - token IS the auth)
-    const response = await bootstrapWithToken(token);
+    // Call host-based registration endpoint
+    const result = await exchangeBootstrapToken(config);
 
-    spinner.succeed('Bootstrap successful!');
+    spinner.succeed('Registration successful!');
 
-    // Extract tenant ID from the response (it's in the managed key name or we need to get it)
-    // The bootstrap response includes the key but not explicitly the tenant ID
-    // We'll need to call getApiKeySelf after setting the key to get the tenant ID
-    config.auth.apiKey = response.key;
-    config.managedKey = {
-      name: response.name,
-      nextRotationAt: response.nextRotationAt,
-      graceExpiresAt: response.graceExpiresAt,
-      rotationMode: response.rotationMode,
-      lastBind: new Date().toISOString(),
-    };
+    // Apply registration result to config (removes bootstrap token, adds API key)
+    const updatedConfig = applyRegistrationResult(config, result);
+
+    // If we got a managed key, set up the managed key config
+    if (result.managedKeyName) {
+      updatedConfig.managedKey = {
+        name: result.managedKeyName,
+        lastBind: new Date().toISOString(),
+      };
+    }
+
+    // Enable config-from-vault if we got a host config ID
+    if (result.hostConfigId) {
+      updatedConfig.configFromVault = true;
+    }
+
+    // Save the updated config
+    Object.assign(config, updatedConfig);
     saveConfig(config);
-
-    // Now get the tenant ID from the API key self endpoint
-    spinner.start('Retrieving tenant information...');
-    const keyInfo = await getApiKeySelf();
-    config.tenantId = keyInfo.tenantId;
-    saveConfig(config);
-    spinner.succeed('Tenant information retrieved');
 
     // Test connection by listing certificates
     spinner.start('Testing connection...');
@@ -130,39 +142,45 @@ async function handleBootstrapToken(
 
     console.log();
     console.log(chalk.green('✓') + ` Configuration saved to: ${getConfigPath()}`);
-    console.log(chalk.green('✓') + ` Tenant: ${keyInfo.tenantId}`);
-    console.log(chalk.green('✓') + ` Managed key: ${response.name}`);
-    console.log(chalk.green('✓') + ` Found ${certs.total} certificate(s) in vault`);
-
-    const nextRotation = response.nextRotationAt
-      ? new Date(response.nextRotationAt).toLocaleString()
-      : 'unknown';
-    console.log(chalk.green('✓') + ` Key rotates: ${nextRotation}`);
-    console.log(chalk.gray('  Auto-rotation enabled - key will refresh before expiration'));
-
-    if (response._notice) {
-      console.log(chalk.gray(`  ${response._notice}`));
+    console.log(chalk.green('✓') + ` Agent ID: ${result.agentId}`);
+    console.log(chalk.green('✓') + ` Tenant: ${result.tenantId}`);
+    if (result.hostConfigId) {
+      console.log(chalk.green('✓') + ` Host config: ${result.hostConfigId}`);
+      console.log(chalk.gray('  Config-from-vault enabled - agent will pull config from vault'));
     }
+    if (result.managedKeyName) {
+      console.log(chalk.green('✓') + ` Managed key: ${result.managedKeyName}`);
+      console.log(chalk.gray('  Auto-rotation enabled - key will refresh before expiration'));
+    }
+    console.log(chalk.green('✓') + ` Found ${certs.total} certificate(s) in vault`);
 
     console.log();
     console.log('Next steps:');
-    console.log('  1. Add certificates to sync: ' + chalk.cyan('zn-vault-agent add'));
-    console.log('  2. List configured targets:  ' + chalk.cyan('zn-vault-agent list'));
-    console.log('  3. Sync certificates now:    ' + chalk.cyan('zn-vault-agent sync'));
-    console.log('  4. Start daemon:             ' + chalk.cyan('zn-vault-agent start'));
+    if (result.hostConfigId) {
+      console.log('  Config-from-vault is enabled. Start the daemon:');
+      console.log('  ' + chalk.cyan('zn-vault-agent start --health-port 9100'));
+    } else {
+      console.log('  1. Add certificates to sync: ' + chalk.cyan('zn-vault-agent certs add'));
+      console.log('  2. List configured targets:  ' + chalk.cyan('zn-vault-agent list'));
+      console.log('  3. Sync certificates now:    ' + chalk.cyan('zn-vault-agent sync'));
+      console.log('  4. Start daemon:             ' + chalk.cyan('zn-vault-agent start'));
+    }
     console.log();
   } catch (err) {
-    spinner.fail('Bootstrap failed');
+    spinner.fail('Registration failed');
     const message = err instanceof Error ? err.message : String(err);
 
     // Provide helpful error messages
     if (message.includes('401') || message.includes('Unauthorized')) {
       console.error(chalk.red('Error:'), 'Invalid or expired registration token');
       console.log(chalk.gray('  The token may have already been used or expired.'));
-      console.log(chalk.gray('  Generate a new token: znvault agent token create --managed-key <name>'));
+      console.log(chalk.gray('  Generate a new token: znvault host token <template-name>'));
     } else if (message.includes('404')) {
-      console.error(chalk.red('Error:'), 'Associated managed key not found');
-      console.log(chalk.gray('  The managed key may have been deleted.'));
+      console.error(chalk.red('Error:'), 'Host template or managed key not found');
+      console.log(chalk.gray('  The host template may have been deleted.'));
+    } else if (message.includes('Hostname is required')) {
+      console.error(chalk.red('Error:'), 'Hostname is required for registration');
+      console.log(chalk.gray('  Add --host-name <hostname> to your command'));
     } else if (message.includes('ECONNREFUSED') || message.includes('ENOTFOUND')) {
       console.error(chalk.red('Error:'), 'Cannot connect to vault server');
       console.log(chalk.gray('  Check that the URL is correct and the server is running.'));
@@ -180,14 +198,22 @@ export function registerLoginCommand(program: Command): void {
     .description('Configure vault connection and authenticate')
     .option('-u, --url <url>', 'Vault server URL')
     .option('-k, --api-key <key>', 'API key (tenant auto-detected from key)')
-    .option('-b, --bootstrap-token <token>', 'One-time registration token for managed key (recommended)')
+    .option('-b, --bootstrap-token <token>', 'One-time registration token')
+    .option('-H, --host-name <hostname>', 'Hostname for agent registration (defaults to machine hostname)')
     .option('--insecure', 'Skip TLS certificate verification')
     .option('-y, --yes', 'Non-interactive mode (skip prompts, use provided values)')
     .option('--skip-test', 'Skip connection test after saving config')
     .addHelpText('after', `
 Examples:
   # Bootstrap with registration token (RECOMMENDED - most secure)
-  zn-vault-agent login --url https://vault.example.com --bootstrap-token zrt_abc123...
+  # Uses machine hostname by default, or specify with --host-name
+  zn-vault-agent login --url https://vault.example.com \\
+    --bootstrap-token zrt_abc123...
+
+  # Bootstrap with explicit hostname
+  zn-vault-agent login --url https://vault.example.com \\
+    --bootstrap-token zrt_abc123... \\
+    --host-name my-server-01
 
   # Login with API key (tenant auto-detected, managed keys auto-detected)
   zn-vault-agent login --url https://vault.example.com --api-key znv_abc123...
@@ -199,11 +225,13 @@ Examples:
   zn-vault-agent login --url https://vault.example.com --api-key znv_... -y --skip-test
 
 Bootstrap Token Flow (Recommended for Production):
-  1. Create a managed API key in the vault dashboard
-  2. Generate a registration token: znvault agent token create --managed-key <name>
+  1. Admin creates a host template: znvault host create <template-name> --managed-key <key-name>
+  2. Admin generates a registration token: znvault host token <template-name>
   3. Pass the token to the new server (cloud-init, Ansible, etc.)
-  4. Run: zn-vault-agent login --url <vault-url> --bootstrap-token <token>
-  5. Token is consumed (one-time use), agent is configured with managed key
+  4. On server, run:
+     zn-vault-agent login --url <vault-url> --bootstrap-token <token>
+     (hostname auto-detected, or use --host-name to override)
+  5. Token is consumed (one-time use), agent is registered and linked to host template
 `)
     .action(async (options: LoginCommandOptions) => {
       const config = loadConfig();

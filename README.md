@@ -2,6 +2,72 @@
 
 Real-time certificate distribution agent for ZnVault. Automatically syncs TLS certificates from your vault to target servers with zero-downtime deployments.
 
+## 🚀 Which Approach Should I Use?
+
+> **📖 For detailed guidance, see [docs/CONFIGURATION_GUIDE.md](docs/CONFIGURATION_GUIDE.md)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Deploying MULTIPLE servers with the SAME role? (e.g., 3 HAProxy nodes)    │
+│                                                                             │
+│     YES ──► HOST TEMPLATES + CONFIG-FROM-VAULT                              │
+│             One template in vault, all agents pull from it                  │
+│             See: docs/CONFIGURATION_GUIDE.md → "PATH A"                     │
+│                                                                             │
+│     NO ──► Deploying a SINGLE unique server?                                │
+│                                                                             │
+│        YES ──► BOOTSTRAP TOKEN + LOCAL CONFIG                               │
+│                Secure provisioning, config stored on server                 │
+│                See: docs/CONFIGURATION_GUIDE.md → "PATH B"                  │
+│                                                                             │
+│        NO ──► Just running a COMMAND with secrets? (no daemon)              │
+│                                                                             │
+│           YES ──► EXEC MODE (One-Shot)                                      │
+│                   No config file, inject secrets and run                    │
+│                   See: docs/CONFIGURATION_GUIDE.md → "PATH C"               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### TL;DR Quick Start
+
+**Path A - Fleet/Multiple Servers (Recommended for production):**
+```bash
+# Admin: Create host template
+znvault host create haproxy-prod --managed-key haproxy-key
+znvault host config haproxy-prod --edit  # Add targets, secrets
+
+# Admin: Generate bootstrap token
+znvault host token haproxy-prod
+# Output: zrt_abc123...
+
+# On each server (hostname auto-detected, or use --host-name to override):
+zn-vault-agent login --url https://vault.example.com \
+  --bootstrap-token zrt_abc123...
+
+# Or one-command bootstrap:
+curl -fsSL https://vault.example.com/v1/hosts/bootstrap.sh | \
+  BOOTSTRAP_TOKEN=zrt_abc123... bash
+```
+
+**Path B - Single Server:**
+```bash
+npm install -g @zincapp/zn-vault-agent
+sudo zn-vault-agent setup
+zn-vault-agent login --url https://vault.example.com --bootstrap-token zrt_...
+zn-vault-agent certs add <cert-id> --combined /etc/haproxy/certs/frontend.pem
+sudo systemctl enable --now zn-vault-agent
+```
+
+**Path C - One-Shot Command:**
+```bash
+zn-vault-agent exec \
+  -s DB_PASSWORD=alias:db/prod.password \
+  -s API_KEY=api-key:my-managed-key \
+  -- ./my-script.sh
+```
+
+---
+
 ## Features
 
 ### Certificate Sync
@@ -44,15 +110,21 @@ The agent supports three authentication methods:
 The most secure way to provision new agents. A one-time registration token is used to bind the agent to a managed API key with automatic rotation.
 
 ```bash
-# 1. Admin creates a managed key and generates a bootstrap token
-znvault agent token create --managed-key my-server-key
+# 1. Admin creates a host template with managed key and generates a bootstrap token
+znvault host create my-server --managed-key my-server-key
+znvault host token my-server
 # Output: zrt_abc123... (one-time use, expires in 1h)
 
 # 2. Pass token to new server via cloud-init, Ansible, etc.
 
-# 3. Agent bootstraps with the token
+# 3. Agent bootstraps with the token (hostname auto-detected)
 zn-vault-agent login --url https://vault.example.com \
   --bootstrap-token zrt_abc123...
+
+# Or with explicit hostname:
+zn-vault-agent login --url https://vault.example.com \
+  --bootstrap-token zrt_abc123... \
+  --host-name my-server-01
 ```
 
 **Benefits:**
@@ -60,6 +132,8 @@ zn-vault-agent login --url https://vault.example.com \
 - Token is consumed immediately (one-time use)
 - Agent automatically uses managed key with auto-rotation
 - Short TTL (max 24h) limits exposure window
+- Agent is linked to host template for centralized config management
+- Hostname auto-detected from machine (use `--host-name` to override)
 
 ### Managed API Key
 
@@ -451,6 +525,114 @@ When using managed keys, the agent automatically persists new keys to the config
 ```
 
 The agent is **stateless** - it can restart at any time and recover automatically by binding to get the current valid key.
+
+### Agent + SDK Integration (for Applications)
+
+When your application uses `zn-vault-sdk-node` alongside the agent, you can have the agent write the managed API key to a file that the SDK reads automatically. This enables:
+
+- **Automatic key rotation**: Agent rotates the key, SDK picks up the new key
+- **No environment variable exposure**: Key stays in a file, not in process environment
+- **Cross-process coordination**: Multiple applications can share the same key file
+
+#### Configuration
+
+**1. Configure the agent to write the key file:**
+
+Add `managedKey.filePath` to your agent config (`/etc/zn-vault-agent/config.json`):
+
+```json
+{
+  "vaultUrl": "https://vault.example.com",
+  "auth": { "apiKey": "znv_..." },
+  "managedKey": {
+    "name": "my-app-key",
+    "filePath": "/var/lib/zn-vault-agent/.config/zn-vault-agent-nodejs/api-key",
+    "fileOwner": "zn-vault-agent:app-group",
+    "fileMode": "0640"
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `filePath` | Where to write the API key (absolute path) |
+| `fileOwner` | File ownership as `user:group` (requires root or matching user) |
+| `fileMode` | File permissions (e.g., `0640` for owner read/write, group read) |
+
+**2. Configure your application to read from the file:**
+
+Set the SDK environment variable to point to the same file:
+
+```bash
+# In your application's systemd service or env file
+ZINC_CONFIG_VAULT_API_KEY_FILE=/var/lib/zn-vault-agent/.config/zn-vault-agent-nodejs/api-key
+```
+
+The SDK's `ZnVaultClient.fromEnv()` will automatically read from this file and refresh when the key rotates.
+
+#### Permission Requirements
+
+The application user must be able to read the key file. Options:
+
+1. **Add application user to agent's group** (recommended):
+   ```bash
+   sudo usermod -aG zn-vault-agent myapp-user
+   ```
+
+2. **Use a shared group** in `fileOwner`:
+   ```json
+   {
+     "managedKey": {
+       "fileOwner": "zn-vault-agent:shared-secrets",
+       "fileMode": "0640"
+     }
+   }
+   ```
+
+3. **Use more permissive mode** (less secure):
+   ```json
+   {
+     "managedKey": {
+       "fileMode": "0644"
+     }
+   }
+   ```
+
+#### Config-from-Vault Mode
+
+When using **config-from-vault** (host templates), the vault provides `managedKey.name` but doesn't know your local filesystem. You must set `filePath`, `fileOwner`, and `fileMode` in your **local** config file:
+
+```json
+// /etc/zn-vault-agent/config.json (local config)
+{
+  "vaultUrl": "https://vault.example.com",
+  "hostName": "my-server",
+  "managedKey": {
+    "filePath": "/var/lib/zn-vault-agent/.config/zn-vault-agent-nodejs/api-key",
+    "fileOwner": "zn-vault-agent:zn-vault-agent",
+    "fileMode": "0640"
+  }
+}
+```
+
+The agent merges local settings with vault config, so vault-provided fields (`name`, `nextRotationAt`, etc.) are combined with your local file settings.
+
+#### Verification
+
+Check that the key file is being written:
+
+```bash
+# Verify file exists and has correct permissions
+ls -la /var/lib/zn-vault-agent/.config/zn-vault-agent-nodejs/api-key
+# Should show: -rw-r----- 1 zn-vault-agent app-group ... api-key
+
+# Verify your app user can read it
+sudo -u myapp-user cat /var/lib/zn-vault-agent/.config/zn-vault-agent-nodejs/api-key
+# Should output: znv_...
+
+# Check agent health for managed key status
+curl -s http://localhost:9100/health | jq '.managedKey'
+```
 
 ### Password Authentication (Development Only)
 

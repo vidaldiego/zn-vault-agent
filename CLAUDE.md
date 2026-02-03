@@ -483,4 +483,28 @@ grep "Subscriptions updated" /var/log/zn-vault-agent/agent.log | tail -1
 
 **Workaround (if upgrade not possible):** Restart the agent - it auto-fixes stale API key files on startup.
 
+### Plugin Config Race Condition (Fixed in v1.20.13)
+
+**Issue:** Even with v1.20.12, plugins could still write stale API keys due to a race condition. The dispatcher called `notifyManagedKeyRotationEvent()` with `void` (fire-and-forget), then immediately called the rotation handlers. Plugins read `ctx.config.auth.apiKey` before the config was updated.
+
+**Root Cause:** In `websocket/dispatcher.ts`, the managed key renewal notification was not awaited:
+```typescript
+void notifyManagedKeyRotationEvent(event.apiKeyName);  // Fire-and-forget!
+this.handlers.apiKeyRotation.forEach(h => { h(event); });  // Runs immediately
+```
+
+**Fix Location:** `src/lib/websocket.ts` - Added `updateManagedKey()` call in `handleApiKeyRotationEvent` BEFORE dispatching to plugins, ensuring the config is updated synchronously.
+
+**Symptoms (if running v1.20.12):**
+- API key file has old key prefix after rotation
+- Logs show "API key written and verified" but file has wrong value
+- Config's `auth.apiKey` has correct (new) prefix, but key file has old prefix
+
+**Verification:**
+```bash
+# Compare key file prefix with config prefix - they should match
+echo "File:   $(head -c 12 /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY)..."
+echo "Config: $(cat /etc/zn-vault-agent/config.json | jq -r '.auth.apiKey[:12]')..."
+```
+
 See `docs/TROUBLESHOOTING.md` for more details.

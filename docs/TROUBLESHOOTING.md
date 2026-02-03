@@ -30,23 +30,29 @@ This guide covers common issues and their solutions.
 - Agent config has different (newer) key than the file
 - Issue occurs after multiple key rotations
 
-**Root Cause (Fixed in v1.20.12):**
+**Root Causes (Fixed in v1.20.12 and v1.20.13):**
 
-Prior to v1.20.12, the agent had a bug where managed API key rotation events were not dispatched to plugins in daemon mode. The rotation handler only checked `execManagedKeyNames` which was only populated in exec mode.
+**v1.20.12 Fix:** The agent had a bug where managed API key rotation events were not dispatched to plugins in daemon mode. The rotation handler only checked `execManagedKeyNames` which was only populated in exec mode.
+
+**v1.20.13 Fix:** Even after v1.20.12, a race condition existed where the plugin could read the old key value before the config was updated. The issue was:
 
 ```
-Timeline of the bug:
+Timeline of the race condition (v1.20.12):
 1. Key rotation event received via WebSocket
-2. Handler checks: if (!execManagedKeyNames.includes(keyName)) return
-3. In daemon mode, execManagedKeyNames = [] (empty)
-4. Handler returns early - plugin's onKeyRotated never called
-5. API key file never updated
-6. Application reads stale key → authentication fails
+2. Dispatcher calls notifyManagedKeyRotationEvent() with 'void' (fire-and-forget)
+3. IMMEDIATELY, handleApiKeyRotationEvent() is called (doesn't wait for step 2)
+4. Handler fetches new key via bindManagedApiKey()
+5. Handler dispatches event to plugin
+6. Plugin reads ctx.config.auth.apiKey - BUT config hasn't been updated yet!
+7. Plugin writes the OLD key to the file
+8. notifyManagedKeyRotationEvent() eventually finishes and updates config (too late)
 ```
+
+The v1.20.13 fix ensures the config is updated synchronously BEFORE dispatching to plugins.
 
 **Solution:**
 
-1. **Upgrade to v1.20.12 or later:**
+1. **Upgrade to v1.20.13 or later:**
    ```bash
    sudo npm install -g @zincapp/zn-vault-agent@latest
    sudo systemctl restart zn-vault-agent

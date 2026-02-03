@@ -224,11 +224,16 @@ Examples:
         }
 
         if (result.config) {
-          // Merge vault config with local auth (keep local API key)
+          // Merge vault config with local config (keep local auth and managed key file settings)
           config = {
             ...result.config,
             auth: config.auth, // Keep local auth
             agentId: config.agentId, // Keep local agent ID
+            // Merge managedKey: vault provides key name, local provides file write settings
+            managedKey: result.config.managedKey ? {
+              ...config.managedKey,  // Local settings (filePath, fileOwner, fileMode)
+              ...result.config.managedKey,  // Vault settings (name, rotation metadata)
+            } : config.managedKey,
           };
 
           // Update in-memory config for daemon (don't persist to disk)

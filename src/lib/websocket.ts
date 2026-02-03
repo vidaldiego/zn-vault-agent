@@ -53,6 +53,7 @@ import {
   type SecretMapping,
 } from './secret-env.js';
 import { bindManagedApiKey } from './api.js';
+import { updateManagedKey } from './config.js';
 import {
   createPluginLoader,
   clearPluginLoader,
@@ -677,6 +678,15 @@ export async function startDaemon(options: {
         keyName: event.apiKeyName,
         keyPrefix: newKey.substring(0, 8),
       }, 'Fetched new API key value');
+
+      // CRITICAL: Update config with new key BEFORE dispatching to plugins
+      // This ensures plugins see the new key when they read ctx.config.auth.apiKey
+      // Without this, there's a race condition with the managed-key-renewal service
+      updateManagedKey(newKey, {
+        nextRotationAt: bindResponse.nextRotationAt,
+        graceExpiresAt: bindResponse.graceExpiresAt,
+        rotationMode: bindResponse.rotationMode,
+      });
 
       // Dispatch plugin event - CRITICAL: await with error handling
       // Previously this was fire-and-forget which could cause silent failures
