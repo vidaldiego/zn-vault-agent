@@ -679,9 +679,19 @@ export async function startDaemon(options: {
         keyPrefix: newKey.substring(0, 8),
       }, 'Fetched new API key value');
 
-      // CRITICAL: Update config with new key BEFORE dispatching to plugins
-      // This ensures plugins see the new key when they read ctx.config.auth.apiKey
-      // Without this, there's a race condition with the managed-key-renewal service
+      // CRITICAL: Mutate the LIVE config object directly so plugins see the new key
+      // updateManagedKey() only updates the config FILE (via loadConfig() + saveConfig()),
+      // but does NOT mutate agentInternals.config which plugins read via ctx.config.
+      // Without this line, plugins would read the OLD key and write stale values to files.
+      config.auth.apiKey = newKey;
+      if (config.managedKey) {
+        config.managedKey.nextRotationAt = bindResponse.nextRotationAt;
+        config.managedKey.graceExpiresAt = bindResponse.graceExpiresAt;
+        config.managedKey.rotationMode = bindResponse.rotationMode;
+        config.managedKey.lastBind = new Date().toISOString();
+      }
+
+      // Also persist to disk and update environment variable
       updateManagedKey(newKey, {
         nextRotationAt: bindResponse.nextRotationAt,
         graceExpiresAt: bindResponse.graceExpiresAt,

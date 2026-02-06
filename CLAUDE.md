@@ -483,28 +483,42 @@ grep "Subscriptions updated" /var/log/zn-vault-agent/agent.log | tail -1
 
 **Workaround (if upgrade not possible):** Restart the agent - it auto-fixes stale API key files on startup.
 
-### Plugin Config Race Condition (Fixed in v1.20.13)
+### Plugin Config Race Condition (Fixed in v1.20.14)
 
-**Issue:** Even with v1.20.12, plugins could still write stale API keys due to a race condition. The dispatcher called `notifyManagedKeyRotationEvent()` with `void` (fire-and-forget), then immediately called the rotation handlers. Plugins read `ctx.config.auth.apiKey` before the config was updated.
+**Issue:** Even with v1.20.12/v1.20.13, plugins could still write stale API keys due to a race condition. Plugins read `ctx.config.auth.apiKey` before the in-memory config object was updated.
 
-**Root Cause:** In `websocket/dispatcher.ts`, the managed key renewal notification was not awaited:
+**Root Cause:** In `websocket.ts`, `handleApiKeyRotationEvent` called `updateManagedKey()` which:
+1. Loads a **NEW** config object from disk via `loadConfig()`
+2. Updates the new object
+3. Saves it back to disk
+
+But this **NEVER updated** `agentInternals.config` (the in-memory object that plugins read via `ctx.config`). So plugins read the OLD key from the stale in-memory object.
+
+**Fix Location:** `src/lib/websocket.ts` - Added direct mutation of the live `config` object BEFORE calling `updateManagedKey()`:
 ```typescript
-void notifyManagedKeyRotationEvent(event.apiKeyName);  // Fire-and-forget!
-this.handlers.apiKeyRotation.forEach(h => { h(event); });  // Runs immediately
+// CRITICAL: Mutate the LIVE config object directly
+config.auth.apiKey = newKey;
+if (config.managedKey) {
+  config.managedKey.nextRotationAt = bindResponse.nextRotationAt;
+  // ... other metadata
+}
+// Then persist to disk
+updateManagedKey(newKey, {...});
 ```
 
-**Fix Location:** `src/lib/websocket.ts` - Added `updateManagedKey()` call in `handleApiKeyRotationEvent` BEFORE dispatching to plugins, ensuring the config is updated synchronously.
-
-**Symptoms (if running v1.20.12):**
+**Symptoms (if running < v1.20.14):**
 - API key file has old key prefix after rotation
 - Logs show "API key written and verified" but file has wrong value
-- Config's `auth.apiKey` has correct (new) prefix, but key file has old prefix
+- Config FILE has correct (new) prefix, but key file has old prefix
+- Multiple rotation events logged (duplicate handling)
 
 **Verification:**
 ```bash
 # Compare key file prefix with config prefix - they should match
-echo "File:   $(head -c 12 /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY)..."
-echo "Config: $(cat /etc/zn-vault-agent/config.json | jq -r '.auth.apiKey[:12]')..."
+echo "File:   $(head -c 16 /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY)..."
+echo "Config: $(cat /etc/zn-vault-agent/config.json | jq -r '.auth.apiKey[:16]')..."
 ```
+
+**Workaround (if upgrade not possible):** Restart the agent - it auto-fixes stale API key files on startup via `syncManagedKeyFile()`.
 
 See `docs/TROUBLESHOOTING.md` for more details.
