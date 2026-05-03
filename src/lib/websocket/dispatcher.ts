@@ -27,6 +27,74 @@ import { getHostname, getAgentVersion } from './connection.js';
 import { getPluginLoader } from '../../plugins/loader.js';
 
 /**
+ * Sliding-window cache of recently-seen event deliveryIds.
+ *
+ * The vault server stamps each broadcast with a deliveryId and may redeliver
+ * the same event on reconnect (and, prior to the 2026-05-03 fix, on every
+ * cross-node Redis fan-out). Without dedup, the apikey rotation handler would
+ * run its full chain — bind, mutate config, write key file, dispatch plugin —
+ * once per duplicate, producing concurrent file writes that race.
+ *
+ * Server-side dedup landed in the same incident, but we keep this as
+ * defense-in-depth so a future server regression cannot reproduce the storm.
+ */
+const DELIVERY_DEDUP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const DELIVERY_DEDUP_MAX_ENTRIES = 1000;
+
+class DeliveryIdDedup {
+  private readonly seen = new Map<string, number>();
+
+  /**
+   * Returns true if this is the first time we've seen this id within the window.
+   * Returns false if it's a duplicate that should be skipped.
+   * Events without a deliveryId are always treated as fresh (caller falls back
+   * to existing behaviour).
+   */
+  observe(deliveryId: string | undefined): boolean {
+    if (!deliveryId) return true;
+
+    const now = Date.now();
+    this.prune(now);
+
+    if (this.seen.has(deliveryId)) {
+      return false;
+    }
+
+    if (this.seen.size >= DELIVERY_DEDUP_MAX_ENTRIES) {
+      // Drop oldest to bound memory if pruning hasn't kept up.
+      const oldestKey = this.seen.keys().next().value;
+      if (oldestKey !== undefined) this.seen.delete(oldestKey);
+    }
+
+    this.seen.set(deliveryId, now);
+    return true;
+  }
+
+  private prune(now: number): void {
+    const cutoff = now - DELIVERY_DEDUP_WINDOW_MS;
+    for (const [id, ts] of this.seen) {
+      if (ts < cutoff) {
+        this.seen.delete(id);
+      } else {
+        // Map preserves insertion order; once we hit a fresh entry the rest
+        // are also fresh.
+        break;
+      }
+    }
+  }
+
+  /** Test seam: clear all entries. */
+  clear(): void {
+    this.seen.clear();
+  }
+
+  /** Test seam: report current size. */
+  size(): number {
+    return this.seen.size;
+  }
+}
+
+/**
  * Message dispatcher for handling incoming WebSocket messages.
  * Routes messages to appropriate handlers based on message type.
  */
@@ -47,6 +115,7 @@ export class MessageDispatcher {
   private registeredAgentId: string | null = null;
   private readonly managedKeyNames: string[];
   private readonly onPongReceived: () => void;
+  private readonly apiKeyDedup = new DeliveryIdDedup();
 
   constructor(options: {
     managedKeyNames: string[];
@@ -54,6 +123,11 @@ export class MessageDispatcher {
   }) {
     this.managedKeyNames = options.managedKeyNames;
     this.onPongReceived = options.onPongReceived;
+  }
+
+  /** Test seam: clear the apikey deliveryId dedup cache. */
+  resetDedupForTesting(): void {
+    this.apiKeyDedup.clear();
   }
 
   /**
@@ -145,11 +219,28 @@ export class MessageDispatcher {
       this.handlers.update.forEach(h => { h(event); });
     } else if (message.topic === 'apikeys' && message.data) {
       const event = message.data as ApiKeyRotationEvent;
+      const deliveryId = (event as { deliveryId?: string }).deliveryId;
+
+      // Dedup duplicate broadcasts (server may resend on reconnect, and
+      // historically did so via cross-node fan-out). Without this guard,
+      // each duplicate triggers a full bind+config-mutate+file-write+plugin
+      // dispatch chain, racing concurrent writes to the API key file. See
+      // docs/incidents/2026-05-03 in the vault repo.
+      if (!this.apiKeyDedup.observe(deliveryId)) {
+        log.debug({
+          event: event.event,
+          keyName: event.apiKeyName,
+          deliveryId,
+        }, 'Skipping duplicate API key rotation event');
+        return;
+      }
+
       log.info({
         event: event.event,
         keyName: event.apiKeyName,
         newPrefix: event.newPrefix,
         graceExpiresAt: event.graceExpiresAt,
+        deliveryId,
       }, 'Received API key rotation event');
 
       // Notify managed key renewal service (for safety rail tracking)
