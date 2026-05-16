@@ -127,6 +127,7 @@ export interface SecretsSyncCommandOptions {
 export interface StartCommandOptions {
   verbose?: boolean;
   healthPort?: number;
+  healthHost?: string;
   validate?: boolean;
   foreground?: boolean;
   autoUpdate?: boolean;

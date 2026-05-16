@@ -427,7 +427,8 @@ function createFastifyInstance(): FastifyInstance {
  */
 export async function startHealthServer(
   port: number = 9100,
-  loader?: PluginLoader
+  loader?: PluginLoader,
+  host: string = '127.0.0.1'
 ): Promise<FastifyInstance> {
   if (fastifyServer) {
     log.warn('Health server already running');
@@ -448,8 +449,15 @@ export async function startHealthServer(
   }
 
   try {
-    await fastifyServer.listen({ port, host: '0.0.0.0' });
-    log.info({ port }, 'Health server started');
+    // Default bind: 127.0.0.1. The agent's HTTP server exposes plugin
+    // routes and update-trigger endpoints; in the absence of an
+    // authentication scheme on those endpoints, binding to all
+    // interfaces (0.0.0.0) lets anything on the host's network reach
+    // them. Operators who genuinely need network exposure (e.g. a
+    // remote Prometheus scraper) must set `health.bindHost` to '0.0.0.0'
+    // explicitly and accept the operational risk.
+    await fastifyServer.listen({ port, host });
+    log.info({ port, host }, 'Health server started');
     return fastifyServer;
   } catch (err) {
     const error = err as NodeJS.ErrnoException;
@@ -470,7 +478,8 @@ export async function startHTTPSHealthServer(
   port: number = 9443,
   certPath: string,
   keyPath: string,
-  loader?: PluginLoader
+  loader?: PluginLoader,
+  host: string = '127.0.0.1'
 ): Promise<FastifyInstance | null> {
   // Verify certificate files exist
   if (!existsSync(certPath)) {
@@ -527,8 +536,9 @@ export async function startHTTPSHealthServer(
   }
 
   try {
-    await httpsServer.listen({ port, host: '0.0.0.0' });
-    log.info({ port }, 'HTTPS health server started');
+    // See startHealthServer() for rationale on the localhost default.
+    await httpsServer.listen({ port, host });
+    log.info({ port, host }, 'HTTPS health server started');
 
     // Set up certificate file watching for hot-reload
     setupCertificateWatcher(certPath, keyPath);

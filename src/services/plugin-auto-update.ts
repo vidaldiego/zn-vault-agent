@@ -61,7 +61,12 @@ export interface PluginAutoUpdateServiceConfig {
 }
 
 export const DEFAULT_PLUGIN_UPDATE_CONFIG: PluginAutoUpdateServiceConfig = {
-  enabled: true,
+  // Production-safe default: disabled. Plugins run in-process with full
+  // agent capabilities; an unsigned npm update can replace the plugin's
+  // entire codebase. Operators must opt in explicitly per plugin (or
+  // globally via `pluginUpdate.enabled = true`) once a gating process
+  // is in place.
+  enabled: false,
   checkIntervalMs: 5 * 60 * 1000, // 5 minutes
   defaultChannel: 'latest',
   stagedRolloutMaxDelayMs: 30 * 60 * 1000, // 30 minutes max delay for staged rollout

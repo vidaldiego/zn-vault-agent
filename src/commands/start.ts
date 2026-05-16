@@ -42,6 +42,7 @@ export function registerStartCommand(program: Command): void {
     .description('Start the certificate sync daemon')
     .option('-v, --verbose', 'Enable verbose logging')
     .option('--health-port <port>', 'Health/metrics HTTP server port (default: disabled)', parseInt)
+    .option('--health-host <host>', 'Health/metrics HTTP server bind host (default: 127.0.0.1; set to 0.0.0.0 only with caution — endpoints are unauthenticated)')
     .option('--validate', 'Validate configuration before starting')
     .option('--foreground', 'Run in foreground (default)')
     .option('--auto-update', 'Enable automatic updates (uses saved config)')
@@ -360,8 +361,9 @@ Examples:
       console.log(`  Secrets:     ${secretTargets.length} secret(s)`);
       console.log(`  Poll:        every ${config.pollInterval ?? 3600}s`);
       if (options.healthPort) {
-        console.log(`  Health:      http://0.0.0.0:${options.healthPort}/health`);
-        console.log(`  Metrics:     http://0.0.0.0:${options.healthPort}/metrics`);
+        const healthHost = options.healthHost ?? '127.0.0.1';
+        console.log(`  Health:      http://${healthHost}:${options.healthPort}/health`);
+        console.log(`  Metrics:     http://${healthHost}:${options.healthPort}/metrics`);
       }
 
       // TLS status (from CLI options or config)
@@ -539,6 +541,7 @@ Examples:
         await startDaemon({
           verbose: options.verbose,
           healthPort: options.healthPort,
+          healthHost: options.healthHost,
           exec: execConfig,
           pluginAutoUpdateService,
           npmAutoUpdateService: autoUpdateService,

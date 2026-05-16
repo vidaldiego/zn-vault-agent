@@ -1017,7 +1017,10 @@ describe('loadUpdateConfig', () => {
 
     const config = loadUpdateConfig();
 
-    expect(config.enabled).toBe(true);
+    // Auto-update is OFF by default (M1.5 of the zn-api hardening plan).
+    // Operators must opt in explicitly via AUTO_UPDATE=true or the config
+    // file once an upstream signing/gating process is in place.
+    expect(config.enabled).toBe(false);
     expect(config.checkIntervalMs).toBe(5 * 60 * 1000);
     expect(config.channel).toBe('latest');
     expect(config.stagedRolloutMaxDelayMs).toBe(30 * 60 * 1000);

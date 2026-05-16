@@ -168,6 +168,14 @@ function setupSignalHandlers(shutdownFn: (signal: string) => Promise<void>): voi
 export async function startDaemon(options: {
   verbose?: boolean;
   healthPort?: number;
+  /**
+   * Bind host for the agent's health/metrics/plugin HTTP server.
+   * Default '127.0.0.1' (loopback only). Operators who genuinely need
+   * network exposure must set this to '0.0.0.0' explicitly via config
+   * and accept that the endpoints (including plugin routes and update
+   * triggers) are not authenticated today.
+   */
+  healthHost?: string;
   exec?: ExecConfig;
   pluginAutoUpdateService?: PluginAutoUpdateService | null;
   npmAutoUpdateService?: NpmAutoUpdateService | null;
@@ -405,7 +413,11 @@ export async function startDaemon(options: {
   const skipHttpServer = tlsEnabledForSkipCheck && options.tls?.keepHttpServer === false;
   if (options.healthPort && !skipHttpServer) {
     try {
-      await startHealthServer(options.healthPort, pluginLoader ?? undefined);
+      await startHealthServer(
+        options.healthPort,
+        pluginLoader ?? undefined,
+        options.healthHost ?? '127.0.0.1'
+      );
     } catch (err) {
       log.error({ err }, 'Failed to start health server');
     }
@@ -442,7 +454,8 @@ export async function startDaemon(options: {
           httpsPort,
           certPath,
           keyPath,
-          pluginLoader ?? undefined
+          pluginLoader ?? undefined,
+          options.healthHost ?? '127.0.0.1'
         );
 
         if (httpsServer) {

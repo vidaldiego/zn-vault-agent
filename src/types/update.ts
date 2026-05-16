@@ -28,7 +28,12 @@ export interface UpdateConfig {
 }
 
 export const DEFAULT_UPDATE_CONFIG: UpdateConfig = {
-  enabled: true,
+  // Production-safe default: disabled. Auto-updating a long-running daemon
+  // from npm is a supply-chain risk (no code signing on the upstream
+  // package). Opt-in via config: set `update.enabled = true` in
+  // /etc/zn-vault-agent/config.json or ZNVAULT_UPDATE_ENABLED=true after
+  // an internal gating process is in place.
+  enabled: false,
   checkIntervalMs: 5 * 60 * 1000, // 5 minutes
   channel: 'latest',
   stagedRolloutMaxDelayMs: 30 * 60 * 1000, // 30 minutes max delay for staged rollout
