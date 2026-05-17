@@ -127,6 +127,27 @@ function writeSecretFile(
 }
 
 /**
+ * Decide whether deploySecret can short-circuit. Trusting lastVersion
+ * alone is unsafe: tmpfs output paths get wiped on host reboot while
+ * lastVersion persists in config.json, so skipping leaves the consumer
+ * with no file. Check the output exists too (when there is one).
+ */
+export function shouldSkipDeploy(
+  target: Pick<SecretTarget, 'lastVersion' | 'format' | 'output'>,
+  remoteVersion: number,
+  fileExists: (path: string) => boolean = fs.existsSync,
+): boolean {
+  if (target.lastVersion !== remoteVersion) return false;
+  // 'none' format is subscribe-only — no file on disk to check.
+  if (target.format === 'none') return true;
+  // Any other format must have an output path; if it's missing or the
+  // file is gone, re-deploy. The output? guard mirrors the later
+  // `Output path required` throw — let that throw fire when we're
+  // actually deploying.
+  return Boolean(target.output) && fileExists(target.output as string);
+}
+
+/**
  * Deploy a single secret target
  */
 export async function deploySecret(
@@ -142,7 +163,7 @@ export async function deploySecret(
     const secret = await getSecret(target.secretId);
 
     // Check if update needed (unless forced)
-    if (!force && target.lastVersion === secret.version) {
+    if (!force && shouldSkipDeploy(target, secret.version)) {
       return {
         success: true,
         secretId: target.secretId,
