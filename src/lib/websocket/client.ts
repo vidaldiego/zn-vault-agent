@@ -25,6 +25,7 @@ import { buildWebSocketUrl, maskSensitiveUrl } from './connection.js';
 import { HeartbeatManager } from './heartbeat.js';
 import { ReconnectManager } from './reconnect.js';
 import { MessageDispatcher } from './dispatcher.js';
+import { ManagedTimer } from '../../utils/timer.js';
 
 // Graceful shutdown state (shared across clients)
 let isShuttingDown = false;
@@ -74,6 +75,14 @@ export function createUnifiedWebSocketClient(
   let wasConnectedBefore = false;
   let wsListeners: WebSocketListeners | null = null;
 
+  // Healthy-connection tracking: a socket opening is NOT success (the server
+  // may close it with 4001 right after the handshake). The reconnect attempt
+  // counter is only reset once we received a server ack AND the connection
+  // survived HEALTHY_CONNECTION_THRESHOLD. See INC-2026-06-12-01.
+  const healthyConnectionTimer = new ManagedTimer();
+  let serverAckReceived = false;
+  let healthyThresholdElapsed = false;
+
   // Create managers
   const heartbeatManager = new HeartbeatManager({
     onStaleConnection: () => { forceReconnect('pong_timeout'); },
@@ -88,6 +97,38 @@ export function createUnifiedWebSocketClient(
     managedKeyNames,
     onPongReceived: () => { heartbeatManager.onPongReceived(); },
   });
+
+  // Internal subscription: the dispatcher fires connect handlers when the
+  // server acknowledges us (registered message). connection_established also
+  // counts as an ack and is detected via dispatcher.getAgentId().
+  dispatcher.onConnect(() => {
+    serverAckReceived = true;
+    maybeMarkConnectionHealthy();
+  });
+
+  /**
+   * Reset healthy-connection tracking (called on open/close/disconnect).
+   */
+  function resetHealthyTracking(): void {
+    healthyConnectionTimer.clear();
+    serverAckReceived = false;
+    healthyThresholdElapsed = false;
+  }
+
+  /**
+   * Reset the reconnect attempt counter once the connection has proven
+   * itself: server ack received AND open beyond HEALTHY_CONNECTION_THRESHOLD.
+   */
+  function maybeMarkConnectionHealthy(): void {
+    if (!healthyThresholdElapsed) return;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    // connection_established sets the agentId without firing connect
+    // handlers, so accept it as a server ack too.
+    if (!serverAckReceived && dispatcher.getAgentId() === null) return;
+
+    log.debug({ ws: 'unified' }, 'Connection healthy - resetting reconnect attempts');
+    reconnectManager.resetAttempts();
+  }
 
   /**
    * Attach event listeners to WebSocket and store references for cleanup.
@@ -130,6 +171,8 @@ export function createUnifiedWebSocketClient(
    */
   function forceReconnect(reason: string): void {
     log.info({ ws: 'unified', reason }, 'Forcing WebSocket reconnect');
+
+    resetHealthyTracking();
 
     try {
       heartbeatManager.stop();
@@ -204,7 +247,19 @@ export function createUnifiedWebSocketClient(
   function handleOpen(): void {
     const isReconnect = wasConnectedBefore;
     wasConnectedBefore = true;
-    reconnectManager.resetAttempts();
+
+    // Do NOT reset reconnect attempts here. A TCP/TLS-level open is not a
+    // successful connection - the server may still close with 4001
+    // (Unauthorized) immediately after the handshake. Resetting here caused
+    // a tight connect->4001->reconnect loop (INC-2026-06-12-01). Attempts
+    // are reset only once the connection proves healthy (server ack + open
+    // beyond HEALTHY_CONNECTION_THRESHOLD) or a fresh key bind succeeds.
+    resetHealthyTracking();
+    healthyConnectionTimer.setTimeout(() => {
+      healthyThresholdElapsed = true;
+      maybeMarkConnectionHealthy();
+    }, WS_CONSTANTS.HEALTHY_CONNECTION_THRESHOLD);
+
     if (ws) {
       heartbeatManager.start(ws);
     }
@@ -260,6 +315,7 @@ export function createUnifiedWebSocketClient(
       log.warn({ err }, 'Failed to stop heartbeat manager during close');
     }
 
+    resetHealthyTracking();
     setWebSocketStatus(false);
     setSecretWebSocketStatus(false);
     metrics.wsDisconnected();
@@ -268,6 +324,13 @@ export function createUnifiedWebSocketClient(
     const reasonStr = reason.length > 0 ? reason.toString() : `Code: ${code}`;
     log.warn({ ws: 'unified', code, reason: reasonStr }, 'WebSocket disconnected');
     dispatcher.fireDisconnect(reasonStr);
+
+    // Auth-rejection close family (4000-4099): the server accepted the
+    // socket but refused our credentials. These MUST count as failed
+    // attempts with growing backoff - retrying quickly with the same
+    // rejected key only hammers the server and keeps refreshing IP
+    // quarantines (INC-2026-06-12-01).
+    const isAuthRejectionClose = code >= 4000 && code <= 4099;
 
     // Check for authentication failure (code 4001 = Unauthorized)
     // This happens when the agent's API key is stale/expired/revoked
@@ -278,9 +341,12 @@ export function createUnifiedWebSocketClient(
       // Previously this was fire-and-forget which could cause reconnect with stale credentials
       handleAuthFailureRecovery().catch((err: unknown) => {
         log.error({ err }, 'Auth failure recovery threw exception');
-        // Still try to reconnect with backoff
-        reconnectManager.schedule();
+        // Still try to reconnect with auth-failure backoff
+        reconnectManager.schedule({ authFailure: true });
       });
+    } else if (isAuthRejectionClose) {
+      log.warn({ ws: 'unified', code }, 'WebSocket closed with auth-rejection code - scheduling reconnect with auth backoff');
+      reconnectManager.schedule({ authFailure: true });
     } else {
       log.info({ ws: 'unified', shouldReconnect: reconnectManager.isEnabled(), isShuttingDown }, 'Triggering reconnect from close handler');
       reconnectManager.schedule();
@@ -292,12 +358,14 @@ export function createUnifiedWebSocketClient(
    * Attempts to refresh managed key credentials before reconnecting.
    */
   async function handleAuthFailureRecovery(): Promise<void> {
+    let recovered = false;
     try {
-      const recovered = await notifyManagedKeyAuthFailure();
+      recovered = await notifyManagedKeyAuthFailure();
 
       if (recovered) {
         log.info({ ws: 'unified' }, 'Managed key recovered successfully');
-        // Reset reconnect attempts since we have a fresh key
+        // An authenticated bind just succeeded with a fresh key, so a quick
+        // retry is justified - this is the only auth-path reset allowed.
         reconnectManager.resetAttempts();
       } else {
         log.error({ ws: 'unified' }, 'Managed key recovery failed - using exponential backoff');
@@ -308,8 +376,8 @@ export function createUnifiedWebSocketClient(
       // Don't reset attempts - use backoff for errors
     }
 
-    log.info({ ws: 'unified', shouldReconnect: reconnectManager.isEnabled(), isShuttingDown }, 'Triggering reconnect after auth recovery');
-    reconnectManager.schedule();
+    log.info({ ws: 'unified', recovered, shouldReconnect: reconnectManager.isEnabled(), isShuttingDown }, 'Triggering reconnect after auth recovery');
+    reconnectManager.schedule(recovered ? undefined : { authFailure: true });
   }
 
   /**
@@ -325,6 +393,7 @@ export function createUnifiedWebSocketClient(
    */
   function disconnect(): void {
     reconnectManager.disable();
+    resetHealthyTracking();
 
     try {
       heartbeatManager.stop();

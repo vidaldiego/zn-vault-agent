@@ -153,8 +153,22 @@ export interface UnifiedWebSocketClient {
 export const WS_CONSTANTS = {
   /** Maximum delay between reconnection attempts (ms) */
   MAX_RECONNECT_DELAY: 30000,
+  /**
+   * Maximum delay between reconnection attempts after an auth-rejection
+   * close (4000-4099). Much higher than MAX_RECONNECT_DELAY: retrying with
+   * a key the server just rejected cannot succeed quickly, and tight retry
+   * loops perpetually refresh server-side IP quarantines (INC-2026-06-12-01).
+   */
+  MAX_AUTH_RECONNECT_DELAY: 300000,
   /** Initial delay for first reconnection attempt (ms) */
   INITIAL_RECONNECT_DELAY: 500,
+  /**
+   * How long a connection must stay open (after a server ack) before it is
+   * considered "healthy" and the reconnect attempt counter is reset.
+   * A socket merely opening is NOT success - the server may still close it
+   * with 4001 immediately after the handshake.
+   */
+  HEALTHY_CONNECTION_THRESHOLD: 30000,
   /** Interval between heartbeat pings (ms) */
   HEARTBEAT_INTERVAL: 15000,
   /** Timeout for pong response (ms) */
