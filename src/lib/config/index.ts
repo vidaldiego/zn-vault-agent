@@ -45,6 +45,9 @@ export {
   updateManagedKey,
   isManagedKeyMode,
   syncManagedKeyFile,
+  type ManagedKeySyncResult,
+  type ManagedKeyProbe,
+  type ManagedKeyProbeResult,
 } from './managed-key.js';
 
 // Vault config loader (config-from-vault mode)

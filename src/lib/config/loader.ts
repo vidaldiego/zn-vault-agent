@@ -14,6 +14,79 @@ import { getConfigFile, userConfig } from './storage.js';
 let inMemoryConfig: AgentConfig | null = null;
 
 /**
+ * Once-flag for the system-config shadowing warning, so the hot loadConfig()
+ * path only logs it once per process (effectively: at startup).
+ */
+let shadowWarningEmitted = false;
+
+/**
+ * Test seam: re-arm the shadowing warning.
+ */
+export function resetShadowWarningForTesting(): void {
+  shadowWarningEmitted = false;
+}
+
+/**
+ * Extract the fields that matter for detecting a meaningful divergence
+ * between the system config and the user config.
+ */
+function significantConfigFields(config: Partial<AgentConfig>): string {
+  return JSON.stringify({
+    vaultUrl: config.vaultUrl ?? '',
+    tenantId: config.tenantId ?? '',
+    apiKey: config.auth?.apiKey,
+    managedKeyName: config.managedKey?.name,
+  });
+}
+
+/**
+ * Warn (once) when a read-only system config is shadowing a writable user
+ * config that holds different values.
+ *
+ * Why this matters (INC-2026-06-12-01): loadConfig() READS the system config
+ * with precedence, but saveConfig() falls back to the user config when the
+ * system config is not writable. After a key rotation the fresh key lands in
+ * the user config while every subsequent load keeps returning the stale
+ * root-owned system config - silently running on dead credentials.
+ */
+function warnIfSystemConfigShadowsUserConfig(
+  systemConfigPath: string,
+  systemConfig: Partial<AgentConfig>
+): void {
+  if (shadowWarningEmitted) return;
+
+  // With a custom config dir, the user-config fallback is disabled entirely
+  // (both load and save use the custom dir), so shadowing cannot occur.
+  if (process.env.ZNVAULT_AGENT_CONFIG_DIR) return;
+
+  // Only relevant when the system config cannot be written by this process.
+  try {
+    fs.accessSync(systemConfigPath, fs.constants.W_OK);
+    return; // writable - saveConfig would update it, no shadowing
+  } catch {
+    // not writable - continue
+  }
+
+  // Only warn if a user config exists with meaningful content...
+  if (!fs.existsSync(userConfig.path)) return;
+  const userStore = userConfig.store as Partial<AgentConfig>;
+  if (!userStore.vaultUrl && !userStore.auth?.apiKey) return;
+
+  // ...and it actually differs from what the system config provides.
+  if (significantConfigFields(systemConfig) === significantConfigFields(userStore)) return;
+
+  shadowWarningEmitted = true;
+  log.warn({
+    systemConfigPath,
+    userConfigPath: userConfig.path,
+  }, 'READ-ONLY SYSTEM CONFIG IS SHADOWING A DIFFERENT USER CONFIG: ' +
+     `loadConfig() reads ${systemConfigPath} (not writable by this process) with precedence, ` +
+     `but saveConfig() writes to ${userConfig.path}. Values saved at runtime (e.g. rotated ` +
+     'managed API keys) are being IGNORED on load. Make the system config writable, delete it, ' +
+     'or fold the user config values into it.');
+}
+
+/**
  * Load configuration from file or user config, with environment variable overrides.
  * If setConfigInMemory() has been called (config-from-vault mode), returns the
  * in-memory config instead of loading from disk.
@@ -61,6 +134,7 @@ export function loadConfig(): AgentConfig {
         secretTargets: parsed.secretTargets ?? [],
       };
       log.debug({ path: configFile }, 'Loaded system config');
+      warnIfSystemConfigShadowsUserConfig(configFile, parsed);
     } catch (err) {
       log.error({ err, path: configFile }, 'Failed to load system config');
       // If custom config dir is set, use empty config instead of userConfig

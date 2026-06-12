@@ -6,8 +6,9 @@ import path from 'node:path';
 import { configLogger as log } from '../logger.js';
 import { chownSafe } from '../../utils/shell.js';
 import { validateOutputPath } from '../../utils/path.js';
-import { loadConfig } from './loader.js';
+import { loadConfig, isConfigInMemory } from './loader.js';
 import { saveConfig } from './saver.js';
+import { getConfigFile, userConfig } from './storage.js';
 
 /**
  * Write managed key to file using paranoid-level durability guarantees.
@@ -214,11 +215,78 @@ export function isManagedKeyMode(): boolean {
 }
 
 /**
+ * Result of probing a candidate key against the vault.
+ * Mirrors ApiKeyProbeResult in lib/api.ts (kept structural to avoid a
+ * static import cycle: api.ts -> config barrel -> managed-key.ts).
+ */
+export type ManagedKeyProbeResult = 'valid' | 'invalid' | 'unknown';
+
+/**
+ * Probe function signature - injectable for tests.
+ */
+export type ManagedKeyProbe = (key: string) => Promise<ManagedKeyProbeResult>;
+
+/**
+ * Default probe: lazily imports the API client to verify a key against the
+ * vault. The dynamic import avoids a static api.ts <-> config cycle.
+ */
+async function defaultKeyProbe(key: string): Promise<ManagedKeyProbeResult> {
+  try {
+    const { probeApiKey } = await import('../api.js');
+    return await probeApiKey(key);
+  } catch (err) {
+    log.warn({ err }, 'Managed key probe unavailable - treating result as unknown');
+    return 'unknown';
+  }
+}
+
+/**
+ * Describe where the in-memory config API key value came from, for
+ * diagnostics when the config value turns out to be stale.
+ */
+function describeApiKeySource(): string {
+  if (process.env.ZNVAULT_API_KEY) {
+    return 'environment variable ZNVAULT_API_KEY';
+  }
+  if (isConfigInMemory()) {
+    return 'in-memory config (config-from-vault mode)';
+  }
+  const configFile = getConfigFile();
+  if (fs.existsSync(configFile)) {
+    return `config file ${configFile}`;
+  }
+  return `user config ${userConfig.path}`;
+}
+
+/**
+ * Result of a managed key file sync attempt.
+ */
+export interface ManagedKeySyncResult {
+  synced: boolean;
+  wasOutOfSync: boolean;
+  recoveredFromBackup?: boolean;
+  /** The existing on-disk key was kept because the config value failed verification. */
+  keptExistingFile?: boolean;
+  /** The config key value was explicitly rejected by the vault (stale config). */
+  staleConfigValue?: boolean;
+  error?: string;
+}
+
+/**
  * Verify and sync managed key file on startup.
  * Includes backup recovery if main file is corrupted/missing.
- * Returns true if file was in sync or successfully synced, false if sync failed.
+ *
+ * SAFETY (INC-2026-06-12-01): before overwriting a valid-looking on-disk key
+ * with a *different* value from config, the config value is probed against
+ * the vault. If the vault rejects it, the on-disk file is preserved - a
+ * stale read-only system config must never clobber a working key file.
+ *
+ * @param options.probeKey - Injectable key probe (defaults to the vault API
+ *   self-info endpoint). Tests can inject a mock.
  */
-export function syncManagedKeyFile(): { synced: boolean; wasOutOfSync: boolean; recoveredFromBackup?: boolean; error?: string } {
+export async function syncManagedKeyFile(
+  options?: { probeKey?: ManagedKeyProbe }
+): Promise<ManagedKeySyncResult> {
   const config = loadConfig();
 
   if (!config.managedKey?.filePath) {
@@ -268,6 +336,36 @@ export function syncManagedKeyFile(): { synced: boolean; wasOutOfSync: boolean; 
         backupPrefix: backupKey.substring(0, 20),
         expectedPrefix: expectedKey.substring(0, 20),
       }, 'Backup exists but does not match expected key - using expected key');
+    }
+  }
+
+  // SAFETY GATE: the file contains a valid-looking key that differs from the
+  // config value. Verify the config value still authenticates BEFORE
+  // clobbering the file. In INC-2026-06-12-01 a stale read-only system
+  // config overwrote a freshly rotated, working key file on every daemon
+  // start, locking the agent out for hours.
+  if (currentKey?.startsWith('znv_')) {
+    const probe = options?.probeKey ?? defaultKeyProbe;
+    const probeResult = await probe(expectedKey);
+
+    if (probeResult === 'invalid') {
+      log.error({
+        path: filePath,
+        configKeyPrefix: expectedKey.substring(0, 20),
+        fileKeyPrefix: currentKey.substring(0, 20),
+        configSource: describeApiKeySource(),
+      }, 'Managed key file differs from config, but the config key FAILED vault authentication - ' +
+         'NOT overwriting the key file. The config value is stale (it came from ' +
+         describeApiKeySource() + '); the on-disk key is likely the freshly rotated one. ' +
+         'Update the config source or remove the stale read-only config file.');
+      return { synced: true, wasOutOfSync: true, keptExistingFile: true, staleConfigValue: true };
+    }
+
+    if (probeResult === 'unknown') {
+      log.warn({
+        path: filePath,
+        configSource: describeApiKeySource(),
+      }, 'Could not verify config key against vault (unreachable) - proceeding with auto-fix as before');
     }
   }
 

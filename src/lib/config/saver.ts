@@ -45,8 +45,15 @@ export function saveConfig(config: AgentConfig): void {
       log.debug({ path: configFile }, 'Config saved (system config)');
       return;
     } catch {
-      // File exists but not writable, fall through to user config
-      log.debug({ path: configFile }, 'System config not writable, using user config');
+      // File exists but not writable, fall through to user config.
+      // WARN (not debug): this creates a split-brain where saves land in the
+      // user config but loadConfig() keeps reading the read-only system
+      // config with precedence - saved values are silently ignored on the
+      // next load (INC-2026-06-12-01).
+      log.warn({
+        systemConfigPath: configFile,
+        userConfigPath: userConfig.path,
+      }, 'System config not writable - saving to user config instead. The read-only system config will keep shadowing these values on load.');
     }
   }
 

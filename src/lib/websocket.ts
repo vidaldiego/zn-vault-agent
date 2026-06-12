@@ -222,9 +222,13 @@ export async function startDaemon(options: {
   const managedKeySyncRequired = process.env.MANAGED_KEY_SYNC_REQUIRED !== 'false';
 
   if (config.managedKey?.filePath) {
-    const syncResult = syncManagedKeyFile();
+    const syncResult = await syncManagedKeyFile();
     if (syncResult.wasOutOfSync) {
-      if (syncResult.synced) {
+      if (syncResult.keptExistingFile) {
+        log.error({
+          filePath: config.managedKey.filePath,
+        }, 'Managed key file differs from config but config key is STALE (failed vault auth) - kept existing key file. Fix the config source.');
+      } else if (syncResult.synced) {
         log.warn({
           filePath: config.managedKey.filePath,
         }, 'Managed key file was out of sync - auto-fixed on startup');
@@ -261,7 +265,7 @@ export async function startDaemon(options: {
 
   // Track all managed key names (exec + plugins + agent's own key)
   // This is populated after plugins are loaded
-  let allManagedKeyNames: string[] = [...execManagedKeyNames];
+  const allManagedKeyNames: string[] = [...execManagedKeyNames];
 
   // Add agent's own managed key if configured
   if (config.managedKey?.name) {
@@ -1005,20 +1009,28 @@ export async function startDaemon(options: {
     keySyncTimer = setInterval(() => {
       if (getIsShuttingDown()) return;
 
-      const syncResult = syncManagedKeyFile();
-      if (syncResult.wasOutOfSync) {
-        if (syncResult.synced) {
-          log.warn({
-            filePath: managedKeyFilePath,
-          }, 'Periodic check: Managed key file was out of sync - auto-fixed');
-        } else {
-          log.error({
-            filePath: managedKeyFilePath,
-            error: syncResult.error,
-          }, 'Periodic check: CRITICAL - Managed key file sync failed');
+      void (async () => {
+        const syncResult = await syncManagedKeyFile();
+        if (syncResult.wasOutOfSync) {
+          if (syncResult.keptExistingFile) {
+            log.error({
+              filePath: managedKeyFilePath,
+            }, 'Periodic check: config key is STALE (failed vault auth) - kept existing key file');
+          } else if (syncResult.synced) {
+            log.warn({
+              filePath: managedKeyFilePath,
+            }, 'Periodic check: Managed key file was out of sync - auto-fixed');
+          } else {
+            log.error({
+              filePath: managedKeyFilePath,
+              error: syncResult.error,
+            }, 'Periodic check: CRITICAL - Managed key file sync failed');
+          }
         }
-      }
-      // Don't log on success - too noisy
+        // Don't log on success - too noisy
+      })().catch((err: unknown) => {
+        log.error({ err, filePath: managedKeyFilePath }, 'Periodic managed key sync check threw');
+      });
     }, KEY_SYNC_INTERVAL);
 
     log.info({ intervalMs: KEY_SYNC_INTERVAL }, 'Periodic managed key file sync check enabled');

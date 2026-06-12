@@ -524,6 +524,67 @@ export async function getApiKeySelf(): Promise<ApiKeySelfInfo> {
 }
 
 /**
+ * Result of probing a specific API key value against the vault.
+ * - 'valid':   the key authenticated successfully
+ * - 'invalid': the vault explicitly rejected the key (401/403)
+ * - 'unknown': the vault could not be reached or answered ambiguously
+ */
+export type ApiKeyProbeResult = 'valid' | 'invalid' | 'unknown';
+
+/**
+ * Probe whether a specific API key value still authenticates against the
+ * vault, using the cheap authenticated self-info endpoint.
+ *
+ * Unlike request(), this sends an explicit key (NOT the one from loadConfig)
+ * and performs a single attempt with no retries. It never throws: callers
+ * use the tri-state result to decide whether a candidate key is safe to
+ * persist (e.g. before auto-fixing the managed key file from a possibly
+ * stale config value - see INC-2026-06-12-01).
+ */
+export async function probeApiKey(key: string): Promise<ApiKeyProbeResult> {
+  const config = loadConfig();
+
+  if (!config.vaultUrl) {
+    log.warn('Cannot probe API key - vault URL not configured');
+    return 'unknown';
+  }
+
+  const url = new URL(config.vaultUrl);
+  url.pathname = '/auth/api-keys/self';
+
+  const requestOptions: https.RequestOptions = {
+    hostname: url.hostname,
+    port: url.port || (url.protocol === 'https:' ? 443 : 80),
+    path: url.pathname,
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+      'X-API-Key': key,
+    },
+    timeout: 10000,
+    rejectUnauthorized: !config.insecure,
+  };
+
+  try {
+    const result = await executeRequest(requestOptions, undefined, url.protocol === 'https:');
+
+    if (result.statusCode >= 200 && result.statusCode < 300) {
+      return 'valid';
+    }
+    if (result.statusCode === 401 || result.statusCode === 403) {
+      log.warn({ status: result.statusCode, keyPrefix: key.substring(0, 8) }, 'API key probe rejected by vault');
+      return 'invalid';
+    }
+
+    log.warn({ status: result.statusCode }, 'API key probe returned ambiguous status');
+    return 'unknown';
+  } catch (err) {
+    log.warn({ err: err instanceof Error ? err.message : String(err) }, 'API key probe failed (network error)');
+    return 'unknown';
+  }
+}
+
+/**
  * Bootstrap response - same format as managed key bind
  */
 export interface BootstrapResponse {

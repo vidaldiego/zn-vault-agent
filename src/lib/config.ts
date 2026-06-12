@@ -46,4 +46,7 @@ export {
 export type {
   FetchConfigOptions,
   FetchConfigResult,
+  ManagedKeySyncResult,
+  ManagedKeyProbe,
+  ManagedKeyProbeResult,
 } from './config/index.js';
