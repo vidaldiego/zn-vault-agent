@@ -55,6 +55,15 @@ describe('NpmAutoUpdateService', () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
 
+    // Default: run as root. Root short-circuits the updater-unit strategy
+    // (Fix C) and takes the direct `npm install -g` path, which is what these
+    // legacy install/verify/rollback/health-check tests exercise. The Fix C
+    // strategy tests below override process.getuid explicitly per case.
+    if (typeof process.getuid !== 'function') {
+      (process as { getuid?: () => number }).getuid = () => 0;
+    }
+    vi.spyOn(process, 'getuid').mockReturnValue(0);
+
     // Default mock: package.json returns current version
     vi.mocked(readFileSync).mockImplementation((path: unknown) => {
       if (String(path).includes('package.json')) {
@@ -989,6 +998,165 @@ describe('NpmAutoUpdateService', () => {
       expect(installCalls.length).toBe(1);
 
       // Should NOT restart (health check failed)
+      expect(killSpy).not.toHaveBeenCalled();
+
+      killSpy.mockRestore();
+    });
+  });
+
+  describe('performUpdate install strategy (Fix C)', () => {
+    // performUpdate is private; cast to an indexable shape to invoke it
+    // directly for a focused unit test of the install strategy.
+    interface PerformUpdateAccessor {
+      performUpdate(targetVersion: string): Promise<boolean>;
+    }
+
+    let getuidSpy: ReturnType<typeof vi.spyOn> | undefined;
+
+    function mockUid(uid: number): void {
+      // process.getuid may be undefined on some platforms; define it so it
+      // can be spied/stubbed deterministically.
+      if (typeof process.getuid !== 'function') {
+        (process as { getuid?: () => number }).getuid = () => uid;
+      }
+      getuidSpy = vi.spyOn(process, 'getuid').mockReturnValue(uid);
+    }
+
+    afterEach(() => {
+      getuidSpy?.mockRestore();
+      getuidSpy = undefined;
+    });
+
+    it('non-root + updater unit present: starts the unit, does not run npm/sudo install', async () => {
+      mockUid(1000); // non-root
+
+      const commands: string[] = [];
+      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        const c = String(cmd);
+        commands.push(c);
+        if (c.includes('npm cache clean')) {
+          cb(null, { stdout: '', stderr: '' });
+        } else if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
+          cb(null, { stdout: '[Unit]\n', stderr: '' }); // unit exists
+        } else if (c.includes('systemctl start zn-vault-agent-updater.service')) {
+          cb(null, { stdout: '', stderr: '' });
+        } else {
+          cb(null, { stdout: '', stderr: '' });
+        }
+        return {} as ReturnType<typeof exec>;
+      });
+
+      const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
+      const restartHandledExternally = await (service as unknown as PerformUpdateAccessor).performUpdate('1.4.0');
+
+      expect(commands.some((c) => c.includes('systemctl start zn-vault-agent-updater.service'))).toBe(true);
+      expect(commands.some((c) => /(^|\s)npm install -g/.test(c))).toBe(false);
+      expect(commands.some((c) => c.includes('sudo npm install -g'))).toBe(false);
+      // The unit's ExecStartPost restarts the agent, so the caller must not.
+      expect(restartHandledExternally).toBe(true);
+    });
+
+    it('root: runs npm install -g directly (no sudo, no systemctl start)', async () => {
+      mockUid(0); // root
+
+      const commands: string[] = [];
+      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        commands.push(String(cmd));
+        cb(null, { stdout: '', stderr: '' });
+        return {} as ReturnType<typeof exec>;
+      });
+
+      const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
+      const restartHandledExternally = await (service as unknown as PerformUpdateAccessor).performUpdate('1.4.0');
+
+      const installCmd = commands.find((c) => c.includes('npm install -g'));
+      expect(installCmd).toBeDefined();
+      expect(installCmd).not.toContain('sudo ');
+      expect(commands.some((c) => c.includes('systemctl start'))).toBe(false);
+      // Root path keeps the old flow: caller verifies + restarts.
+      expect(restartHandledExternally).toBe(false);
+    });
+
+    it('non-root + no updater unit: falls back to sudo npm install -g', async () => {
+      mockUid(1000); // non-root
+
+      const commands: string[] = [];
+      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        const c = String(cmd);
+        commands.push(c);
+        if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
+          const err = new Error('No such file or directory');
+          cb(err, { stdout: '', stderr: 'No files found for zn-vault-agent-updater.service.' });
+        } else {
+          cb(null, { stdout: '', stderr: '' });
+        }
+        return {} as ReturnType<typeof exec>;
+      });
+
+      const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
+      const restartHandledExternally = await (service as unknown as PerformUpdateAccessor).performUpdate('1.4.0');
+
+      expect(commands.some((c) => c.includes('sudo npm install -g'))).toBe(true);
+      expect(commands.some((c) => c.includes('systemctl start zn-vault-agent-updater.service'))).toBe(false);
+      // Fallback path keeps the old flow: caller verifies + restarts.
+      expect(restartHandledExternally).toBe(false);
+    });
+  });
+
+  describe('triggerUpdate restart delegation (Fix C)', () => {
+    interface HasUpdaterAccessor {
+      hasUpdaterUnit(): Promise<boolean>;
+    }
+
+    let getuidSpy: ReturnType<typeof vi.spyOn> | undefined;
+
+    function mockUid(uid: number): void {
+      if (typeof process.getuid !== 'function') {
+        (process as { getuid?: () => number }).getuid = () => uid;
+      }
+      getuidSpy = vi.spyOn(process, 'getuid').mockReturnValue(uid);
+    }
+
+    afterEach(() => {
+      getuidSpy?.mockRestore();
+      getuidSpy = undefined;
+    });
+
+    it('non-root + updater unit: triggerUpdate reports willRestart and skips self verify+restart', async () => {
+      mockUid(1000); // non-root
+      vi.mocked(existsSync).mockReturnValue(false); // no lock file
+
+      const commands: string[] = [];
+      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        const c = String(cmd);
+        commands.push(c);
+        if (c.includes('npm view')) {
+          cb(null, { stdout: '1.4.0\n', stderr: '' });
+        } else if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
+          cb(null, { stdout: '[Unit]\n', stderr: '' });
+        } else {
+          cb(null, { stdout: '', stderr: '' });
+        }
+        return {} as ReturnType<typeof exec>;
+      });
+
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+      const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
+      // Sanity: the unit-detection helper exists and resolves true.
+      await expect((service as unknown as HasUpdaterAccessor).hasUpdaterUnit()).resolves.toBe(true);
+
+      const result = await service.triggerUpdate();
+
+      expect(result.success).toBe(true);
+      expect(result.willRestart).toBe(true);
+      // Delegated to the unit: the agent must NOT self-verify (npm list) or
+      // self-restart (SIGTERM) — the unit's ExecStartPost handles that.
+      expect(commands.some((c) => c.includes('npm list'))).toBe(false);
       expect(killSpy).not.toHaveBeenCalled();
 
       killSpy.mockRestore();
