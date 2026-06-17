@@ -43,10 +43,27 @@ require_root_or_sudo() {
   fi
 }
 
+# Resolve the installed agent version WITHOUT assuming a health port. Not all
+# agents run the :9100 deploy-agent health server (only Payara hosts do); infra
+# agents (haproxy/minio proxies) don't. The binary + npm are the universal source
+# of truth. The HTTP health endpoint is used only as an optional liveness signal.
 agent_version() {
+  local v=""
+  # 1. the installed binary itself
+  v="$(zn-vault-agent --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  if [ -n "$v" ]; then echo "$v"; return; fi
+  # 2. npm global record
+  v="$(npm list -g @zincapp/zn-vault-agent --depth=0 2>/dev/null | grep -oE '@[0-9]+\.[0-9]+\.[0-9]+' | head -1 | tr -d '@' || true)"
+  if [ -n "$v" ]; then echo "$v"; return; fi
+  # 3. fall back to the health endpoint (Payara hosts)
   curl -s --max-time 5 "$HEALTH_URL" 2>/dev/null \
     | python3 -c 'import sys,json; print(json.load(sys.stdin).get("version",""))' 2>/dev/null \
     || echo ""
+}
+
+# Is the agent service running? (universal liveness, no port assumption)
+agent_active() {
+  systemctl is-active "$AGENT_UNIT" 2>/dev/null
 }
 
 # semver-ish compare: returns 0 if $1 >= $2
@@ -109,7 +126,8 @@ main() {
     ok "${UPDATER_UNIT} ran (Result=success)"
   fi
 
-  # --- Step 3: verify the agent is healthy on the fixed version ---
+  # --- Step 3: verify the agent is on the fixed version + the service is up ---
+  # Verify via the binary/npm (works on EVERY host shape), not a health port.
   local after="" tries=0
   while [ "$tries" -lt 15 ]; do
     after="$(agent_version)"
@@ -118,16 +136,24 @@ main() {
   done
 
   if [ -z "$after" ]; then
-    die "agent health endpoint not responding after bootstrap — check: systemctl status ${AGENT_UNIT}; journalctl -u ${AGENT_UNIT}"
+    die "could not determine installed agent version after bootstrap (zn-vault-agent --version / npm both empty) — check: journalctl -u ${UPDATER_UNIT}"
   fi
   if ! version_ge "$after" "$MIN_FIXED_VERSION"; then
     die "agent is on ${after}, expected >= ${MIN_FIXED_VERSION} — bootstrap did not take. Check npm latest dist-tag and ${UPDATER_UNIT} logs."
   fi
 
-  local status
-  status="$(curl -s --max-time 5 "$HEALTH_URL" 2>/dev/null \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("status",""))' 2>/dev/null || echo "")"
-  ok "agent now on ${after} (status: ${status:-?})"
+  # Confirm the service came back up after the unit's try-restart.
+  local active="" atries=0
+  while [ "$atries" -lt 10 ]; do
+    active="$(agent_active)"
+    [ "$active" = "active" ] && break
+    sleep 2; atries=$((atries + 1))
+  done
+  if [ "$active" != "active" ]; then
+    die "agent installed (${after}) but the service is '${active:-inactive}' — check: systemctl status ${AGENT_UNIT}; journalctl -u ${AGENT_UNIT}"
+  fi
+
+  ok "agent now on ${after} (service: ${active})"
   printf '\n\033[32m✓ %s bootstrapped: %s, sudoers provisioned. Operator-initiated updates will work going forward.\033[0m\n' "$host" "$after"
 }
 
