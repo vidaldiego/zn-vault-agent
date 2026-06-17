@@ -2,6 +2,11 @@
 
 This guide helps you choose the right configuration approach and understand the key concepts.
 
+> Once an agent is running, see
+> [OPERATIONS_RUNBOOK.md](OPERATIONS_RUNBOOK.md) for fleet health
+> checks, the `lastSync` persistence quirk, persistent-vs-ephemeral
+> state, and server-side inspection commands.
+
 ## Quick Start: Choose Your Path
 
 ```

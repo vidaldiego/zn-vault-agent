@@ -115,6 +115,7 @@ import type {
   ApiKeyRotationEvent,
   HostConfigEvent,
 } from './websocket/index.js';
+import { handleUpdateEvent } from './websocket/update-handler.js';
 
 // Track active deployments for graceful shutdown
 let activeDeployments = 0;
@@ -659,10 +660,16 @@ export async function startDaemon(options: {
     });
   });
 
-  // Handle update events
+  // Handle update events (operator-initiated update-available from vault).
+  // The dispatcher fires this for top-level {type:'update-available',...} messages
+  // (and the legacy {type:'event', topic:'updates'} path). Drive the manual,
+  // gate-bypassing update path so updates work even when the automatic periodic
+  // checker is off (AUTO_UPDATE=false default). Fire-and-handle like the other
+  // async handlers - handleUpdateEvent never throws, but .catch() defensively.
   unifiedClient.onUpdateEvent((event) => {
-    log.info({ version: event.version, channel: event.channel }, 'Update available');
-    // Auto-update handling is done by auto-update service
+    handleUpdateEvent(event, options.npmAutoUpdateService).catch((err: unknown) => {
+      log.error({ err }, 'Error handling update event');
+    });
   });
 
   // Handle API key rotation events

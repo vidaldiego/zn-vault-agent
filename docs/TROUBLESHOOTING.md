@@ -2,6 +2,11 @@
 
 This guide covers common issues and their solutions.
 
+> For day-2 operations (fleet health checks, `lastSync` drift, reboot
+> behavior, server-side inspection via `znvault host`), see
+> [OPERATIONS_RUNBOOK.md](OPERATIONS_RUNBOOK.md). The runbook covers
+> failure modes that aren't caught by `systemctl is-active`.
+
 ---
 
 ## Table of Contents
