@@ -25,11 +25,15 @@ import type { SetupCommandOptions } from './types.js';
 
 const SYSTEM_USER = 'zn-vault-agent';
 const SERVICE_NAME = 'zn-vault-agent';
+const UPDATER_SERVICE_NAME = 'zn-vault-agent-updater';
+const NPM_PACKAGE = '@zincapp/zn-vault-agent';
+const SYSTEMD_DIR = '/etc/systemd/system';
 const CONFIG_DIR = '/etc/zn-vault-agent';
 const DATA_DIR = '/var/lib/zn-vault-agent';
 const LOG_DIR = '/var/log/zn-vault-agent';
 const CERT_DIR = '/etc/ssl/znvault';
-const SERVICE_FILE = `/etc/systemd/system/${SERVICE_NAME}.service`;
+const SERVICE_FILE = `${SYSTEMD_DIR}/${SERVICE_NAME}.service`;
+const UPDATER_SERVICE_FILE = `${SYSTEMD_DIR}/${UPDATER_SERVICE_NAME}.service`;
 
 export function registerSetupCommand(program: Command): void {
   program
@@ -80,6 +84,7 @@ async function handleInstall(options: { skipUser?: boolean; yes?: boolean }): Pr
     console.log(`      ${LOG_DIR}/`);
     console.log(`      ${CERT_DIR}/`);
     console.log(`  - Install systemd service: ${SERVICE_NAME}`);
+    console.log(`  - Install updater unit (root-owned): ${UPDATER_SERVICE_NAME}`);
     console.log();
 
     const inquirer = await import('inquirer');
@@ -193,6 +198,18 @@ LOG_LEVEL=info
     console.log(chalk.green(`  Generated ${SERVICE_FILE}`));
   }
 
+  // Step 4b: Install the root-owned updater unit (oneshot, triggered on demand).
+  // The main agent unit runs as a sandboxed non-root user and cannot self-install
+  // via npm (ProtectSystem=strict). This helper runs the install as root.
+  // Written root:root 0644 (setup runs as root, so the new file is root-owned);
+  // not enabled/started — the agent starts it when an operator triggers an update.
+  console.log('Installing updater unit...');
+  const updaterContent = buildUpdaterUnit();
+  // Overwrite if it already exists (idempotent refresh).
+  writeFileSync(UPDATER_SERVICE_FILE, updaterContent, { mode: 0o644 });
+  chownSafe(UPDATER_SERVICE_FILE, 'root:root');
+  console.log(chalk.green(`  Installed ${UPDATER_SERVICE_FILE}`));
+
   // Step 5: Reload systemd (using safe utilities)
   console.log('Reloading systemd...');
   systemctlSafe('daemon-reload');
@@ -274,6 +291,13 @@ async function handleUninstall(options: { purge?: boolean; yes?: boolean }): Pro
     console.log(`Removing ${SERVICE_FILE}...`);
     unlinkSync(SERVICE_FILE);
     console.log(chalk.green(`  Removed ${SERVICE_FILE}`));
+  }
+
+  // Remove the root-owned updater unit
+  if (existsSync(UPDATER_SERVICE_FILE)) {
+    console.log(`Removing ${UPDATER_SERVICE_FILE}...`);
+    unlinkSync(UPDATER_SERVICE_FILE);
+    console.log(chalk.green(`  Removed ${UPDATER_SERVICE_FILE}`));
   }
 
   // Reload systemd (using safe utilities)
@@ -388,5 +412,34 @@ LimitNOFILE=4096
 
 [Install]
 WantedBy=multi-user.target
+`;
+}
+
+/**
+ * Build the content of the root-owned `zn-vault-agent-updater.service` unit.
+ *
+ * This is a `Type=oneshot` helper unit that runs the npm self-install as root,
+ * outside the main agent unit's `ProtectSystem=strict` sandbox (which blocks the
+ * agent from writing `/usr/lib/node_modules` + `/usr/bin` — see
+ * INC-2026-06-12-01 P4). It is intentionally NOT enabled or started: the agent
+ * triggers it on demand via `systemctl start` in response to an operator update.
+ * `ExecStartPost` restarts the agent onto the freshly installed version.
+ *
+ * The unit has no `[Install]` section by design — there is nothing to enable.
+ *
+ * @returns The full systemd unit file content.
+ */
+export function buildUpdaterUnit(): string {
+  const npmPath = whichSafe('npm') ?? '/usr/bin/npm';
+  const systemctlPath = whichSafe('systemctl') ?? '/usr/bin/systemctl';
+
+  return `[Unit]
+Description=Update ${SERVICE_NAME} (root-owned; agent unit sandbox blocks self-update - INC-2026-06-12-01 P4)
+Documentation=https://github.com/zincapp/zn-vault
+
+[Service]
+Type=oneshot
+ExecStart=${npmPath} install -g ${NPM_PACKAGE}@latest
+ExecStartPost=${systemctlPath} try-restart ${SERVICE_NAME}
 `;
 }
