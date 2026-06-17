@@ -49,7 +49,9 @@ export async function handleUpdateEvent(
   try {
     // Manual trigger: bypasses the `enabled` gate so operator-initiated updates
     // work even when the automatic periodic checker is off (AUTO_UPDATE=false).
-    const result = await npmAutoUpdateService.triggerUpdate();
+    // Thread the operator's `force` flag through so "force update" reinstalls an
+    // agent already at latest instead of silently no-opping.
+    const result = await npmAutoUpdateService.triggerUpdate({ force: event.force ?? false });
     log.info(
       {
         success: result.success,

@@ -1106,6 +1106,122 @@ describe('NpmAutoUpdateService', () => {
     });
   });
 
+  describe('triggerUpdate force flag (UI force-update reinstall)', () => {
+    // When the operator clicks "force update" the server sends force:true, which
+    // the daemon threads into triggerUpdate({ force: true }). A forced trigger
+    // must reinstall the current channel tag even when checkForUpdates reports
+    // updateAvailable:false — otherwise forcing a reinstall/repair on an agent
+    // already at latest silently no-ops and the UI affordance is broken.
+
+    it('force:true reinstalls even when no update is available (root path)', async () => {
+      // Root short-circuits to the in-process npm install path.
+      vi.spyOn(process, 'getuid').mockReturnValue(0);
+      vi.mocked(existsSync).mockReturnValue(false); // no lock file
+
+      const installCalls: string[] = [];
+      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        const c = String(cmd);
+        if (c.includes('npm cache clean')) {
+          cb(null, { stdout: '', stderr: '' });
+        } else if (c.includes('npm view')) {
+          // Latest == current => updateAvailable:false
+          cb(null, { stdout: '1.3.0\n', stderr: '' });
+        } else if (c.includes('npm install')) {
+          installCalls.push(c);
+          cb(null, { stdout: 'installed\n', stderr: '' });
+        } else if (c.includes('npm list')) {
+          cb(null, { stdout: '@zincapp/zn-vault-agent@1.3.0\n', stderr: '' });
+        } else {
+          cb(null, { stdout: '', stderr: '' });
+        }
+        return {} as ReturnType<typeof exec>;
+      });
+
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+      const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
+      const result = await service.triggerUpdate({ force: true });
+
+      // Proceeded to install despite updateAvailable:false.
+      expect(installCalls.length).toBe(1);
+      expect(installCalls[0]).toContain('npm install -g');
+      expect(result.success).toBe(true);
+      expect(result.willRestart).toBe(true);
+      // Message must reflect a (re)install, not "Already at latest version".
+      expect(result.message).not.toBe('Already at latest version');
+      expect(result.message.toLowerCase()).toContain('1.3.0');
+
+      killSpy.mockRestore();
+    });
+
+    it('no force when no update is available still early-returns "Already at latest version" (regression guard)', async () => {
+      vi.spyOn(process, 'getuid').mockReturnValue(0);
+      vi.mocked(existsSync).mockReturnValue(false);
+
+      let installCalled = false;
+      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        const c = String(cmd);
+        if (c.includes('npm view')) {
+          cb(null, { stdout: '1.3.0\n', stderr: '' }); // updateAvailable:false
+        } else if (c.includes('npm install')) {
+          installCalled = true;
+          cb(null, { stdout: 'installed\n', stderr: '' });
+        } else {
+          cb(null, { stdout: '', stderr: '' });
+        }
+        return {} as ReturnType<typeof exec>;
+      });
+
+      const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
+      const result = await service.triggerUpdate(); // no force
+
+      expect(installCalled).toBe(false);
+      expect(result.success).toBe(true);
+      expect(result.willRestart).toBe(false);
+      expect(result.message).toBe('Already at latest version');
+    });
+
+    it('force:true reinstalls via the updater unit (non-root) without double-restart', async () => {
+      // Non-root + updater unit present delegates to the root-owned unit, which
+      // installs AND restarts. Force must not change the install mechanism, and
+      // the agent must NOT self-verify (npm list) or self-restart (SIGTERM).
+      vi.spyOn(process, 'getuid').mockReturnValue(1000); // non-root
+      vi.mocked(existsSync).mockReturnValue(false); // no lock file
+
+      const commands: string[] = [];
+      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        const c = String(cmd);
+        commands.push(c);
+        if (c.includes('npm view')) {
+          cb(null, { stdout: '1.3.0\n', stderr: '' }); // updateAvailable:false
+        } else if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
+          cb(null, { stdout: '[Unit]\n', stderr: '' }); // unit exists
+        } else {
+          cb(null, { stdout: '', stderr: '' });
+        }
+        return {} as ReturnType<typeof exec>;
+      });
+
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+      const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
+      const result = await service.triggerUpdate({ force: true });
+
+      // Delegated to the unit even though updateAvailable:false.
+      expect(commands.some((c) => c.includes('systemctl start zn-vault-agent-updater.service'))).toBe(true);
+      expect(result.success).toBe(true);
+      expect(result.willRestart).toBe(true);
+      // Did not self-verify or self-restart (unit owns the restart).
+      expect(commands.some((c) => c.includes('npm list'))).toBe(false);
+      expect(killSpy).not.toHaveBeenCalled();
+
+      killSpy.mockRestore();
+    });
+  });
+
   describe('triggerUpdate restart delegation (Fix C)', () => {
     interface HasUpdaterAccessor {
       hasUpdaterUnit(): Promise<boolean>;

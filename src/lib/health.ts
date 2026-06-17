@@ -380,8 +380,10 @@ function addHealthRoutes(fastify: FastifyInstance): void {
     }
   });
 
-  // Agent update trigger endpoint
-  fastify.post('/agent/update', async (_request, reply) => {
+  // Agent update trigger endpoint. Accepts an optional `{ force?: boolean }`
+  // JSON body so an operator can force a reinstall/repair of an agent already
+  // at latest (parity with the WS "force update" path).
+  fastify.post<{ Body?: { force?: boolean } }>('/agent/update', async (request, reply) => {
     if (!npmAutoUpdateService) {
       return await reply.code(503).send({
         error: 'Agent auto-update service not available',
@@ -389,9 +391,11 @@ function addHealthRoutes(fastify: FastifyInstance): void {
       });
     }
 
+    const force = request.body?.force ?? false;
+
     try {
-      log.info('Agent update triggered via HTTP');
-      const result = await npmAutoUpdateService.triggerUpdate();
+      log.info({ force }, 'Agent update triggered via HTTP');
+      const result = await npmAutoUpdateService.triggerUpdate({ force });
       reply.send({
         ...result,
         timestamp: new Date().toISOString(),

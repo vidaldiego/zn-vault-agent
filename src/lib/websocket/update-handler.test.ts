@@ -65,6 +65,36 @@ describe('handleUpdateEvent', () => {
     expect(logInfo).toHaveBeenCalled();
   });
 
+  it('threads the event force flag into triggerUpdate', async () => {
+    const triggerUpdate = vi.fn().mockResolvedValue({
+      success: true,
+      previousVersion: '1.20.17',
+      newVersion: '1.20.17',
+      willRestart: true,
+      message: 'Forced reinstall of 1.20.17',
+    });
+    const service = makeService(triggerUpdate);
+
+    await handleUpdateEvent(makeEvent({ force: true }), service);
+
+    expect(triggerUpdate).toHaveBeenCalledWith({ force: true });
+  });
+
+  it('passes force:false through when the event does not force', async () => {
+    const triggerUpdate = vi.fn().mockResolvedValue({
+      success: true,
+      previousVersion: '1.20.17',
+      newVersion: '1.21.0',
+      willRestart: true,
+      message: 'Updated to 1.21.0',
+    });
+    const service = makeService(triggerUpdate);
+
+    await handleUpdateEvent(makeEvent({ force: false }), service);
+
+    expect(triggerUpdate).toHaveBeenCalledWith({ force: false });
+  });
+
   it('does not throw and warns when no update service is wired', async () => {
     await expect(handleUpdateEvent(makeEvent(), null)).resolves.toBeUndefined();
     await expect(handleUpdateEvent(makeEvent(), undefined)).resolves.toBeUndefined();

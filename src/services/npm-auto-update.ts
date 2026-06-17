@@ -129,17 +129,27 @@ export class NpmAutoUpdateService {
   /**
    * Trigger an immediate update (bypasses staged rollout).
    * Returns update result with version info.
+   *
+   * @param opts.force - When true (operator clicked "force update"), proceed
+   *   to (re)install the channel tag even if `checkForUpdates` reports
+   *   `updateAvailable:false`. This repairs/reinstalls an agent already at
+   *   latest. `force` only changes the "proceed despite updateAvailable:false"
+   *   decision — the install mechanism (in-process npm install when root, or
+   *   the root-owned updater unit when non-root) is unchanged.
    */
-  async triggerUpdate(): Promise<{
+  async triggerUpdate(opts?: { force?: boolean }): Promise<{
     success: boolean;
     previousVersion: string;
     newVersion: string;
     willRestart: boolean;
     message: string;
   }> {
+    const force = opts?.force ?? false;
     const info = await this.checkForUpdates();
 
-    if (!info.updateAvailable) {
+    // Without an available update we normally no-op. A forced trigger skips this
+    // early-return and reinstalls the channel tag (forced reinstall/repair).
+    if (!info.updateAvailable && !force) {
       return {
         success: true,
         previousVersion: info.current,
@@ -149,9 +159,16 @@ export class NpmAutoUpdateService {
       };
     }
 
+    // When forced and already at latest, there is no newer version to move to —
+    // we reinstall the current channel tag, which resolves to info.current.
+    const targetVersion = info.updateAvailable ? info.latest : info.current;
+    const isReinstall = force && !info.updateAvailable;
+
     logger.info(
-      { current: info.current, latest: info.latest },
-      'Manual update triggered via HTTP'
+      { current: info.current, latest: info.latest, force, reinstall: isReinstall },
+      isReinstall
+        ? 'Forced reinstall triggered (already at latest)'
+        : 'Manual update triggered'
     );
 
     try {
@@ -167,7 +184,7 @@ export class NpmAutoUpdateService {
       }
 
       try {
-        const restartHandledExternally = await this.performUpdate(info.latest);
+        const restartHandledExternally = await this.performUpdate(targetVersion);
 
         // When the install was delegated to the root-owned updater unit, the
         // unit installs AND restarts the agent (ExecStartPost try-restart).
@@ -178,14 +195,18 @@ export class NpmAutoUpdateService {
           return {
             success: true,
             previousVersion: info.current,
-            newVersion: info.latest,
+            newVersion: targetVersion,
             willRestart: true,
-            message: `Update delegated to ${UPDATER_UNIT}; agent will restart on ${info.latest}`,
+            message: isReinstall
+              ? `Reinstall delegated to ${UPDATER_UNIT}; agent will restart on ${targetVersion}`
+              : `Update delegated to ${UPDATER_UNIT}; agent will restart on ${targetVersion}`,
           };
         }
 
-        // Verify the update was successful
-        const verified = await this.verifyUpdate(info.latest);
+        // Verify the update was successful. The updater-unit path is excluded
+        // above; here the in-process install just ran, so the installed version
+        // must match the target (== current on a forced reinstall).
+        const verified = await this.verifyUpdate(targetVersion);
         if (!verified) {
           throw new Error('Version verification failed after update');
         }
@@ -196,9 +217,11 @@ export class NpmAutoUpdateService {
         return {
           success: true,
           previousVersion: info.current,
-          newVersion: info.latest,
+          newVersion: targetVersion,
           willRestart: true,
-          message: `Updated to ${info.latest}, restarting in 2 seconds`,
+          message: isReinstall
+            ? `Reinstalling ${targetVersion}, restarting in 2 seconds`
+            : `Updated to ${targetVersion}, restarting in 2 seconds`,
         };
       } finally {
         this.releaseLock();
