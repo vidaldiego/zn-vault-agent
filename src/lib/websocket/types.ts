@@ -34,6 +34,7 @@ export interface AgentUpdateEvent {
   channel: 'stable' | 'beta' | 'staging';
   version: string;
   releaseNotes?: string;
+  force?: boolean;
   timestamp: string;
 }
 
@@ -97,7 +98,7 @@ export interface HostConfigEvent {
  * Unified agent event (from /v1/ws/agent)
  */
 export interface UnifiedAgentEvent {
-  type: 'pong' | 'event' | 'subscribed' | 'registered' | 'error' | 'connection_established' | 'degraded_connection' | 'reprovision_available' | 'dynamic-secrets';
+  type: 'pong' | 'event' | 'subscribed' | 'registered' | 'error' | 'connection_established' | 'degraded_connection' | 'reprovision_available' | 'dynamic-secrets' | 'update-available';
   topic?: 'certificates' | 'secrets' | 'updates' | 'apikeys' | 'reprovision' | 'dynamic-secrets' | 'hostconfig';
   data?: CertificateEvent | SecretEvent | AgentUpdateEvent | ApiKeyRotationEvent | ReprovisionEvent | DegradedConnectionInfo | HostConfigEvent;
   subscriptions?: { certificates: string[]; secrets: string[]; managedKeys: string[]; updates: string | null };
@@ -107,6 +108,12 @@ export interface UnifiedAgentEvent {
   // For reprovision_available message
   reprovisionToken?: string;
   expiresAt?: string;
+  // For top-level 'update-available' message — the server sends these fields at
+  // the top level (NOT under `data`); see vault src/routes/agent-updates.ts
+  // and unified-agent-websocket/index.ts broadcastUpdateAvailable.
+  version?: string;
+  channel?: 'stable' | 'beta' | 'staging';
+  force?: boolean;
   // For dynamic-secrets messages
   dynamicSecrets?: DynamicSecretsServerMessage;
   // For vault public key exchange

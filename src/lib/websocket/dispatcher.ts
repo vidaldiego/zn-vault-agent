@@ -180,6 +180,10 @@ export class MessageDispatcher {
           void handleDynamicSecretsIncoming(message.dynamicSecrets);
         }
         break;
+
+      case 'update-available':
+        this.handleUpdateAvailable(message);
+        break;
     }
 
     // Handle vault public key if present (sent during registration)
@@ -314,6 +318,33 @@ export class MessageDispatcher {
       }, 'Reprovision token available');
       this.handlers.reprovisionAvailable.forEach(h => { h(expiresAt); });
     }
+  }
+
+  /**
+   * Handle a top-level `update-available` message.
+   *
+   * The vault server sends operator-initiated update triggers as a top-level
+   * message ({type:'update-available', version, channel, force, timestamp}) —
+   * the fields live at the top level, NOT under `data`. See vault
+   * src/routes/agent-updates.ts and unified-agent-websocket/index.ts
+   * (broadcastUpdateAvailable). The legacy `{type:'event', topic:'updates'}`
+   * path in handleEventMessage is kept for back-compat.
+   */
+  private handleUpdateAvailable(message: UnifiedAgentEvent): void {
+    const version = message.version;
+    if (!version) {
+      log.warn({ message }, 'Received update-available message without a version');
+      return;
+    }
+    const event: AgentUpdateEvent = {
+      event: 'update.available',
+      channel: message.channel ?? 'stable',
+      version,
+      force: message.force ?? false,
+      timestamp: message.timestamp ?? new Date().toISOString(),
+    };
+    log.info({ version: event.version, channel: event.channel, force: event.force }, 'Received update event');
+    this.handlers.update.forEach(h => { h(event); });
   }
 
   /**
