@@ -14,6 +14,7 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import {
   chownSafe,
+  chmodSafe,
   useraddSafe,
   userExists,
   systemctlSafe,
@@ -34,6 +35,7 @@ const LOG_DIR = '/var/log/zn-vault-agent';
 const CERT_DIR = '/etc/ssl/znvault';
 const SERVICE_FILE = `${SYSTEMD_DIR}/${SERVICE_NAME}.service`;
 const UPDATER_SERVICE_FILE = `${SYSTEMD_DIR}/${UPDATER_SERVICE_NAME}.service`;
+const SUDOERS_FILE = `/etc/sudoers.d/${SYSTEM_USER}`;
 
 export function registerSetupCommand(program: Command): void {
   program
@@ -85,6 +87,7 @@ async function handleInstall(options: { skipUser?: boolean; yes?: boolean }): Pr
     console.log(`      ${CERT_DIR}/`);
     console.log(`  - Install systemd service: ${SERVICE_NAME}`);
     console.log(`  - Install updater unit (root-owned): ${UPDATER_SERVICE_NAME}`);
+    console.log(`  - Install sudoers rule: ${SUDOERS_FILE}`);
     console.log();
 
     const inquirer = await import('inquirer');
@@ -210,6 +213,21 @@ LOG_LEVEL=info
   chownSafe(UPDATER_SERVICE_FILE, 'root:root');
   console.log(chalk.green(`  Installed ${UPDATER_SERVICE_FILE}`));
 
+  // Step 4c: Provision the sudoers rule that lets the non-root agent user start
+  // the root-owned updater unit (a bare `systemctl start` is polkit-denied). The
+  // agent's self-update runs `sudo /usr/bin/systemctl start <updater unit>`,
+  // which is the ONLY working path under ProtectSystem=strict (an in-process
+  // `sudo npm install` EROFS'es — INC-2026-06-12-01). Written 0440 root:root
+  // (the mode sudo requires) and overwritten idempotently.
+  console.log('Installing sudoers rule...');
+  const sudoersContent = buildSudoersFile();
+  // Write restrictive first, then enforce ownership + mode (sudo refuses a
+  // sudoers file that is group/world-writable or not owned by root).
+  writeFileSync(SUDOERS_FILE, sudoersContent, { mode: 0o440 });
+  chownSafe(SUDOERS_FILE, 'root:root');
+  chmodSafe(SUDOERS_FILE, '0440');
+  console.log(chalk.green(`  Installed ${SUDOERS_FILE}`));
+
   // Step 5: Reload systemd (using safe utilities)
   console.log('Reloading systemd...');
   systemctlSafe('daemon-reload');
@@ -241,6 +259,8 @@ async function handleUninstall(options: { purge?: boolean; yes?: boolean }): Pro
     console.log('This will:');
     console.log(`  - Stop and disable systemd service: ${SERVICE_NAME}`);
     console.log(`  - Remove service file: ${SERVICE_FILE}`);
+    console.log(`  - Remove updater unit: ${UPDATER_SERVICE_FILE}`);
+    console.log(`  - Remove sudoers rule: ${SUDOERS_FILE}`);
     if (options.purge) {
       console.log(chalk.yellow(`  - Remove configuration: ${CONFIG_DIR}/`));
       console.log(chalk.yellow(`  - Remove data: ${DATA_DIR}/`));
@@ -298,6 +318,13 @@ async function handleUninstall(options: { purge?: boolean; yes?: boolean }): Pro
     console.log(`Removing ${UPDATER_SERVICE_FILE}...`);
     unlinkSync(UPDATER_SERVICE_FILE);
     console.log(chalk.green(`  Removed ${UPDATER_SERVICE_FILE}`));
+  }
+
+  // Remove the sudoers rule
+  if (existsSync(SUDOERS_FILE)) {
+    console.log(`Removing ${SUDOERS_FILE}...`);
+    unlinkSync(SUDOERS_FILE);
+    console.log(chalk.green(`  Removed ${SUDOERS_FILE}`));
   }
 
   // Reload systemd (using safe utilities)
@@ -441,5 +468,52 @@ Documentation=https://github.com/zincapp/zn-vault
 Type=oneshot
 ExecStart=${npmPath} install -g ${NPM_PACKAGE}@latest
 ExecStartPost=${systemctlPath} try-restart ${SERVICE_NAME}
+`;
+}
+
+/**
+ * Build the content of the `/etc/sudoers.d/zn-vault-agent` rules file.
+ *
+ * The agent runs as the unprivileged `${SYSTEM_USER}` service user under
+ * `ProtectSystem=strict`, so it cannot self-update in process: `/usr` is
+ * read-only in the agent's mount namespace and `sudo` only changes the uid, not
+ * the namespace, so an in-process `sudo npm install` fails EROFS writing
+ * `/usr/bin` (INC-2026-06-12-01). The only working path is starting the
+ * root-owned `${UPDATER_SERVICE_NAME}.service`, which runs in its own clean
+ * namespace — but a bare `systemctl start` is polkit-denied for the agent user
+ * ("interactive authentication required").
+ *
+ * This file grants the two NOPASSWD rules the agent's self-update relies on:
+ *  1. Starting the updater unit (the primary, sandbox-safe path):
+ *       `sudo /usr/bin/systemctl start ${UPDATER_SERVICE_NAME}.service`
+ *  2. A best-effort direct `npm install` for dev / non-systemd hosts that have
+ *     no updater unit and no ProtectSystem sandbox.
+ *
+ * The first rule MUST match the command the agent runs byte-for-byte (absolute
+ * `/usr/bin/systemctl` path + exact unit name) — sudoers matches on the literal
+ * command, so any divergence makes the rule a no-op.
+ *
+ * The file MUST be installed mode 0440, owned root:root (sudo refuses to load a
+ * sudoers file that is group/world-writable). See `handleInstall`.
+ *
+ * @returns The full sudoers rules-file content.
+ */
+export function buildSudoersFile(): string {
+  const npmPath = whichSafe('npm') ?? '/usr/bin/npm';
+  // Absolute systemctl path; must match the command performUpdate runs and the
+  // path baked into the npm-auto-update service (SYSTEMCTL_BIN).
+  const systemctlPath = '/usr/bin/systemctl';
+
+  return `# Managed by 'zn-vault-agent setup' — do not edit by hand.
+#
+# Allow the unprivileged ${SYSTEM_USER} service user to self-update.
+# The agent unit runs under ProtectSystem=strict, so an in-process
+# 'sudo npm install' EROFS-fails writing /usr/bin (INC-2026-06-12-01). The
+# working path is starting the root-owned updater unit, which runs in its own
+# namespace. A bare 'systemctl start' is polkit-denied, so it is whitelisted
+# here. The npm-install rule is a best-effort fallback for dev / non-systemd
+# hosts that have no updater unit.
+${SYSTEM_USER} ALL=(root) NOPASSWD: ${systemctlPath} start ${UPDATER_SERVICE_NAME}.service
+${SYSTEM_USER} ALL=(root) NOPASSWD: ${npmPath} install -g ${NPM_PACKAGE}@latest
 `;
 }

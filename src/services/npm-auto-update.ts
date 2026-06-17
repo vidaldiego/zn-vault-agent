@@ -39,6 +39,20 @@ const execAsync = promisify(exec);
 const LOCK_FILE = '/var/run/zn-vault-agent.update.lock';
 const PACKAGE_NAME = '@zincapp/zn-vault-agent';
 
+// Root-owned helper unit that performs the global npm install (and restarts the
+// agent via ExecStartPost) OUTSIDE the agent's mount namespace. The agent unit
+// runs as a non-root service user under ProtectSystem=strict, which makes /usr
+// read-only IN THE AGENT'S MOUNT NAMESPACE. An in-process `sudo npm install`
+// CANNOT escape that namespace (sudo changes uid, not the namespace), so it
+// fails EROFS when writing /usr/bin (the real INC-2026-06-12-01 mechanism). The
+// updater unit runs in its own clean namespace where /usr/bin is writable.
+const UPDATER_UNIT = 'zn-vault-agent-updater.service';
+
+// Absolute systemctl path used to start the updater unit. It MUST match the
+// provisioned sudoers rule byte-for-byte:
+//   zn-vault-agent ALL=(root) NOPASSWD: /usr/bin/systemctl start zn-vault-agent-updater.service
+const SYSTEMCTL_BIN = '/usr/bin/systemctl';
+
 // Lock file staleness threshold (10 minutes)
 const LOCK_STALE_MS = 10 * 60 * 1000;
 
@@ -127,8 +141,9 @@ export class NpmAutoUpdateService {
    *   to (re)install the channel tag even if `checkForUpdates` reports
    *   `updateAvailable:false`. This repairs/reinstalls an agent already at
    *   latest. `force` only changes the "proceed despite updateAvailable:false"
-   *   decision — the install mechanism (`npm install -g` directly when root,
-   *   or `sudo npm install -g` when non-root) is unchanged.
+   *   decision — the install mechanism (in-process `npm install -g` when root,
+   *   or the root-owned updater unit via `sudo systemctl start` when non-root)
+   *   is unchanged.
    */
   async triggerUpdate(opts?: { force?: boolean }): Promise<{
     success: boolean;
@@ -177,12 +192,29 @@ export class NpmAutoUpdateService {
       }
 
       try {
-        await this.performUpdate(targetVersion);
+        const restartHandledExternally = await this.performUpdate(targetVersion);
 
-        // The npm install just ran (directly as root, or via sudo as the agent
-        // user). It does NOT restart the agent, so we own verify + restart.
-        // The installed version must match the target (== current on a forced
-        // reinstall).
+        // When the install was delegated to the root-owned updater unit, the
+        // unit installs AND restarts the agent (ExecStartPost try-restart). We
+        // must NOT also verify (the agent is about to be restarted from under
+        // us, so verify can't confirm) or self-restart (avoid a double restart).
+        // Report willRestart and return.
+        if (restartHandledExternally) {
+          return {
+            success: true,
+            previousVersion: info.current,
+            newVersion: targetVersion,
+            willRestart: true,
+            message: isReinstall
+              ? `Reinstall delegated to ${UPDATER_UNIT}; agent will restart on ${targetVersion}`
+              : `Update delegated to ${UPDATER_UNIT}; agent will restart on ${targetVersion}`,
+          };
+        }
+
+        // The in-process npm install just ran (directly as root, or the
+        // best-effort sudo fallback). It does NOT restart the agent, so we own
+        // verify + restart. The installed version must match the target
+        // (== current on a forced reinstall).
         const verified = await this.verifyUpdate(targetVersion);
         if (!verified) {
           throw new Error('Version verification failed after update');
@@ -257,9 +289,22 @@ export class NpmAutoUpdateService {
         // Store current version for potential rollback
         const previousVersion = info.current;
 
-        // Perform the update (npm install -g, sudo when non-root). It does not
-        // restart the agent, so we own verify + health-check + restart below.
-        await this.performUpdate(info.latest);
+        // Perform the update. Returns true when delegated to the root-owned
+        // updater unit (non-root + unit present), false for the in-process
+        // install paths (root, or the sudo-npm fallback).
+        const restartHandledExternally = await this.performUpdate(info.latest);
+
+        // Delegated to the root-owned updater unit: it installs AND restarts
+        // the agent outside the sandbox. Skip our own verify/health-check/
+        // rollback/restart — they would race the unit's restart, and a rollback
+        // can't run as the unprivileged agent anyway.
+        if (restartHandledExternally) {
+          logger.info(
+            { previousVersion, newVersion: info.latest, unit: UPDATER_UNIT },
+            'Update delegated to updater unit; it will restart the agent'
+          );
+          return;
+        }
 
         // Verify the update was successful
         const verified = await this.verifyUpdate(info.latest);
@@ -455,6 +500,55 @@ export class NpmAutoUpdateService {
   }
 
   /**
+   * Detect whether the root-owned updater unit is installed on this host.
+   * `systemctl cat <unit>` exits 0 when the unit exists, non-zero otherwise,
+   * so a resolved exec means the unit is available.
+   */
+  private async hasUpdaterUnit(): Promise<boolean> {
+    try {
+      await execAsync(`systemctl cat ${UPDATER_UNIT}`, { timeout: 10_000 });
+      return true;
+    } catch {
+      // Non-zero exit (unit absent) or systemctl unavailable (non-systemd / dev).
+      return false;
+    }
+  }
+
+  /**
+   * Install the update by starting the root-owned updater unit AS the agent
+   * user via sudo.
+   *
+   * The agent runs as the unprivileged `zn-vault-agent` user. A bare
+   * `systemctl start` is denied by polkit ("Interactive authentication
+   * required"), but the provisioned sudoers rule permits exactly:
+   *   `sudo /usr/bin/systemctl start zn-vault-agent-updater.service`
+   * (NOPASSWD). The oneshot unit runs `npm install -g <package>@latest` and
+   * then `systemctl try-restart zn-vault-agent` (ExecStartPost) as root, in its
+   * OWN namespace where /usr/bin is writable. Because the unit already restarts
+   * the agent, callers MUST NOT also self-restart (see performUpdate's return
+   * contract).
+   *
+   * The command string is `sudo /usr/bin/systemctl start <unit>` for the
+   * non-root agent; this is the only privilege path used here. The absolute
+   * systemctl path is required so it matches the sudoers rule exactly.
+   *
+   * NOTE: the unit installs `@latest`, not the resolved target version. That is
+   * acceptable for operator-initiated updates today. Follow-up: parameterize
+   * the unit with the target version so forced/targeted versions are honored
+   * end-to-end.
+   */
+  private async installViaUpdaterUnit(): Promise<void> {
+    const startCmd = `${this.getSudoPrefix()}${SYSTEMCTL_BIN} start ${UPDATER_UNIT}`;
+    logger.info({ unit: UPDATER_UNIT, cmd: startCmd }, 'Delegating install to root-owned updater unit');
+    const { stdout, stderr } = await execAsync(startCmd, {
+      timeout: 5 * 60 * 1000, // 5 minute timeout (matches npm install)
+    });
+    if (stdout) logger.debug({ stdout: stdout.trim() }, 'updater unit start stdout');
+    if (stderr) logger.debug({ stderr: stderr.trim() }, 'updater unit start stderr');
+    logger.info({ unit: UPDATER_UNIT }, 'Updater unit started; it will install and restart the agent');
+  }
+
+  /**
    * Clear npm cache to ensure clean install.
    * This helps prevent issues from interrupted previous installs.
    */
@@ -470,35 +564,56 @@ export class NpmAutoUpdateService {
   }
 
   /**
-   * Perform the update via a global npm install, choosing the privilege prefix.
+   * Perform the update, choosing the install strategy by privilege/environment.
    *
-   * - **root** → `npm install -g <package>@<tag>` (no sudo).
-   * - **non-root** → `sudo npm install -g <package>@<tag>`.
+   * Live testing (INC-2026-06-12-01) PROVED that an in-process `sudo npm
+   * install` cannot write `/usr/bin` for a sandboxed agent: `ProtectSystem=strict`
+   * makes `/usr` read-only IN THE AGENT'S MOUNT NAMESPACE, and `sudo` only
+   * changes the uid — it does NOT escape the namespace — so the install fails
+   * `EROFS`. The only working path for a non-root sandboxed agent is the
+   * root-owned updater unit, which runs in its OWN clean namespace.
    *
-   * The non-root path relies on the host sudoers entry
-   * (`/etc/sudoers.d/zn-vault-agent`) which permits
-   * `sudo npm install -g @zincapp/zn-vault-agent*` with NOPASSWD. `sudo` runs
-   * in a fresh root context OUTSIDE the agent unit's `ProtectSystem=strict`
-   * sandbox, so the global install succeeds — verified on a live host.
+   * Strategy:
+   * - **root** → `npm install -g <package>@<tag>` directly (no sudo). Root is
+   *   not sandboxed the same way, and the caller still verifies + restarts.
+   * - **non-root + updater unit present** → `sudo /usr/bin/systemctl start
+   *   <unit>` (permitted by the provisioned sudoers rule). The unit installs +
+   *   restarts the agent outside the sandbox, so this returns `true` (restart
+   *   handled externally) and the caller MUST NOT self-verify/self-restart
+   *   (avoids a double restart, which would kill the agent mid-verify).
+   * - **non-root + no updater unit** → best-effort `sudo npm install -g`. This
+   *   fails `EROFS` under a strict sandbox but works in dev / on non-systemd
+   *   hosts where there is no `ProtectSystem`. Caller keeps verify + restart.
    *
-   * NOTE: we deliberately do NOT `systemctl start` the root-owned updater unit
-   * here. The agent runs as the unprivileged `zn-vault-agent` user, which polkit
-   * denies starting a system unit ("Interactive authentication required"). The
-   * updater unit still exists for OPERATOR bootstrap (`sudo systemctl start
-   * zn-vault-agent-updater.service`), but the agent must not depend on starting
-   * it itself.
-   *
-   * Because `sudo npm install` does NOT restart the agent, the caller owns the
-   * restart: it verifies the installed version and then triggers the restart
-   * (see `checkAndUpdate` and `triggerUpdate`).
+   * @returns `restartHandledExternally` — `true` when the updater unit was used
+   *   (the unit's ExecStartPost restarts the agent), `false` for the root and
+   *   sudo-npm fallback paths (caller verifies the install and triggers restart).
    */
-  private async performUpdate(targetVersion: string): Promise<void> {
+  private async performUpdate(targetVersion: string): Promise<boolean> {
+    const tag = this.config.channel;
+
+    // Non-root: prefer the root-owned updater unit over in-process npm install.
+    // An in-process install would EROFS under the agent's ProtectSystem sandbox.
+    if (!this.isRoot() && (await this.hasUpdaterUnit())) {
+      logger.info(
+        { package: PACKAGE_NAME, channel: tag, targetVersion, strategy: 'updater-unit' },
+        'Installing update via root-owned updater unit'
+      );
+      // Clear cache first so the unit's npm install is clean (best-effort).
+      await this.clearNpmCache();
+      await this.installViaUpdaterUnit();
+      return true; // The unit restarts the agent; caller must not double-restart.
+    }
+
+    // Root, or non-root without the unit: run npm install (sudo when non-root).
     await this.performNpmInstall(targetVersion);
+    return false; // Caller keeps the normal verify + restart flow.
   }
 
   /**
    * Run the in-process `npm install -g` with cache clearing and retries.
    * Uses sudo for non-root users (requires appropriate sudoers config).
+   * Used by the root path and the non-root/no-unit best-effort fallback.
    */
   private async performNpmInstall(targetVersion: string): Promise<void> {
     const tag = this.config.channel;
