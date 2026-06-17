@@ -26,7 +26,8 @@ import {
   exchangeBootstrapToken,
   applyRegistrationResult,
 } from '../lib/auth/bootstrap.js';
-import { NpmAutoUpdateService, loadUpdateConfig } from '../services/npm-auto-update.js';
+import { loadUpdateConfig } from '../services/npm-auto-update.js';
+import { buildAutoUpdateService } from '../services/auto-update-builder.js';
 import { PluginAutoUpdateService, loadPluginUpdateConfig } from '../services/plugin-auto-update.js';
 import { parseSecretMapping, isSensitiveEnvVar, type ExecSecret } from '../lib/secret-env.js';
 import type { StartCommandOptions } from './types.js';
@@ -424,7 +425,7 @@ Examples:
       // Auto-update status
       const updateConfig = loadUpdateConfig();
       const autoUpdateEnabled = options.autoUpdate !== false && updateConfig.enabled;
-      console.log(`  Auto-update: ${autoUpdateEnabled ? chalk.green('enabled') : 'disabled'}`);
+      console.log(`  Auto-update: ${autoUpdateEnabled ? chalk.green('enabled') : 'disabled (manual trigger available)'}`);
 
       // Plugin auto-update status (shown later if plugins are configured)
 
@@ -519,13 +520,16 @@ Examples:
       console.log(chalk.gray('Starting daemon...'));
       console.log();
 
-      // Start auto-update service if enabled
-      let autoUpdateService: NpmAutoUpdateService | null = null;
+      // Always construct the auto-update service so operator-initiated updates
+      // (POST /agent/update + the WebSocket update-available trigger) have a
+      // non-null service to call. Only the periodic checker is gated on the
+      // auto-update flag — automatic npm-polling stays off by default (FIX A).
       if (autoUpdateEnabled) {
         logger.info('Starting npm-based auto-update service');
-        autoUpdateService = new NpmAutoUpdateService(updateConfig);
-        autoUpdateService.start();
+      } else {
+        logger.info('Auto-update periodic checker disabled; manual trigger available');
       }
+      const { service: autoUpdateService } = buildAutoUpdateService(updateConfig, autoUpdateEnabled);
 
       // Start plugin auto-update service if enabled and plugins are configured
       let pluginAutoUpdateService: PluginAutoUpdateService | null = null;
