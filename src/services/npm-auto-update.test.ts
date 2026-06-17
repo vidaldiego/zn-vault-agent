@@ -55,10 +55,10 @@ describe('NpmAutoUpdateService', () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
 
-    // Default: run as root. Root short-circuits the updater-unit strategy
-    // (Fix C) and takes the direct `npm install -g` path, which is what these
-    // legacy install/verify/rollback/health-check tests exercise. The Fix C
-    // strategy tests below override process.getuid explicitly per case.
+    // Default: run as root. Root takes the direct `npm install -g` path (no
+    // sudo), which is what these install/verify/rollback/health-check tests
+    // exercise. The install-strategy tests below override process.getuid
+    // explicitly per case to cover the non-root `sudo npm install` path.
     if (typeof process.getuid !== 'function') {
       (process as { getuid?: () => number }).getuid = () => 0;
     }
@@ -1004,11 +1004,18 @@ describe('NpmAutoUpdateService', () => {
     });
   });
 
-  describe('performUpdate install strategy (Fix C)', () => {
+  describe('performUpdate install strategy', () => {
     // performUpdate is private; cast to an indexable shape to invoke it
     // directly for a focused unit test of the install strategy.
+    //
+    // The agent user cannot `systemctl start zn-vault-agent-updater.service`
+    // (polkit denies it: "interactive authentication required"), but the host
+    // sudoers entry already permits `sudo npm install -g @zincapp/zn-vault-agent*`,
+    // which works because sudo runs in a fresh root context OUTSIDE the unit's
+    // ProtectSystem=strict sandbox. So non-root installs via `sudo npm install`,
+    // NOT by starting the updater unit.
     interface PerformUpdateAccessor {
-      performUpdate(targetVersion: string): Promise<boolean>;
+      performUpdate(targetVersion: string): Promise<void>;
     }
 
     let getuidSpy: ReturnType<typeof vi.spyOn> | undefined;
@@ -1027,37 +1034,28 @@ describe('NpmAutoUpdateService', () => {
       getuidSpy = undefined;
     });
 
-    it('non-root + updater unit present: starts the unit, does not run npm/sudo install', async () => {
+    it('non-root: installs via sudo npm install -g (not systemctl start)', async () => {
       mockUid(1000); // non-root
 
       const commands: string[] = [];
       vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
         const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
-        const c = String(cmd);
-        commands.push(c);
-        if (c.includes('npm cache clean')) {
-          cb(null, { stdout: '', stderr: '' });
-        } else if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
-          cb(null, { stdout: '[Unit]\n', stderr: '' }); // unit exists
-        } else if (c.includes('systemctl start zn-vault-agent-updater.service')) {
-          cb(null, { stdout: '', stderr: '' });
-        } else {
-          cb(null, { stdout: '', stderr: '' });
-        }
+        commands.push(String(cmd));
+        cb(null, { stdout: '', stderr: '' });
         return {} as ReturnType<typeof exec>;
       });
 
       const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
-      const restartHandledExternally = await (service as unknown as PerformUpdateAccessor).performUpdate('1.4.0');
+      await (service as unknown as PerformUpdateAccessor).performUpdate('1.4.0');
 
-      expect(commands.some((c) => c.includes('systemctl start zn-vault-agent-updater.service'))).toBe(true);
-      expect(commands.some((c) => /(^|\s)npm install -g/.test(c))).toBe(false);
-      expect(commands.some((c) => c.includes('sudo npm install -g'))).toBe(false);
-      // The unit's ExecStartPost restarts the agent, so the caller must not.
-      expect(restartHandledExternally).toBe(true);
+      // Non-root installs via the sudoers-permitted sudo npm install path.
+      expect(commands.some((c) => c.includes('sudo npm install -g @zincapp/zn-vault-agent@latest'))).toBe(true);
+      // It must NOT try to start the updater unit (agent has no permission).
+      expect(commands.some((c) => c.includes('systemctl start'))).toBe(false);
+      expect(commands.some((c) => c.includes('systemctl cat'))).toBe(false);
     });
 
-    it('root: runs npm install -g directly (no sudo, no systemctl start)', async () => {
+    it('root: runs npm install -g directly (no sudo, no systemctl)', async () => {
       mockUid(0); // root
 
       const commands: string[] = [];
@@ -1069,40 +1067,12 @@ describe('NpmAutoUpdateService', () => {
       });
 
       const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
-      const restartHandledExternally = await (service as unknown as PerformUpdateAccessor).performUpdate('1.4.0');
+      await (service as unknown as PerformUpdateAccessor).performUpdate('1.4.0');
 
       const installCmd = commands.find((c) => c.includes('npm install -g'));
       expect(installCmd).toBeDefined();
       expect(installCmd).not.toContain('sudo ');
-      expect(commands.some((c) => c.includes('systemctl start'))).toBe(false);
-      // Root path keeps the old flow: caller verifies + restarts.
-      expect(restartHandledExternally).toBe(false);
-    });
-
-    it('non-root + no updater unit: falls back to sudo npm install -g', async () => {
-      mockUid(1000); // non-root
-
-      const commands: string[] = [];
-      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
-        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
-        const c = String(cmd);
-        commands.push(c);
-        if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
-          const err = new Error('No such file or directory');
-          cb(err, { stdout: '', stderr: 'No files found for zn-vault-agent-updater.service.' });
-        } else {
-          cb(null, { stdout: '', stderr: '' });
-        }
-        return {} as ReturnType<typeof exec>;
-      });
-
-      const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
-      const restartHandledExternally = await (service as unknown as PerformUpdateAccessor).performUpdate('1.4.0');
-
-      expect(commands.some((c) => c.includes('sudo npm install -g'))).toBe(true);
-      expect(commands.some((c) => c.includes('systemctl start zn-vault-agent-updater.service'))).toBe(false);
-      // Fallback path keeps the old flow: caller verifies + restarts.
-      expect(restartHandledExternally).toBe(false);
+      expect(commands.some((c) => c.includes('systemctl'))).toBe(false);
     });
   });
 
@@ -1183,10 +1153,10 @@ describe('NpmAutoUpdateService', () => {
       expect(result.message).toBe('Already at latest version');
     });
 
-    it('force:true reinstalls via the updater unit (non-root) without double-restart', async () => {
-      // Non-root + updater unit present delegates to the root-owned unit, which
-      // installs AND restarts. Force must not change the install mechanism, and
-      // the agent must NOT self-verify (npm list) or self-restart (SIGTERM).
+    it('force:true reinstalls via sudo npm install (non-root) and the caller verifies + restarts', async () => {
+      // Non-root installs via the sudoers-permitted `sudo npm install`, which
+      // does NOT restart the agent. So the caller MUST verify (npm list) and
+      // self-restart (SIGTERM). Force must not change the install mechanism.
       vi.spyOn(process, 'getuid').mockReturnValue(1000); // non-root
       vi.mocked(existsSync).mockReturnValue(false); // no lock file
 
@@ -1197,8 +1167,8 @@ describe('NpmAutoUpdateService', () => {
         commands.push(c);
         if (c.includes('npm view')) {
           cb(null, { stdout: '1.3.0\n', stderr: '' }); // updateAvailable:false
-        } else if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
-          cb(null, { stdout: '[Unit]\n', stderr: '' }); // unit exists
+        } else if (c.includes('npm list')) {
+          cb(null, { stdout: '@zincapp/zn-vault-agent@1.3.0\n', stderr: '' });
         } else {
           cb(null, { stdout: '', stderr: '' });
         }
@@ -1210,23 +1180,23 @@ describe('NpmAutoUpdateService', () => {
       const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
       const result = await service.triggerUpdate({ force: true });
 
-      // Delegated to the unit even though updateAvailable:false.
-      expect(commands.some((c) => c.includes('systemctl start zn-vault-agent-updater.service'))).toBe(true);
+      // Reinstalled via sudo npm install even though updateAvailable:false.
+      expect(commands.some((c) => c.includes('sudo npm install -g @zincapp/zn-vault-agent@latest'))).toBe(true);
+      // Must NOT try to start the updater unit (agent can't).
+      expect(commands.some((c) => c.includes('systemctl start'))).toBe(false);
       expect(result.success).toBe(true);
       expect(result.willRestart).toBe(true);
-      // Did not self-verify or self-restart (unit owns the restart).
-      expect(commands.some((c) => c.includes('npm list'))).toBe(false);
-      expect(killSpy).not.toHaveBeenCalled();
+      // The caller owns the restart on the sudo path: it verifies + restarts.
+      expect(commands.some((c) => c.includes('npm list'))).toBe(true);
+      // requestRestart schedules SIGTERM after flushLogs + a 500ms delay.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(killSpy).toHaveBeenCalled();
 
       killSpy.mockRestore();
     });
   });
 
-  describe('triggerUpdate restart delegation (Fix C)', () => {
-    interface HasUpdaterAccessor {
-      hasUpdaterUnit(): Promise<boolean>;
-    }
-
+  describe('triggerUpdate restart handling (non-root sudo path)', () => {
     let getuidSpy: ReturnType<typeof vi.spyOn> | undefined;
 
     function mockUid(uid: number): void {
@@ -1241,7 +1211,7 @@ describe('NpmAutoUpdateService', () => {
       getuidSpy = undefined;
     });
 
-    it('non-root + updater unit: triggerUpdate reports willRestart and skips self verify+restart', async () => {
+    it('non-root: triggerUpdate installs via sudo npm install, then verifies + restarts', async () => {
       mockUid(1000); // non-root
       vi.mocked(existsSync).mockReturnValue(false); // no lock file
 
@@ -1252,8 +1222,8 @@ describe('NpmAutoUpdateService', () => {
         commands.push(c);
         if (c.includes('npm view')) {
           cb(null, { stdout: '1.4.0\n', stderr: '' });
-        } else if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
-          cb(null, { stdout: '[Unit]\n', stderr: '' });
+        } else if (c.includes('npm list')) {
+          cb(null, { stdout: '@zincapp/zn-vault-agent@1.4.0\n', stderr: '' });
         } else {
           cb(null, { stdout: '', stderr: '' });
         }
@@ -1263,17 +1233,19 @@ describe('NpmAutoUpdateService', () => {
       const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
 
       const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
-      // Sanity: the unit-detection helper exists and resolves true.
-      await expect((service as unknown as HasUpdaterAccessor).hasUpdaterUnit()).resolves.toBe(true);
-
       const result = await service.triggerUpdate();
 
       expect(result.success).toBe(true);
       expect(result.willRestart).toBe(true);
-      // Delegated to the unit: the agent must NOT self-verify (npm list) or
-      // self-restart (SIGTERM) — the unit's ExecStartPost handles that.
-      expect(commands.some((c) => c.includes('npm list'))).toBe(false);
-      expect(killSpy).not.toHaveBeenCalled();
+      // Installed via the sudoers-permitted sudo npm install path, NOT the unit.
+      expect(commands.some((c) => c.includes('sudo npm install -g @zincapp/zn-vault-agent@latest'))).toBe(true);
+      expect(commands.some((c) => c.includes('systemctl start'))).toBe(false);
+      // sudo npm install does NOT restart the agent, so the caller must
+      // self-verify (npm list) and self-restart (SIGTERM).
+      expect(commands.some((c) => c.includes('npm list'))).toBe(true);
+      // requestRestart schedules SIGTERM after flushLogs + a 500ms delay.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(killSpy).toHaveBeenCalled();
 
       killSpy.mockRestore();
     });
