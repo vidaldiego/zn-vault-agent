@@ -55,6 +55,14 @@ const PAYARA_DROPIN_FILE = `${SYSTEMD_DIR}/${SERVICE_NAME}.service.d/20-payara-s
 // non-default deployments; defaults match the standard host layout.
 const PAYARA_USER = process.env.ZNVAULT_PAYARA_USER ?? 'payara';
 const PAYARA_HOME = process.env.ZNVAULT_PAYARA_HOME ?? '/opt/payara';
+// Real install dir behind the /opt/payara symlink (→ /opt/payara7). systemd
+// ReadWritePaths usually resolves the symlink, but listing the real target too
+// is the robust choice across systemd versions. Overridable for non-default
+// layouts; '' (when PAYARA_HOME isn't symlinked) is filtered out.
+const PAYARA_HOME_REAL = process.env.ZNVAULT_PAYARA_HOME_REAL ?? '/opt/payara7';
+// Directory holding the deployed WAR (warPath). The deploy writes the WAR here,
+// so it must be writable under the agent's ProtectSystem=strict sandbox.
+const PAYARA_WAR_ROOT = process.env.ZNVAULT_PAYARA_WAR_ROOT ?? '/opt/zincapi';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -671,14 +679,27 @@ ${SYSTEM_USER} ALL=(root) NOPASSWD: /usr/bin/pkill *
 }
 
 /**
- * Build the systemd drop-in that re-grants the capabilities `sudo` needs on
- * Payara hosts. The strict base unit sets NoNewPrivileges=true + an empty
- * CapabilityBoundingSet + PrivateDevices=yes, which together break sudo
- * (cannot setgid, audit plugin fails to init). The Payara plugin sudoes at
- * startup (setenv.conf) and during deploys (asadmin), so those hosts need this.
- * Non-Payara hosts keep the strict profile untouched.
+ * Build the systemd drop-in carrying every Payara-plugin requirement that the
+ * strict base unit would otherwise block. Two parts, same incident
+ * (INC-2026-06-22):
+ *
+ *  1. sudo capability — the strict base sets NoNewPrivileges=true + an empty
+ *     CapabilityBoundingSet + PrivateDevices=yes, which break sudo (cannot
+ *     setgid, audit plugin fails to init). The plugin sudoes at startup
+ *     (setenv.conf) and during deploys (asadmin), so re-grant what sudo needs.
+ *  2. ReadWritePaths — ProtectSystem=strict makes the FS read-only except the
+ *     listed paths. The deploy writes the WAR (warPath) and Payara's domain
+ *     state + setenv.conf, which live OUTSIDE the base RW list, so every
+ *     `znvault deploy` EROFS-fails without these. /opt/payara is a symlink to
+ *     /opt/payara7 — both are listed for robustness across systemd versions.
+ *
+ * Non-Payara hosts keep the strict profile untouched (this drop-in is only
+ * written when the plugin is detected).
  */
 export function buildPayaraDropIn(): string {
+  // De-dup + drop empties so a non-symlinked PAYARA_HOME (== PAYARA_HOME_REAL)
+  // doesn't list the same path twice.
+  const rwPaths = [...new Set([PAYARA_WAR_ROOT, PAYARA_HOME, PAYARA_HOME_REAL].filter(Boolean))];
   return `[Service]
 # Payara plugin requires sudo (setenv.conf write + asadmin as the payara user).
 # The strict base profile (NoNewPrivileges + empty CapabilityBoundingSet +
@@ -687,5 +708,8 @@ NoNewPrivileges=no
 RestrictSUIDSGID=no
 PrivateDevices=no
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+# ReadWritePaths for the deploy: WAR dir + Payara home (symlink + real target).
+# ProtectSystem=strict makes everything else read-only → deploy EROFS without these.
+ReadWritePaths=${rwPaths.join(' ')}
 `;
 }

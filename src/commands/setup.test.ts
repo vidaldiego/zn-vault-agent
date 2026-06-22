@@ -117,4 +117,16 @@ describe('buildPayaraDropIn', () => {
     expect(d).toContain('CAP_SETGID');
     expect(d).toContain('CAP_AUDIT_WRITE');
   });
+
+  it('grants ReadWritePaths for the WAR dir and Payara home (symlink + real target)', () => {
+    const d = buildPayaraDropIn();
+    const rwLine = d.split('\n').find((l) => l.startsWith('ReadWritePaths='));
+    expect(rwLine).toBeDefined();
+    expect(rwLine).toContain('/opt/zincapi');
+    expect(rwLine).toContain('/opt/payara');
+    expect(rwLine).toContain('/opt/payara7');
+    // No duplicate path entries.
+    const paths = rwLine!.replace('ReadWritePaths=', '').split(' ');
+    expect(paths.length).toBe(new Set(paths).size);
+  });
 });
