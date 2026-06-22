@@ -177,6 +177,73 @@ describe('/scheduler/* passthrough routes', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Fix 1: whitespace-only secret file → treated as unreadable → 500
+  // -------------------------------------------------------------------------
+  it('POST /scheduler/quiesce — whitespace-only secret file → 500, znapi NOT called', async () => {
+    secretFile = writeTempSecret('   \n\t  \n'); // whitespace only — must be treated as unreadable
+
+    let znapiCalled = false;
+    const { server, url } = await startStubServer((_req, res) => {
+      znapiCalled = true;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ quiesced: true, inFlightUnits: 0 }));
+    });
+    znapi = server;
+    znapiUrl = url;
+
+    addSchedulerRoutes(app, { znapiBaseUrl: znapiUrl, internalSecretFile: secretFile });
+    await app.ready();
+
+    const response = await app.inject({ method: 'POST', url: '/scheduler/quiesce' });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ error: 'deploy secret unreadable' });
+    expect(znapiCalled).toBe(false); // znapi must NOT have been contacted
+  });
+
+  // -------------------------------------------------------------------------
+  // Fix 2: non-2xx znapi response → proxied through AND warn log fires
+  // -------------------------------------------------------------------------
+  it('POST /scheduler/quiesce — znapi returns 403 → proxied 403 AND warn logged', async () => {
+    secretFile = writeTempSecret('s3cr3t');
+
+    const { server, url } = await startStubServer((_req, res) => {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'forbidden' }));
+    });
+    znapi = server;
+    znapiUrl = url;
+
+    // Spy on the module-level log object (healthLogger, imported as `log` in the
+    // routes module) by monkey-patching its .warn method on the live object.
+    const { healthLogger } = await import('./logger.js');
+    const warnCalls: unknown[] = [];
+    const originalWarn = healthLogger.warn.bind(healthLogger);
+    healthLogger.warn = (...args: unknown[]) => {
+      warnCalls.push(args);
+      return originalWarn(...(args as Parameters<typeof originalWarn>));
+    };
+
+    addSchedulerRoutes(app, { znapiBaseUrl: url, internalSecretFile: secretFile });
+    await app.ready();
+
+    const response = await app.inject({ method: 'POST', url: '/scheduler/quiesce' });
+
+    // Restore original warn
+    healthLogger.warn = originalWarn;
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({ error: 'forbidden' });
+
+    // At least one warn call must have statusCode === 403 in its first arg
+    const has403Warn = warnCalls.some((call) => {
+      const [obj] = call as [Record<string, unknown>, ...unknown[]];
+      return typeof obj === 'object' && obj !== null && obj['statusCode'] === 403;
+    });
+    expect(has403Warn).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
   // Unreachable znapi → 502
   // NOTE: An https integration test is intentionally omitted — setting up a
   // local TLS stub in unit tests adds significant complexity with self-signed

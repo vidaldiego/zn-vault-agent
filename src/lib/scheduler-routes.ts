@@ -128,7 +128,7 @@ export function addSchedulerRoutes(
   function readSecret(): string | null {
     try {
       if (!existsSync(secretFile)) return null;
-      return readFileSync(secretFile, 'utf-8').trim();
+      return readFileSync(secretFile, 'utf-8').trim() || null;
     } catch {
       return null;
     }
@@ -167,6 +167,10 @@ export function addSchedulerRoutes(
       log.debug({ znapiPath }, 'znapi returned 404 for internal scheduler endpoint — treating as unavailable');
       await reply.code(200).send(ZNAPI_NOT_FOUND_RESPONSE);
       return;
+    }
+
+    if (result.statusCode >= 400) {
+      log.warn({ znapiPath, statusCode: result.statusCode }, 'znapi returned error status for internal scheduler endpoint');
     }
 
     await reply.code(result.statusCode).send(result.body);
