@@ -3,6 +3,7 @@
 
 import type { Command } from 'commander';
 import chalk from 'chalk';
+import { existsSync } from 'node:fs';
 import {
   isConfigured,
   loadConfig,
@@ -128,6 +129,21 @@ Examples:
       }
 
       let config = loadConfig();
+
+      // ========================================================================
+      // Boot-time validation: scheduler deploy secret file
+      // ========================================================================
+      // If internalSecretFile is explicitly configured, verify it is readable now
+      // so the operator gets a clear warning at startup rather than a silent 500
+      // at deploy time. Non-fatal: the agent starts anyway.
+      if (config.internalSecretFile !== undefined) {
+        if (!existsSync(config.internalSecretFile)) {
+          logger.warn(
+            { path: config.internalSecretFile },
+            `deploy secret file not readable: ${config.internalSecretFile} — /scheduler/quiesce will fail at runtime`,
+          );
+        }
+      }
 
       // ========================================================================
       // Bootstrap Registration (one-command deployment)

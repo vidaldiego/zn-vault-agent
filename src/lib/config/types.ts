@@ -228,6 +228,26 @@ export interface AgentConfig {
   managedKeyName?: string;
   /** Agent ID assigned during registration (set automatically) */
   agentId?: string;
+
+  // ============================================================================
+  // Scheduler passthrough (Part 5a — scheduler-aware deploy)
+  // ============================================================================
+
+  /**
+   * Base URL of the local znapi instance.
+   * Used by /scheduler/* passthrough routes to forward quiesce/resume/status
+   * calls to znapi's /internal/scheduler/* endpoints.
+   * @default "http://127.0.0.1:8080"
+   */
+  znapiBaseUrl?: string;
+
+  /**
+   * Path to the dedicated deploy secret file.
+   * The file contents are sent as X-Internal-Secret to znapi's
+   * InternalSchedulerFilter. Must be provisioned during agent setup.
+   * @default "/etc/zincapi/scheduler-deploy-secret"
+   */
+  internalSecretFile?: string;
 }
 
 /**
