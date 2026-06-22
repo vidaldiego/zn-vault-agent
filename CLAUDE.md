@@ -34,6 +34,7 @@ The agent communicates with the vault server via:
 - Managed API keys with automatic rotation
 - Plugin system for extensibility
 - Prometheus metrics and health endpoints
+- Scheduler passthrough: `/scheduler/{quiesce,resume,status}` routes forward to znapi's `/internal/scheduler/*` (used by `znvault-plugin-payara` for scheduler-aware deploys). Configured via `znapiBaseUrl` (default `http://127.0.0.1:8080`) and `internalSecretFile` (default `/etc/zincapi/scheduler-deploy-secret`) — both top-level `AgentConfig` fields in `src/lib/config/types.ts`. Implemented in `src/lib/scheduler-routes.ts`, registered from `src/lib/health.ts`.
 
 ## Development Commands
 

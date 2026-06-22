@@ -736,9 +736,17 @@ Both `znvault agent` CLI and the standalone daemon share the same config file.
     }
   ],
   "pollInterval": 3600,
-  "insecure": false
+  "insecure": false,
+
+  "znapiBaseUrl": "http://127.0.0.1:8080",
+  "internalSecretFile": "/etc/zincapi/scheduler-deploy-secret"
 }
 ```
+
+| Config field | Default | Description |
+|---|---|---|
+| `znapiBaseUrl` | `http://127.0.0.1:8080` | Base URL of the local znapi instance, used by `/scheduler/*` passthrough routes. |
+| `internalSecretFile` | `/etc/zincapi/scheduler-deploy-secret` | Path to the dedicated deploy secret file sent as `X-Internal-Secret` to znapi's `InternalSchedulerFilter`. Must be provisioned on the node. Unreadable file logs a non-fatal warning at boot. |
 
 ### Environment Variables
 
@@ -755,6 +763,8 @@ Environment variables override config file values:
 | `ZNVAULT_AGENT_CONFIG_DIR` | Custom config directory |
 | `LOG_LEVEL` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `LOG_FILE` | Optional log file path |
+
+> **Note:** `znapiBaseUrl` and `internalSecretFile` are config-file fields only (no env-var override). Set them in `config.json` when deploying nodes that run znapi alongside the agent.
 
 ### Output Formats
 
@@ -1136,12 +1146,34 @@ The CLI provides the same configuration commands:
 
 When started with `--health-port`, the agent exposes:
 
-| Endpoint | Description |
-|----------|-------------|
-| `/health` | JSON health status |
-| `/ready` | Readiness probe (Kubernetes) |
-| `/live` | Liveness probe |
-| `/metrics` | Prometheus metrics |
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | JSON health status |
+| `/ready` | GET | Readiness probe (Kubernetes) |
+| `/live` | GET | Liveness probe |
+| `/metrics` | GET | Prometheus metrics |
+| `/scheduler/quiesce` | POST | Scheduler quiesce passthrough (see below) |
+| `/scheduler/status` | GET | Scheduler status passthrough |
+| `/scheduler/resume` | POST | Scheduler resume passthrough |
+
+### Scheduler Passthrough Routes
+
+The `/scheduler/*` routes forward requests to the local znapi instance's `/internal/scheduler/*` endpoints. They are used by `znvault-plugin-payara` during scheduler-aware deploys to quiesce (drain in-flight jobs), verify drain, and resume the scheduler after the WAR is deployed.
+
+Each request is authenticated by reading a dedicated deploy secret from `internalSecretFile` (default: `/etc/zincapi/scheduler-deploy-secret`) and sending it as `X-Internal-Secret` to znapi. The file must be provisioned on the node during agent setup; it is read locally and never travels from the operator.
+
+**Boot behavior:** If the secret file is unreadable at startup, a non-fatal warning is logged. The routes are still registered; individual requests return `500 { "error": "deploy secret unreadable" }` until the file is provisioned.
+
+**Error responses:**
+
+| Condition | HTTP | Body |
+|-----------|------|------|
+| Secret file unreadable | 500 | `{ "error": "deploy secret unreadable" }` |
+| znapi unreachable | 502 | `{ "error": "failed to reach znapi", "message": "..." }` |
+| znapi returns 404 (old version) | 200 | `{ "available": false, "reason": "znapi-internal-scheduler-not-found" }` |
+| All other znapi responses | proxied | proxied as-is |
+
+The 200 + `{ "available": false, "reason": "znapi-internal-scheduler-not-found" }` shape is the **capability-missing contract** the plugin keys off: when znapi lacks the internal scheduler endpoint (old version → 404), the agent signals this non-fatally so the plugin can skip quiesce and proceed with the deploy rather than treating it as a hard failure.
 
 ### Prometheus Metrics
 
