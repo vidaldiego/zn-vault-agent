@@ -14,6 +14,7 @@ import type { PluginLoader } from '../plugins/loader.js';
 import type { PluginHealthStatus } from '../plugins/types.js';
 import type { PluginAutoUpdateService } from '../services/plugin-auto-update.js';
 import type { NpmAutoUpdateService } from '../services/npm-auto-update.js';
+import { addSchedulerRoutes } from './scheduler-routes.js';
 
 // Get agent version from package.json at module load time
 let agentVersion = '1.0.0';
@@ -408,6 +409,14 @@ function addHealthRoutes(fastify: FastifyInstance): void {
         success: false,
       });
     }
+  });
+
+  // Scheduler passthrough routes (/scheduler/quiesce, /scheduler/status, /scheduler/resume)
+  // These forward to znapi's /internal/scheduler/* endpoints using a local deploy secret.
+  const config = loadConfig();
+  addSchedulerRoutes(fastify, {
+    znapiBaseUrl: config.znapiBaseUrl,
+    internalSecretFile: config.internalSecretFile,
   });
 }
 
