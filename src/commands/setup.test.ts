@@ -2,7 +2,7 @@
 // Unit tests for the setup command's systemd-unit content builders.
 
 import { describe, it, expect } from 'vitest';
-import { buildUpdaterUnit, buildSudoersFile, buildUpdaterPathUnit } from './setup.js';
+import { buildUpdaterUnit, buildSudoersFile, buildUpdaterPathUnit, buildPayaraDropIn } from './setup.js';
 
 describe('buildUpdaterUnit', () => {
   it('should be a oneshot unit', () => {
@@ -82,5 +82,39 @@ describe('buildSudoersFile', () => {
     for (const rule of rules) {
       expect(rule.startsWith('zn-vault-agent ALL=(root) NOPASSWD:')).toBe(true);
     }
+  });
+});
+
+describe('buildSudoersFile — Payara awareness', () => {
+  it('without Payara: only the base self-update rules (no payara rules)', () => {
+    const s = buildSudoersFile(false);
+    expect(s).toContain('start zn-vault-agent-updater.service');
+    expect(s).toContain('npm install -g @zincapp/zn-vault-agent@latest');
+    expect(s).not.toContain('asadmin');
+    expect(s).not.toContain('(payara)');
+    expect(s).not.toContain('setenv.conf');
+  });
+
+  it('with Payara: includes the base rules AND the payara plugin rules', () => {
+    const s = buildSudoersFile(true);
+    // base rules still present (not clobbered)
+    expect(s).toContain('start zn-vault-agent-updater.service');
+    // payara rules
+    expect(s).toContain('(payara) NOPASSWD: /opt/payara/bin/asadmin *');
+    expect(s).toContain('(payara) NOPASSWD: /usr/bin/env *');
+    expect(s).toContain('/usr/bin/tee /opt/payara/glassfish/domains/*/config/setenv.conf');
+    expect(s).toContain('/usr/bin/chown payara\\:payara /opt/payara/glassfish/domains/*/config/setenv.conf');
+  });
+});
+
+describe('buildPayaraDropIn', () => {
+  it('re-grants the caps sudo needs and disables NoNewPrivileges', () => {
+    const d = buildPayaraDropIn();
+    expect(d).toContain('[Service]');
+    expect(d).toContain('NoNewPrivileges=no');
+    expect(d).toContain('PrivateDevices=no');
+    expect(d).toContain('CAP_SETUID');
+    expect(d).toContain('CAP_SETGID');
+    expect(d).toContain('CAP_AUDIT_WRITE');
   });
 });

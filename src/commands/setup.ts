@@ -42,7 +42,36 @@ const WRAPPER_INSTALL_DIR = '/usr/local/lib/zn-vault-agent';
 const WRAPPER_INSTALL_PATH = `${WRAPPER_INSTALL_DIR}/zn-vault-agent-update.sh`;
 const TRIGGER_FILE = `${DATA_DIR}/.update-trigger`;
 
+// Payara plugin integration. When this plugin is present, the agent must be able
+// to sudo (write setenv.conf, run asadmin as the payara user) — which the strict
+// base profile blocks (NoNewPrivileges + empty CapabilityBoundingSet). We detect
+// it and (a) emit the payara sudoers rules into the managed sudoers file, and
+// (b) drop in a unit override that re-grants the caps sudo needs. See
+// INC-2026-06-22 (setup clobbered the plugin's sudoers + strict profile broke
+// the plugin's startup sudo, taking Payara down).
+const PAYARA_PLUGIN_PACKAGE = '@zincapp/znvault-plugin-payara';
+const PAYARA_DROPIN_FILE = `${SYSTEMD_DIR}/${SERVICE_NAME}.service.d/20-payara-sudo.conf`;
+// The OS user Payara runs as, and its install root. Overridable via env for
+// non-default deployments; defaults match the standard host layout.
+const PAYARA_USER = process.env.ZNVAULT_PAYARA_USER ?? 'payara';
+const PAYARA_HOME = process.env.ZNVAULT_PAYARA_HOME ?? '/opt/payara';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Detect whether the Payara plugin is installed for this agent. Checks the
+ * common npm-global install locations for the plugin package — the most reliable
+ * signal at setup time (a config-from-vault agent may have no local plugin
+ * config on disk yet).
+ */
+function isPayaraPluginInstalled(): boolean {
+  const candidates = [
+    `/usr/lib/node_modules/${PAYARA_PLUGIN_PACKAGE}`,
+    `/usr/local/lib/node_modules/${PAYARA_PLUGIN_PACKAGE}`,
+    join(__dirname, '..', '..', '..', PAYARA_PLUGIN_PACKAGE),
+  ];
+  return candidates.some((p) => existsSync(p));
+}
 
 function resolveBundledFile(rel: string): string {
   const candidates = [
@@ -252,14 +281,30 @@ LOG_LEVEL=info
     unlinkSync(TRIGGER_FILE);
   }
 
+  // Step 4b-payara: On Payara hosts, drop in a unit override that re-grants the
+  // caps sudo needs (the plugin sudoes for setenv.conf + asadmin). The strict
+  // base profile would otherwise break the plugin's startup → Payara down
+  // (INC-2026-06-22). Non-Payara hosts are left on the strict profile.
+  const payaraHost = isPayaraPluginInstalled();
+  if (payaraHost) {
+    console.log('Payara plugin detected — installing sudo capability drop-in...');
+    const dropInDir = dirname(PAYARA_DROPIN_FILE);
+    if (!existsSync(dropInDir)) {
+      mkdirSync(dropInDir, { recursive: true, mode: 0o755 });
+    }
+    writeFileSync(PAYARA_DROPIN_FILE, buildPayaraDropIn(), { mode: 0o644 });
+    chownSafe(PAYARA_DROPIN_FILE, 'root:root');
+    console.log(chalk.green(`  Installed ${PAYARA_DROPIN_FILE}`));
+  }
+
   // Step 4c: Provision the sudoers rule that lets the non-root agent user start
   // the root-owned updater unit (a bare `systemctl start` is polkit-denied). The
   // agent's self-update runs `sudo /usr/bin/systemctl start <updater unit>`,
   // which is the ONLY working path under ProtectSystem=strict (an in-process
   // `sudo npm install` EROFS'es — INC-2026-06-12-01). Written 0440 root:root
   // (the mode sudo requires) and overwritten idempotently.
-  console.log('Installing sudoers rule...');
-  const sudoersContent = buildSudoersFile();
+  console.log(`Installing sudoers rule${payaraHost ? ' (incl. Payara plugin rules)' : ''}...`);
+  const sudoersContent = buildSudoersFile(payaraHost);
   // Write restrictive first, then enforce ownership + mode (sudo refuses a
   // sudoers file that is group/world-writable or not owned by root).
   writeFileSync(SUDOERS_FILE, sudoersContent, { mode: 0o440 });
@@ -378,6 +423,10 @@ async function handleUninstall(options: { purge?: boolean; yes?: boolean }): Pro
   }
   if (existsSync(TRIGGER_FILE)) {
     unlinkSync(TRIGGER_FILE);
+  }
+  if (existsSync(PAYARA_DROPIN_FILE)) {
+    unlinkSync(PAYARA_DROPIN_FILE);
+    console.log(chalk.green(`  Removed ${PAYARA_DROPIN_FILE}`));
   }
 
   // Remove the sudoers rule
@@ -577,13 +626,13 @@ WantedBy=paths.target
  *
  * @returns The full sudoers rules-file content.
  */
-export function buildSudoersFile(): string {
+export function buildSudoersFile(includePayara: boolean = isPayaraPluginInstalled()): string {
   const npmPath = whichSafe('npm') ?? '/usr/bin/npm';
   // Absolute systemctl path; must match the command performUpdate runs and the
   // path baked into the npm-auto-update service (SYSTEMCTL_BIN).
   const systemctlPath = '/usr/bin/systemctl';
 
-  return `# Managed by 'zn-vault-agent setup' — do not edit by hand.
+  let content = `# Managed by 'zn-vault-agent setup' — do not edit by hand.
 #
 # Allow the unprivileged ${SYSTEM_USER} service user to self-update.
 # The agent unit runs under ProtectSystem=strict, so an in-process
@@ -594,5 +643,49 @@ export function buildSudoersFile(): string {
 # hosts that have no updater unit.
 ${SYSTEM_USER} ALL=(root) NOPASSWD: ${systemctlPath} start ${UPDATER_SERVICE_NAME}.service
 ${SYSTEM_USER} ALL=(root) NOPASSWD: ${npmPath} install -g ${NPM_PACKAGE}@latest
+`;
+
+  if (includePayara) {
+    // Rules the Payara plugin needs: run asadmin as the payara user, and manage
+    // setenv.conf as root. Without these, the plugin cannot start the domain and
+    // Payara stays down (INC-2026-06-22). Emitted into the SAME managed file so a
+    // later `setup` run preserves them (rather than clobbering an out-of-band file).
+    content += `
+# --- Payara plugin (${PAYARA_PLUGIN_PACKAGE}) ---
+# Run asadmin / env / bash as the payara user (plugin lifecycle + health).
+${SYSTEM_USER} ALL=(${PAYARA_USER}) NOPASSWD: /usr/bin/env *
+${SYSTEM_USER} ALL=(${PAYARA_USER}) NOPASSWD: ${PAYARA_HOME}/bin/asadmin *
+${SYSTEM_USER} ALL=(${PAYARA_USER}) NOPASSWD: ${PAYARA_HOME}/glassfish/bin/asadmin *
+${SYSTEM_USER} ALL=(${PAYARA_USER}) NOPASSWD: /usr/bin/bash *
+# Manage setenv.conf (secret injection) as root.
+${SYSTEM_USER} ALL=(root) NOPASSWD: /usr/bin/tee ${PAYARA_HOME}/glassfish/domains/*/config/setenv.conf
+${SYSTEM_USER} ALL=(root) NOPASSWD: /usr/bin/chmod 640 ${PAYARA_HOME}/glassfish/domains/*/config/setenv.conf
+${SYSTEM_USER} ALL=(root) NOPASSWD: /usr/bin/chown ${PAYARA_USER}\\:${PAYARA_USER} ${PAYARA_HOME}/glassfish/domains/*/config/setenv.conf
+# Process management for aggressive-mode deploys.
+${SYSTEM_USER} ALL=(root) NOPASSWD: /usr/bin/kill *
+${SYSTEM_USER} ALL=(root) NOPASSWD: /usr/bin/pkill *
+`;
+  }
+
+  return content;
+}
+
+/**
+ * Build the systemd drop-in that re-grants the capabilities `sudo` needs on
+ * Payara hosts. The strict base unit sets NoNewPrivileges=true + an empty
+ * CapabilityBoundingSet + PrivateDevices=yes, which together break sudo
+ * (cannot setgid, audit plugin fails to init). The Payara plugin sudoes at
+ * startup (setenv.conf) and during deploys (asadmin), so those hosts need this.
+ * Non-Payara hosts keep the strict profile untouched.
+ */
+export function buildPayaraDropIn(): string {
+  return `[Service]
+# Payara plugin requires sudo (setenv.conf write + asadmin as the payara user).
+# The strict base profile (NoNewPrivileges + empty CapabilityBoundingSet +
+# PrivateDevices) blocks sudo; re-grant only what sudo needs. See INC-2026-06-22.
+NoNewPrivileges=no
+RestrictSUIDSGID=no
+PrivateDevices=no
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
 `;
 }
