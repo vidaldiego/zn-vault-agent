@@ -36,6 +36,25 @@ const CERT_DIR = '/etc/ssl/znvault';
 const SERVICE_FILE = `${SYSTEMD_DIR}/${SERVICE_NAME}.service`;
 const UPDATER_SERVICE_FILE = `${SYSTEMD_DIR}/${UPDATER_SERVICE_NAME}.service`;
 const SUDOERS_FILE = `/etc/sudoers.d/${SYSTEM_USER}`;
+const UPDATER_PATH_NAME = 'zn-vault-agent-updater';
+const UPDATER_PATH_FILE = `${SYSTEMD_DIR}/${UPDATER_PATH_NAME}.path`;
+const WRAPPER_INSTALL_DIR = '/usr/local/lib/zn-vault-agent';
+const WRAPPER_INSTALL_PATH = `${WRAPPER_INSTALL_DIR}/zn-vault-agent-update.sh`;
+const TRIGGER_FILE = `${DATA_DIR}/.update-trigger`;
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function resolveBundledFile(rel: string): string {
+  const candidates = [
+    join(__dirname, '..', '..', 'deploy', rel),
+    join(__dirname, '..', 'deploy', rel),
+    `/usr/local/lib/node_modules/@zincapp/zn-vault-agent/deploy/${rel}`,
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  throw new Error(`Bundled file not found: ${rel} (looked in ${candidates.join(', ')})`);
+}
 
 export function registerSetupCommand(program: Command): void {
   program
@@ -173,8 +192,6 @@ LOG_LEVEL=info
 
   // Step 4: Copy systemd service file
   console.log(`Installing systemd service...`);
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = dirname(__filename);
 
   // Try to find the service file in the package
   const possiblePaths = [
@@ -201,17 +218,39 @@ LOG_LEVEL=info
     console.log(chalk.green(`  Generated ${SERVICE_FILE}`));
   }
 
-  // Step 4b: Install the root-owned updater unit (oneshot, triggered on demand).
-  // The main agent unit runs as a sandboxed non-root user and cannot self-install
-  // via npm (ProtectSystem=strict). This helper runs the install as root.
-  // Written root:root 0644 (setup runs as root, so the new file is root-owned);
-  // not enabled/started — the agent starts it when an operator triggers an update.
+  // Step 4b: Install the root-owned updater unit (oneshot, activated by the
+  // companion .path watcher). The main agent unit runs as a sandboxed non-root
+  // user and cannot self-install via npm (ProtectSystem=strict). This helper
+  // runs the wrapper script as root. Written root:root 0644; not enabled
+  // directly — the .path unit activates it on trigger-file creation.
   console.log('Installing updater unit...');
   const updaterContent = buildUpdaterUnit();
   // Overwrite if it already exists (idempotent refresh).
   writeFileSync(UPDATER_SERVICE_FILE, updaterContent, { mode: 0o644 });
   chownSafe(UPDATER_SERVICE_FILE, 'root:root');
   console.log(chalk.green(`  Installed ${UPDATER_SERVICE_FILE}`));
+
+  // Install the root-owned updater wrapper script that the oneshot runs.
+  console.log('Installing updater wrapper...');
+  if (!existsSync(WRAPPER_INSTALL_DIR)) {
+    mkdirSync(WRAPPER_INSTALL_DIR, { recursive: true, mode: 0o755 });
+  }
+  const wrapperSrc = resolveBundledFile('scripts/zn-vault-agent-update.sh');
+  copyFileSync(wrapperSrc, WRAPPER_INSTALL_PATH);
+  chownSafe(WRAPPER_INSTALL_PATH, 'root:root');
+  chmodSafe(WRAPPER_INSTALL_PATH, '0755');
+  console.log(chalk.green(`  Installed ${WRAPPER_INSTALL_PATH}`));
+
+  // Install the .path unit that activates the updater on trigger-file creation.
+  console.log('Installing updater path unit...');
+  writeFileSync(UPDATER_PATH_FILE, buildUpdaterPathUnit(), { mode: 0o644 });
+  chownSafe(UPDATER_PATH_FILE, 'root:root');
+  console.log(chalk.green(`  Installed ${UPDATER_PATH_FILE}`));
+
+  // Remove any stale trigger so enabling the .path does not fire-on-enable.
+  if (existsSync(TRIGGER_FILE)) {
+    unlinkSync(TRIGGER_FILE);
+  }
 
   // Step 4c: Provision the sudoers rule that lets the non-root agent user start
   // the root-owned updater unit (a bare `systemctl start` is polkit-denied). The
@@ -232,6 +271,12 @@ LOG_LEVEL=info
   console.log('Reloading systemd...');
   systemctlSafe('daemon-reload');
   console.log(chalk.green('  systemd reloaded'));
+
+  // Enable + start the updater .path watcher (enable --now is two calls here).
+  console.log('Enabling updater path watcher...');
+  systemctlSafe('enable', `${UPDATER_PATH_NAME}.path`);
+  systemctlSafe('start', `${UPDATER_PATH_NAME}.path`);
+  console.log(chalk.green(`  ${UPDATER_PATH_NAME}.path enabled`));
 
   // Enable service (but don't start)
   console.log('Enabling service...');
@@ -318,6 +363,21 @@ async function handleUninstall(options: { purge?: boolean; yes?: boolean }): Pro
     console.log(`Removing ${UPDATER_SERVICE_FILE}...`);
     unlinkSync(UPDATER_SERVICE_FILE);
     console.log(chalk.green(`  Removed ${UPDATER_SERVICE_FILE}`));
+  }
+
+  // Remove the .path unit, wrapper script, and stale trigger
+  if (existsSync(UPDATER_PATH_FILE)) {
+    systemctlSafeQuiet('disable', `${UPDATER_PATH_NAME}.path`);
+    console.log(`Removing ${UPDATER_PATH_FILE}...`);
+    unlinkSync(UPDATER_PATH_FILE);
+    console.log(chalk.green(`  Removed ${UPDATER_PATH_FILE}`));
+  }
+  if (existsSync(WRAPPER_INSTALL_PATH)) {
+    unlinkSync(WRAPPER_INSTALL_PATH);
+    console.log(chalk.green(`  Removed ${WRAPPER_INSTALL_PATH}`));
+  }
+  if (existsSync(TRIGGER_FILE)) {
+    unlinkSync(TRIGGER_FILE);
   }
 
   // Remove the sudoers rule
@@ -445,19 +505,19 @@ WantedBy=multi-user.target
 /**
  * Build the content of the root-owned `zn-vault-agent-updater.service` unit.
  *
- * This is a `Type=oneshot` helper unit that runs the npm self-install as root,
+ * This is a `Type=oneshot` helper unit that runs the wrapper script as root,
  * outside the main agent unit's `ProtectSystem=strict` sandbox (which blocks the
  * agent from writing `/usr/lib/node_modules` + `/usr/bin` — see
- * INC-2026-06-12-01 P4). It is intentionally NOT enabled or started: the agent
- * triggers it on demand via `systemctl start` in response to an operator update.
- * `ExecStartPost` restarts the agent onto the freshly installed version.
+ * INC-2026-06-12-01 P4). It is activated by the companion `.path` watcher when
+ * an operator writes the trigger file. `ExecStartPost` restarts the agent onto
+ * the freshly installed version.
  *
- * The unit has no `[Install]` section by design — there is nothing to enable.
+ * The unit has no `[Install]` section by design — it is activated by the `.path`
+ * unit, not enabled directly.
  *
  * @returns The full systemd unit file content.
  */
 export function buildUpdaterUnit(): string {
-  const npmPath = whichSafe('npm') ?? '/usr/bin/npm';
   const systemctlPath = whichSafe('systemctl') ?? '/usr/bin/systemctl';
 
   return `[Unit]
@@ -466,8 +526,27 @@ Documentation=https://github.com/zincapp/zn-vault
 
 [Service]
 Type=oneshot
-ExecStart=${npmPath} install -g ${NPM_PACKAGE}@latest
+ExecStart=${WRAPPER_INSTALL_PATH} ${TRIGGER_FILE}
 ExecStartPost=${systemctlPath} try-restart ${SERVICE_NAME}
+`;
+}
+
+/**
+ * Build the root-owned `.path` unit that watches the trigger file and activates
+ * the updater oneshot. Uses `PathExists` + delete-on-consume (the wrapper
+ * deletes the trigger) so it cannot fire-on-enable against a stale file or loop
+ * on a truncate. See the design spec.
+ */
+export function buildUpdaterPathUnit(): string {
+  return `[Unit]
+Description=Watch for ${SERVICE_NAME} self-update triggers
+
+[Path]
+PathExists=${TRIGGER_FILE}
+Unit=${UPDATER_PATH_NAME}.service
+
+[Install]
+WantedBy=paths.target
 `;
 }
 

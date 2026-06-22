@@ -2,7 +2,7 @@
 // Unit tests for the setup command's systemd-unit content builders.
 
 import { describe, it, expect } from 'vitest';
-import { buildUpdaterUnit, buildSudoersFile } from './setup.js';
+import { buildUpdaterUnit, buildSudoersFile, buildUpdaterPathUnit } from './setup.js';
 
 describe('buildUpdaterUnit', () => {
   it('should be a oneshot unit', () => {
@@ -10,11 +10,10 @@ describe('buildUpdaterUnit', () => {
     expect(unit).toContain('Type=oneshot');
   });
 
-  it('should install @zincapp/zn-vault-agent@latest via npm in ExecStart', () => {
+  it('ExecStart runs the wrapper script (not inline npm)', () => {
     const unit = buildUpdaterUnit();
-    expect(unit).toMatch(
-      /^ExecStart=\S*npm install -g @zincapp\/zn-vault-agent@latest$/m
-    );
+    expect(unit).toContain('ExecStart=/usr/local/lib/zn-vault-agent/zn-vault-agent-update.sh');
+    expect(unit).not.toContain('npm install -g');
   });
 
   it('should try-restart the agent in ExecStartPost', () => {
@@ -35,10 +34,27 @@ describe('buildUpdaterUnit', () => {
     expect(unit).toContain('[Service]');
   });
 
-  it('should NOT be enabled/started (no [Install] section)', () => {
+  it('should NOT have an [Install] section (path unit activates it instead)', () => {
     const unit = buildUpdaterUnit();
     expect(unit).not.toContain('[Install]');
-    expect(unit).not.toContain('WantedBy=');
+  });
+});
+
+describe('updater path-activation units', () => {
+  it('buildUpdaterPathUnit uses PathExists on the trigger and points at the service', () => {
+    const unit = buildUpdaterPathUnit();
+    expect(unit).toContain('PathExists=/var/lib/zn-vault-agent/.update-trigger');
+    expect(unit).not.toContain('PathModified');
+    expect(unit).toContain('Unit=zn-vault-agent-updater.service');
+    expect(unit).toContain('WantedBy=paths.target');
+  });
+
+  it('buildUpdaterUnit ExecStart runs the wrapper script, not inline npm', () => {
+    const unit = buildUpdaterUnit();
+    expect(unit).toContain('ExecStart=/usr/local/lib/zn-vault-agent/zn-vault-agent-update.sh');
+    expect(unit).not.toContain('npm install -g');
+    expect(unit).toContain('ExecStartPost=');
+    expect(unit).toContain('try-restart zn-vault-agent');
   });
 });
 
