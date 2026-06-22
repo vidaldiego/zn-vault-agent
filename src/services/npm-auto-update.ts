@@ -28,6 +28,7 @@ import {
   closeSync,
   constants,
 } from 'fs';
+import { writeFile, rename } from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import semver from 'semver';
@@ -52,6 +53,17 @@ const UPDATER_UNIT = 'zn-vault-agent-updater.service';
 // provisioned sudoers rule byte-for-byte:
 //   zn-vault-agent ALL=(root) NOPASSWD: /usr/bin/systemctl start zn-vault-agent-updater.service
 const SYSTEMCTL_BIN = '/usr/bin/systemctl';
+
+// Root-owned systemd .path unit that watches for the trigger file.  When the
+// trigger appears, the companion .service (oneshot) installs the target version
+// and restarts the agent.  This is the PREFERRED non-root strategy because it
+// requires no sudo at all — the agent only needs to create a file.
+const UPDATER_PATH_UNIT = 'zn-vault-agent-updater.path';
+
+// Trigger file and temp-file paths.  The agent writes the tmp file and renames
+// it atomically so the .path unit sees a complete, never-partial value.
+const TRIGGER_FILE = '/var/lib/zn-vault-agent/.update-trigger';
+const TRIGGER_TMP_FILE = '/var/lib/zn-vault-agent/.update-trigger.tmp';
 
 // Lock file staleness threshold (10 minutes)
 const LOCK_STALE_MS = 10 * 60 * 1000;
@@ -500,6 +512,35 @@ export class NpmAutoUpdateService {
   }
 
   /**
+   * Detect whether the root-owned updater `.path` unit is installed (the
+   * sudo-free trigger mechanism). Mirrors hasUpdaterUnit().
+   */
+  private async hasUpdaterPathUnit(): Promise<boolean> {
+    try {
+      await execAsync(`systemctl cat ${UPDATER_PATH_UNIT}`, { timeout: 10_000 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Trigger an update by atomically creating the trigger file. The root-owned
+   * `.path` unit activates the updater oneshot, which reads + deletes the
+   * trigger and installs the target. The agent only ever CREATES the trigger;
+   * the root wrapper is the sole deleter.
+   */
+  private async installViaTriggerFile(targetVersion: string): Promise<void> {
+    const channel = this.config.channel;
+    const line = `${targetVersion} ${channel}\n`;
+    logger.info({ trigger: TRIGGER_FILE, targetVersion, channel }, 'Writing self-update trigger file');
+    // Atomic create: write tmp then rename, so .path sees a complete value.
+    await writeFile(TRIGGER_TMP_FILE, line, { mode: 0o644 });
+    await rename(TRIGGER_TMP_FILE, TRIGGER_FILE);
+    logger.info({ trigger: TRIGGER_FILE }, 'Trigger written; updater .path will install + restart the agent');
+  }
+
+  /**
    * Detect whether the root-owned updater unit is installed on this host.
    * `systemctl cat <unit>` exits 0 when the unit exists, non-zero otherwise,
    * so a resolved exec means the unit is available.
@@ -590,24 +631,31 @@ export class NpmAutoUpdateService {
    *   sudo-npm fallback paths (caller verifies the install and triggers restart).
    */
   private async performUpdate(targetVersion: string): Promise<boolean> {
-    const tag = this.config.channel;
-
-    // Non-root: prefer the root-owned updater unit over in-process npm install.
-    // An in-process install would EROFS under the agent's ProtectSystem sandbox.
-    if (!this.isRoot() && (await this.hasUpdaterUnit())) {
+    // Non-root + .path unit present → sudo-free file trigger (preferred).
+    if (!this.isRoot() && (await this.hasUpdaterPathUnit())) {
       logger.info(
-        { package: PACKAGE_NAME, channel: tag, targetVersion, strategy: 'updater-unit' },
-        'Installing update via root-owned updater unit'
+        { package: PACKAGE_NAME, targetVersion, strategy: 'trigger-file' },
+        'Installing update via updater .path trigger file'
       );
-      // Clear cache first so the unit's npm install is clean (best-effort).
       await this.clearNpmCache();
-      await this.installViaUpdaterUnit();
-      return true; // The unit restarts the agent; caller must not double-restart.
+      await this.installViaTriggerFile(targetVersion);
+      return true; // The oneshot restarts the agent; caller must not double-restart.
     }
 
-    // Root, or non-root without the unit: run npm install (sudo when non-root).
+    // Non-root + only the old updater .service/sudoers → sudo systemctl start.
+    if (!this.isRoot() && (await this.hasUpdaterUnit())) {
+      logger.info(
+        { package: PACKAGE_NAME, channel: this.config.channel, targetVersion, strategy: 'updater-unit' },
+        'Installing update via root-owned updater unit'
+      );
+      await this.clearNpmCache();
+      await this.installViaUpdaterUnit();
+      return true;
+    }
+
+    // Root, or non-root without any unit: npm install (sudo when non-root).
     await this.performNpmInstall(targetVersion);
-    return false; // Caller keeps the normal verify + restart flow.
+    return false;
   }
 
   /**

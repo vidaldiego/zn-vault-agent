@@ -25,6 +25,12 @@ vi.mock('fs', () => ({
   },
 }));
 
+// Mock fs/promises (for trigger-file writes in the .path strategy)
+vi.mock('fs/promises', () => ({
+  writeFile: vi.fn().mockResolvedValue(undefined),
+  rename: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock logger
 vi.mock('../lib/logger.js', () => ({
   logger: {
@@ -38,6 +44,7 @@ vi.mock('../lib/logger.js', () => ({
 
 import { exec, spawn } from 'child_process';
 import { existsSync, unlinkSync, readFileSync, statSync, openSync } from 'fs';
+import { writeFile as fspWriteFile, rename as fspRename } from 'fs/promises';
 import type { ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 
@@ -1050,6 +1057,8 @@ describe('NpmAutoUpdateService', () => {
         commands.push(c);
         if (c.includes('npm cache clean')) {
           cb(null, { stdout: '', stderr: '' });
+        } else if (c.includes('systemctl cat zn-vault-agent-updater.path')) {
+          cb(new Error('not found'), { stdout: '', stderr: 'No files found.' }); // no .path unit
         } else if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
           cb(null, { stdout: '[Unit]\n', stderr: '' }); // unit exists
         } else if (c.includes('systemctl start zn-vault-agent-updater.service')) {
@@ -1103,7 +1112,9 @@ describe('NpmAutoUpdateService', () => {
         const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
         const c = String(cmd);
         commands.push(c);
-        if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
+        if (c.includes('systemctl cat zn-vault-agent-updater.path')) {
+          cb(new Error('not found'), { stdout: '', stderr: 'No files found.' }); // no .path unit
+        } else if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
           const err = new Error('No such file or directory');
           cb(err, { stdout: '', stderr: 'No files found for zn-vault-agent-updater.service.' });
         } else {
@@ -1121,6 +1132,69 @@ describe('NpmAutoUpdateService', () => {
       expect(commands.some((c) => c.includes('systemctl start zn-vault-agent-updater.service'))).toBe(false);
       // Fallback path keeps the old flow: caller verifies + restarts.
       expect(restartHandledExternally).toBe(false);
+    });
+
+    it('non-root + .path unit present: writes trigger file, no sudo, no npm install', async () => {
+      mockUid(1000); // non-root
+
+      // Capture trigger-file writes via the module-level mock.
+      const writes: Array<{ path: string; data: string }> = [];
+      vi.mocked(fspWriteFile).mockImplementation(async (p: unknown, d: unknown) => {
+        writes.push({ path: String(p), data: String(d) });
+      });
+      vi.mocked(fspRename).mockResolvedValue(undefined);
+
+      const commands: string[] = [];
+      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        const c = String(cmd);
+        commands.push(c);
+        if (c.includes('systemctl cat zn-vault-agent-updater.path')) {
+          cb(null, { stdout: '[Path]\n', stderr: '' }); // .path unit exists
+        } else {
+          cb(null, { stdout: '', stderr: '' });
+        }
+        return {} as ReturnType<typeof exec>;
+      });
+
+      const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0, channel: 'latest' });
+      const restartHandledExternally = await (service as unknown as PerformUpdateAccessor).performUpdate('1.21.0');
+
+      // Wrote a trigger with "<version> <channel>".
+      const tmpWrite = writes.find((w) => w.path.includes('.update-trigger'));
+      expect(tmpWrite).toBeDefined();
+      expect(tmpWrite?.data.trim()).toBe('1.21.0 latest');
+      // No sudo, no npm install, no systemctl start.
+      expect(commands.some((c) => c.includes('sudo '))).toBe(false);
+      expect(commands.some((c) => /(^|\s)npm install -g/.test(c))).toBe(false);
+      expect(commands.some((c) => c.includes('systemctl start'))).toBe(false);
+      // The oneshot (via .path) restarts the agent; caller must not.
+      expect(restartHandledExternally).toBe(true);
+    });
+
+    it('non-root + no .path but old updater .service present: falls back to sudo systemctl start', async () => {
+      mockUid(1000);
+
+      const commands: string[] = [];
+      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        const c = String(cmd);
+        commands.push(c);
+        if (c.includes('systemctl cat zn-vault-agent-updater.path')) {
+          cb(new Error('not found'), { stdout: '', stderr: 'No files found.' }); // no .path
+        } else if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
+          cb(null, { stdout: '[Unit]\n', stderr: '' }); // old .service exists
+        } else {
+          cb(null, { stdout: '', stderr: '' });
+        }
+        return {} as ReturnType<typeof exec>;
+      });
+
+      const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0, channel: 'latest' });
+      const restartHandledExternally = await (service as unknown as PerformUpdateAccessor).performUpdate('1.21.0');
+
+      expect(commands.some((c) => c.includes('sudo /usr/bin/systemctl start zn-vault-agent-updater.service'))).toBe(true);
+      expect(restartHandledExternally).toBe(true);
     });
   });
 
@@ -1215,6 +1289,8 @@ describe('NpmAutoUpdateService', () => {
         commands.push(c);
         if (c.includes('npm view')) {
           cb(null, { stdout: '1.3.0\n', stderr: '' }); // updateAvailable:false
+        } else if (c.includes('systemctl cat zn-vault-agent-updater.path')) {
+          cb(new Error('not found'), { stdout: '', stderr: 'No files found.' }); // no .path unit
         } else if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
           cb(null, { stdout: '[Unit]\n', stderr: '' }); // unit exists
         } else {
@@ -1270,6 +1346,8 @@ describe('NpmAutoUpdateService', () => {
         commands.push(c);
         if (c.includes('npm view')) {
           cb(null, { stdout: '1.4.0\n', stderr: '' });
+        } else if (c.includes('systemctl cat zn-vault-agent-updater.path')) {
+          cb(new Error('not found'), { stdout: '', stderr: 'No files found.' }); // no .path unit
         } else if (c.includes('systemctl cat zn-vault-agent-updater.service')) {
           cb(null, { stdout: '[Unit]\n', stderr: '' });
         } else {
