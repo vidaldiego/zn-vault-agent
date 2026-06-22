@@ -63,6 +63,13 @@ const PAYARA_HOME_REAL = process.env.ZNVAULT_PAYARA_HOME_REAL ?? '/opt/payara7';
 // Directory holding the deployed WAR (warPath). The deploy writes the WAR here,
 // so it must be writable under the agent's ProtectSystem=strict sandbox.
 const PAYARA_WAR_ROOT = process.env.ZNVAULT_PAYARA_WAR_ROOT ?? '/opt/zincapi';
+// Memory cap for the agent unit on Payara hosts. The agent SPAWNS the Payara JVM
+// (via `sudo -u payara ... start-domain`), so the JVM inherits the agent's
+// cgroup. The base unit caps it at 512M, which an 8GB-heap JVM cannot start
+// inside ("Failed to commit memory / Could not create the JVM", INC-2026-06-22).
+// On dedicated Payara hosts we lift the cap (default: infinity). Override with a
+// concrete value (e.g. '10G') via env if the host is shared.
+const PAYARA_MEMORY_MAX = process.env.ZNVAULT_PAYARA_MEMORY_MAX ?? 'infinity';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -711,5 +718,10 @@ CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_DAC_OVERRIDE CAP
 # ReadWritePaths for the deploy: WAR dir + Payara home (symlink + real target).
 # ProtectSystem=strict makes everything else read-only → deploy EROFS without these.
 ReadWritePaths=${rwPaths.join(' ')}
+# Lift the agent's memory cap: the agent spawns the 8GB-heap Payara JVM, which
+# inherits this cgroup. The base 512M cap makes the JVM fail to start. Dedicated
+# Payara hosts run uncapped (INC-2026-06-22).
+MemoryHigh=infinity
+MemoryMax=${PAYARA_MEMORY_MAX}
 `;
 }

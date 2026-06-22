@@ -129,4 +129,13 @@ describe('buildPayaraDropIn', () => {
     const paths = rwLine!.replace('ReadWritePaths=', '').split(' ');
     expect(paths.length).toBe(new Set(paths).size);
   });
+
+  it('lifts the agent memory cap so the spawned Payara JVM can start', () => {
+    const d = buildPayaraDropIn();
+    // The base unit caps MemoryMax=512M; the agent-spawned 8GB-heap JVM inherits
+    // the cgroup, so the drop-in must raise it.
+    expect(d).toContain('MemoryHigh=infinity');
+    expect(d).toMatch(/MemoryMax=(infinity|\d+[GM])/);
+    expect(d).not.toContain('MemoryMax=512M');
+  });
 });
