@@ -484,6 +484,19 @@ grep "Subscriptions updated" /var/log/zn-vault-agent/agent.log | tail -1
 
 **Workaround (if upgrade not possible):** Restart the agent - it auto-fixes stale API key files on startup.
 
+### Sudo-free self-update (.path activation, 2026-06-22)
+
+The strict agent systemd profile (empty CapabilityBoundingSet + PrivateDevices)
+blocks `sudo`, breaking the old `sudo systemctl start updater` path. Self-update
+now uses a file trigger: the agent atomically creates
+`/var/lib/zn-vault-agent/.update-trigger` ("<version> <channel>"); a root-owned
+`zn-vault-agent-updater.path` (PathExists) activates the updater oneshot, whose
+ExecStart is `/usr/local/lib/zn-vault-agent/zn-vault-agent-update.sh` (reads +
+DELETES the trigger, validates, `npm install -g @pkg@<target>`); ExecStartPost
+`try-restart`s the agent on success only. The sudo path remains as a fallback
+for un-migrated hosts. Channels: `latest | beta | next`. Design:
+`docs/superpowers/specs/2026-06-22-sudo-free-agent-self-update-design.md`.
+
 ### Plugin Config Race Condition (Fixed in v1.20.14)
 
 **Issue:** Even with v1.20.12/v1.20.13, plugins could still write stale API keys due to a race condition. Plugins read `ctx.config.auth.apiKey` before the in-memory config object was updated.

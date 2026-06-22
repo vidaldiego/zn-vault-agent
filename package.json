@@ -26,7 +26,8 @@
     "!dist/*.cjs",
     "!dist/*.cjs.map",
     "deploy/systemd/zn-vault-agent.service",
-    "deploy/logrotate.d/"
+    "deploy/logrotate.d/",
+    "deploy/scripts/"
   ],
   "publishConfig": {
     "access": "public"
