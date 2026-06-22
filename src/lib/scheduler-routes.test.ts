@@ -177,6 +177,35 @@ describe('/scheduler/* passthrough routes', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Unreachable znapi → 502
+  // NOTE: An https integration test is intentionally omitted — setting up a
+  // local TLS stub in unit tests adds significant complexity with self-signed
+  // certs. The https branch in callZnapi is covered by the production path;
+  // a separate integration test suite would be the right venue for it.
+  // -------------------------------------------------------------------------
+  it('POST /scheduler/quiesce — znapi unreachable → 502 with error body', async () => {
+    secretFile = writeTempSecret('s3cr3t');
+
+    // Start a server then immediately close it so we have a definitely-closed port
+    const { server, url } = await startStubServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+    await stopServer(server);
+    // server is now stopped — port is closed; route will get ECONNREFUSED
+
+    addSchedulerRoutes(app, { znapiBaseUrl: url, internalSecretFile: secretFile });
+    await app.ready();
+
+    const response = await app.inject({ method: 'POST', url: '/scheduler/quiesce' });
+
+    expect(response.statusCode).toBe(502);
+    const body = response.json<{ error: string; message: string }>();
+    expect(body.error).toBe('failed to reach znapi');
+    expect(typeof body.message).toBe('string');
+  });
+
+  // -------------------------------------------------------------------------
   // GET /scheduler/status — happy path
   // -------------------------------------------------------------------------
   it('GET /scheduler/status — reads secret + GETs znapi and returns its JSON', async () => {

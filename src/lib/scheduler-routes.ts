@@ -4,6 +4,7 @@
 // so znapi's InternalSchedulerFilter can authenticate the call.
 
 import http from 'node:http';
+import https from 'node:https';
 import { readFileSync, existsSync } from 'node:fs';
 import type { FastifyInstance } from 'fastify';
 import { healthLogger as log } from './logger.js';
@@ -79,8 +80,9 @@ function callZnapi(
       timeout: 15000,
     };
 
-    // Use http (not https) for loopback — znapi internal endpoint is plain HTTP
-    const req = http.request(options, (res) => {
+    // Select http or https client based on the target URL protocol
+    const client = parsedUrl.protocol === 'https:' ? https : http;
+    const req = client.request(options, (res) => {
       let data = '';
       res.on('data', (chunk: Buffer | string) => { data += String(chunk); });
       res.on('end', () => {
