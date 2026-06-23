@@ -1,11 +1,12 @@
 // Path: src/lib/scheduler-routes.ts
 // /scheduler/* passthrough routes — forward requests to znapi's internal scheduler endpoints.
-// The agent reads a dedicated deploy secret from a local file and sends it with each request
-// so znapi's InternalSchedulerFilter can authenticate the call.
+// The agent calls znapi on loopback (127.0.0.1), which is exactly what znapi's
+// InternalSchedulerFilter authorizes — so NO deploy secret is needed or sent.
+// (znapi switched /internal/scheduler/* to loopback-only auth on 2026-06-22; the
+// dedicated deploy secret was removed and X-Internal-Secret is ignored.)
 
 import http from 'node:http';
 import https from 'node:https';
-import { readFileSync, existsSync } from 'node:fs';
 import type { FastifyInstance } from 'fastify';
 import { healthLogger as log } from './logger.js';
 
@@ -18,9 +19,6 @@ const ZNAPI_NOT_FOUND_RESPONSE = {
   reason: 'znapi-internal-scheduler-not-found',
 } as const;
 
-/** Default path for the deploy secret file (written during agent provisioning). */
-const DEFAULT_SECRET_FILE = '/etc/zincapi/scheduler-deploy-secret';
-
 /** Default base URL for the local znapi instance. */
 const DEFAULT_ZNAPI_BASE_URL = 'http://127.0.0.1:8080';
 
@@ -30,11 +28,6 @@ export interface SchedulerRoutesConfig {
    * @default "http://127.0.0.1:8080"
    */
   znapiBaseUrl?: string;
-  /**
-   * Path to the dedicated deploy secret file.
-   * @default "/etc/zincapi/scheduler-deploy-secret"
-   */
-  internalSecretFile?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -47,14 +40,15 @@ interface ZnapiResult {
 }
 
 /**
- * Make a plain HTTP/HTTPS request to znapi with the deploy auth headers.
+ * Make a plain HTTP/HTTPS request to znapi's internal scheduler endpoint.
+ * No auth secret is sent — znapi authorizes on loopback. The X-Internal-Origin
+ * header is kept purely as audit context (znapi no longer checks it).
  * Returns { statusCode, body } — never throws for HTTP-level errors.
  */
 function callZnapi(
   method: 'GET' | 'POST',
   znapiBaseUrl: string,
   urlPath: string,
-  secret: string,
 ): Promise<ZnapiResult> {
   return new Promise((resolve, reject) => {
     let parsedUrl: URL;
@@ -73,8 +67,7 @@ function callZnapi(
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        'X-Internal-Origin': 'deploy',
-        'X-Internal-Secret': secret,
+        'X-Internal-Origin': 'deploy', // audit context only; znapi authorizes on loopback
         // Deliberately NO X-Forwarded-For or proxy headers
       },
       timeout: 15000,
@@ -119,25 +112,11 @@ export function addSchedulerRoutes(
   config: SchedulerRoutesConfig,
 ): void {
   const znapiBaseUrl = config.znapiBaseUrl ?? DEFAULT_ZNAPI_BASE_URL;
-  const secretFile = config.internalSecretFile ?? DEFAULT_SECRET_FILE;
-
-  /**
-   * Read the deploy secret from the configured file.
-   * Returns the trimmed contents on success, null if the file is missing or unreadable.
-   */
-  function readSecret(): string | null {
-    try {
-      if (!existsSync(secretFile)) return null;
-      return readFileSync(secretFile, 'utf-8').trim() || null;
-    } catch {
-      return null;
-    }
-  }
 
   /**
    * Forward a request to znapi's internal scheduler endpoint and send back
    * the response. Handles:
-   * - Missing secret file → 500 { error: 'deploy secret unreadable' }
+   * - Connection failure → 502 { error: 'failed to reach znapi' }
    * - znapi 404 → 200 { available: false, reason: '...' } (non-fatal)
    * - All other znapi statuses → proxied through as-is
    */
@@ -146,16 +125,9 @@ export function addSchedulerRoutes(
     znapiPath: string,
     reply: import('fastify').FastifyReply,
   ): Promise<void> {
-    const secret = readSecret();
-    if (secret === null) {
-      log.warn({ secretFile }, 'Deploy secret file not readable — /scheduler/* will return 500');
-      await reply.code(500).send({ error: 'deploy secret unreadable' });
-      return;
-    }
-
     let result: ZnapiResult;
     try {
-      result = await callZnapi(method, znapiBaseUrl, znapiPath, secret);
+      result = await callZnapi(method, znapiBaseUrl, znapiPath);
     } catch (err) {
       log.error({ err, znapiPath }, 'Failed to connect to znapi internal scheduler');
       await reply.code(502).send({ error: 'failed to reach znapi', message: err instanceof Error ? err.message : String(err) });
@@ -191,5 +163,5 @@ export function addSchedulerRoutes(
     await proxyToScheduler('POST', '/internal/scheduler/resume', reply);
   });
 
-  log.debug({ znapiBaseUrl, secretFile }, 'Registered /scheduler/* passthrough routes');
+  log.debug({ znapiBaseUrl }, 'Registered /scheduler/* passthrough routes');
 }

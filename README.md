@@ -738,15 +738,13 @@ Both `znvault agent` CLI and the standalone daemon share the same config file.
   "pollInterval": 3600,
   "insecure": false,
 
-  "znapiBaseUrl": "http://127.0.0.1:8080",
-  "internalSecretFile": "/etc/zincapi/scheduler-deploy-secret"
+  "znapiBaseUrl": "http://127.0.0.1:8080"
 }
 ```
 
 | Config field | Default | Description |
 |---|---|---|
-| `znapiBaseUrl` | `http://127.0.0.1:8080` | Base URL of the local znapi instance, used by `/scheduler/*` passthrough routes. |
-| `internalSecretFile` | `/etc/zincapi/scheduler-deploy-secret` | Path to the dedicated deploy secret file sent as `X-Internal-Secret` to znapi's `InternalSchedulerFilter`. Must be provisioned on the node. Unreadable file logs a non-fatal warning at boot. |
+| `znapiBaseUrl` | `http://127.0.0.1:8080` | Base URL of the local znapi instance, used by `/scheduler/*` passthrough routes. No secret is required — znapi authorizes `/internal/scheduler/*` on loopback. |
 
 ### Environment Variables
 
@@ -764,7 +762,7 @@ Environment variables override config file values:
 | `LOG_LEVEL` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `LOG_FILE` | Optional log file path |
 
-> **Note:** `znapiBaseUrl` and `internalSecretFile` are config-file fields only (no env-var override). Set them in `config.json` when deploying nodes that run znapi alongside the agent.
+> **Note:** `znapiBaseUrl` is a config-file field only (no env-var override). Set it in `config.json` when deploying nodes that run znapi alongside the agent.
 
 ### Output Formats
 
@@ -1160,15 +1158,12 @@ When started with `--health-port`, the agent exposes:
 
 The `/scheduler/*` routes forward requests to the local znapi instance's `/internal/scheduler/*` endpoints. They are used by `znvault-plugin-payara` during scheduler-aware deploys to quiesce (drain in-flight jobs), verify drain, and resume the scheduler after the WAR is deployed.
 
-Each request is authenticated by reading a dedicated deploy secret from `internalSecretFile` (default: `/etc/zincapi/scheduler-deploy-secret`) and sending it as `X-Internal-Secret` to znapi. The file must be provisioned on the node during agent setup; it is read locally and never travels from the operator.
-
-**Boot behavior:** If the secret file is unreadable at startup, a non-fatal warning is logged. The routes are still registered; individual requests return `500 { "error": "deploy secret unreadable" }` until the file is provisioned.
+**No deploy secret.** znapi's `/internal/scheduler/*` filter authorizes purely on loopback (the agent posts to `127.0.0.1`, which the agent already binds to the same box as znapi). So the agent sends **no** `X-Internal-Secret` and requires **no** provisioned secret file — `znapiBaseUrl` is the only configuration. (Before 2026-06-23 the agent read `/etc/zincapi/scheduler-deploy-secret` and returned `500 "deploy secret unreadable"` when it was absent; that requirement, and the provisioning step, are gone.) The agent still sends `X-Internal-Origin: deploy` as audit context, which znapi ignores for authorization.
 
 **Error responses:**
 
 | Condition | HTTP | Body |
 |-----------|------|------|
-| Secret file unreadable | 500 | `{ "error": "deploy secret unreadable" }` |
 | znapi unreachable | 502 | `{ "error": "failed to reach znapi", "message": "..." }` |
 | znapi returns 404 (old version) | 200 | `{ "available": false, "reason": "znapi-internal-scheduler-not-found" }` |
 | All other znapi responses | proxied | proxied as-is |

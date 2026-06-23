@@ -412,11 +412,11 @@ function addHealthRoutes(fastify: FastifyInstance): void {
   });
 
   // Scheduler passthrough routes (/scheduler/quiesce, /scheduler/status, /scheduler/resume)
-  // These forward to znapi's /internal/scheduler/* endpoints using a local deploy secret.
+  // These forward to znapi's /internal/scheduler/* endpoints. No deploy secret —
+  // znapi authorizes on loopback (the agent posts to 127.0.0.1).
   const config = loadConfig();
   addSchedulerRoutes(fastify, {
     znapiBaseUrl: config.znapiBaseUrl,
-    internalSecretFile: config.internalSecretFile,
   });
 }
 

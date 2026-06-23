@@ -240,14 +240,6 @@ export interface AgentConfig {
    * @default "http://127.0.0.1:8080"
    */
   znapiBaseUrl?: string;
-
-  /**
-   * Path to the dedicated deploy secret file.
-   * The file contents are sent as X-Internal-Secret to znapi's
-   * InternalSchedulerFilter. Must be provisioned during agent setup.
-   * @default "/etc/zincapi/scheduler-deploy-secret"
-   */
-  internalSecretFile?: string;
 }
 
 /**
