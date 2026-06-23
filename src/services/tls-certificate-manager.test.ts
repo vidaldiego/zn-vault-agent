@@ -8,7 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 // Mock the dependencies before importing the module
@@ -45,7 +45,6 @@ import { loadConfig, saveConfig } from '../lib/config.js';
 import {
   requestAgentTLSCertificate,
   renewAgentTLSCertificate,
-  getAgentTLSCertificate,
   activateAgentTLSCertificate,
 } from '../lib/api.js';
 import type { AgentTLSCertificateResponse } from '../lib/api.js';
