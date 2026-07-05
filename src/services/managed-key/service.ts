@@ -16,6 +16,7 @@ import {
   type RotationTracking,
   type RefreshSource,
   type ManagedKeyStatus,
+  type KeyChangeMeta,
   createInitialRotationTracking,
   resetRotationTracking,
   RECONNECT_POLL_DELAY_MS,
@@ -39,7 +40,7 @@ const refreshTimer = new ManagedTimer();
 let isRunning = false;
 let currentKey: string | null = null;
 let staleKeyDetected = false;
-let onKeyChangedCallback: ((newKey: string) => void) | null = null;
+let onKeyChangedCallback: ((newKey: string, meta: KeyChangeMeta) => void) | null = null;
 
 const rotationTracking: RotationTracking = createInitialRotationTracking();
 
@@ -81,8 +82,11 @@ function registerRotationMetrics(): void {
 /**
  * Set callback for when the API key changes.
  * This allows other parts of the system (e.g., WebSocket) to be notified.
+ * The callback receives rotation metadata so the daemon can propagate the
+ * new key to ALL consumers (plugins, exec env files) — not just its own
+ * credentials — regardless of which channel detected the rotation.
  */
-export function onKeyChanged(callback: (newKey: string) => void): void {
+export function onKeyChanged(callback: (newKey: string, meta: KeyChangeMeta) => void): void {
   onKeyChangedCallback = callback;
 }
 
@@ -187,7 +191,14 @@ function handleRotationDetected(
   rotationTracking.wsEventReceived = false;
 
   if (onKeyChangedCallback) {
-    onKeyChangedCallback(bindResponse.key);
+    onKeyChangedCallback(bindResponse.key, {
+      keyName: bindResponse.name,
+      newPrefix: bindResponse.prefix,
+      nextRotationAt: bindResponse.nextRotationAt,
+      graceExpiresAt: bindResponse.graceExpiresAt,
+      rotationMode: bindResponse.rotationMode,
+      source,
+    });
   }
 }
 

@@ -42,18 +42,17 @@ import {
   stopManagedKeyRenewal,
   onKeyChanged as onManagedKeyChanged,
 } from '../services/managed-key-renewal.js';
+import { TrackedKeyPoller } from '../services/managed-key/tracked-keys-poller.js';
 import { isManagedKeyMode } from './config.js';
 import { ChildProcessManager } from '../services/child-process-manager.js';
 import {
   extractSecretIds,
   extractApiKeyNames,
   parseSecretMappingFromConfig,
-  updateEnvFile,
-  findEnvVarsForApiKey,
   type SecretMapping,
 } from './secret-env.js';
 import { bindManagedApiKey } from './api.js';
-import { updateManagedKey } from './config.js';
+import { createKeyRotationPropagator } from './key-rotation-propagation.js';
 import {
   createPluginLoader,
   clearPluginLoader,
@@ -63,7 +62,6 @@ import type {
   CertificateDeployedEvent,
   SecretDeployedEvent,
   SecretChangedEvent,
-  KeyRotatedEvent,
   ChildProcessEvent,
 } from '../plugins/types.js';
 import {
@@ -284,6 +282,10 @@ export async function startDaemon(options: {
 
   // Initialize child process manager if exec config provided
   let childManager: ChildProcessManager | null = null;
+  // Guards key-rotation-triggered restarts: a rotation detected during the
+  // awaited initial bind must not restart a child that has not started yet
+  // (the upcoming start() reads the already-updated config anyway).
+  let childProcessStarted = false;
   if (options.exec) {
     childManager = new ChildProcessManager(options.exec);
 
@@ -291,6 +293,7 @@ export async function startDaemon(options: {
     setChildProcessManager(childManager);
 
     childManager.on('started', (pid) => {
+      childProcessStarted = true;
       log.info({ pid }, 'Child process started');
     });
 
@@ -401,6 +404,43 @@ export async function startDaemon(options: {
       });
     }
   }
+
+  // Unified propagation of rotated managed keys to ALL consumers (live config,
+  // plugin keyRotated dispatch, exec env files, child restart). Both detection
+  // channels — the WebSocket rotation event AND the renewal service's polling
+  // rails — go through this one path, so a lost WebSocket event can no longer
+  // leave plugin-deployed key files stale (2026-07-05 incident).
+  const childManagerForRestart = childManager;
+  const keyRotationPropagator = createKeyRotationPropagator({
+    config,
+    getPluginLoader: () => pluginLoader,
+    execOutputFile,
+    execSecretMappings,
+    isShuttingDown: getIsShuttingDown,
+    restartChild: childManagerForRestart && options.exec?.restartOnChange
+      ? async (reason: string) => {
+          // Skip restarts before the child ever started: start() (which runs
+          // after the initial sync) builds its env from the updated config.
+          if (!childProcessStarted) {
+            log.debug({ reason }, 'Skipping child restart - child process not started yet');
+            return;
+          }
+          await childManagerForRestart.restart(reason);
+        }
+      : undefined,
+  });
+
+  // Polling rail for tracked managed keys BEYOND the agent's own auth key
+  // (exec/plugin `api-key:` mappings). The renewal service covers only the
+  // own key; without this poller, a lost WebSocket event would leave those
+  // keys' consumers stale until restart — the 2026-07-05 incident class.
+  // Started after plugins are running (so keyRotated dispatches reach them);
+  // unchanged polls are no-ops via the propagator's per-key dedup.
+  const trackedKeyPoller = new TrackedKeyPoller({
+    keyNames: allManagedKeyNames.filter((name) => name !== config.managedKey?.name),
+    propagate: (newKey, meta, opts) => keyRotationPropagator.propagate(newKey, meta, opts),
+    isShuttingDown: getIsShuttingDown,
+  });
 
   // Register plugin auto-update service with health module for HTTP endpoints
   if (options.pluginAutoUpdateService) {
@@ -703,75 +743,21 @@ export async function startDaemon(options: {
         keyPrefix: newKey.substring(0, 8),
       }, 'Fetched new API key value');
 
-      // CRITICAL: Mutate the LIVE config object directly so plugins see the new key
-      // updateManagedKey() only updates the config FILE (via loadConfig() + saveConfig()),
-      // but does NOT mutate agentInternals.config which plugins read via ctx.config.
-      // Without this line, plugins would read the OLD key and write stale values to files.
-      config.auth.apiKey = newKey;
-      if (config.managedKey) {
-        config.managedKey.nextRotationAt = bindResponse.nextRotationAt;
-        config.managedKey.graceExpiresAt = bindResponse.graceExpiresAt;
-        config.managedKey.rotationMode = bindResponse.rotationMode;
-        config.managedKey.lastBind = new Date().toISOString();
-      }
-
-      // Also persist to disk and update environment variable
-      updateManagedKey(newKey, {
+      // Propagate to ALL consumers: live config mutation (plugins read
+      // ctx.config), disk/env persistence, plugin keyRotated dispatch, exec
+      // env-file update, optional child restart. Shared with the renewal
+      // service's polling rails so both channels behave identically.
+      // Metadata comes from the authoritative bind response (the event may
+      // be older than the bind we just performed); detectedAt is when the
+      // bind resolved — the propagator uses it to discard stale detections.
+      await keyRotationPropagator.propagate(newKey, {
+        keyName: event.apiKeyName,
+        newPrefix: event.newPrefix ?? bindResponse.prefix,
         nextRotationAt: bindResponse.nextRotationAt,
-        graceExpiresAt: bindResponse.graceExpiresAt,
-        rotationMode: bindResponse.rotationMode,
-      });
-
-      // Dispatch plugin event - CRITICAL: await with error handling
-      // Previously this was fire-and-forget which could cause silent failures
-      if (pluginLoader) {
-        const keyEvent: KeyRotatedEvent = {
-          keyName: event.apiKeyName,
-          newPrefix: event.newPrefix,
-          graceExpiresAt: event.graceExpiresAt,
-          nextRotationAt: bindResponse.nextRotationAt,
-          rotationMode: event.rotationMode,
-        };
-        try {
-          await pluginLoader.dispatchEvent('keyRotated', keyEvent);
-          log.debug({ keyName: event.apiKeyName }, 'Plugin keyRotated event dispatched successfully');
-        } catch (pluginErr) {
-          log.error({
-            err: pluginErr,
-            keyName: event.apiKeyName,
-          }, 'Plugin failed to handle keyRotated event');
-          // Continue processing - plugin failure should not block key rotation
-        }
-      }
-
-      // Update env file if using output file mode
-      if (execOutputFile) {
-        // Find which env var(s) map to this API key
-        const envVars = findEnvVarsForApiKey(execSecretMappings, event.apiKeyName);
-
-        for (const envVar of envVars) {
-          try {
-            updateEnvFile(execOutputFile, envVar, newKey);
-            log.info({
-              keyName: event.apiKeyName,
-              envVar,
-              filePath: execOutputFile,
-            }, 'Updated env file with rotated API key');
-          } catch (err) {
-            log.error({
-              err,
-              keyName: event.apiKeyName,
-              envVar,
-              filePath: execOutputFile,
-            }, 'Failed to update env file with rotated API key');
-          }
-        }
-      }
-
-      // Restart child process if configured to restart on changes
-      if (childManager && options.exec?.restartOnChange) {
-        await childManager.restart(`managed API key '${event.apiKeyName}' rotated`);
-      }
+        graceExpiresAt: bindResponse.graceExpiresAt ?? event.graceExpiresAt,
+        rotationMode: bindResponse.rotationMode ?? event.rotationMode,
+        source: 'ws_event',
+      }, { persist: true, detectedAt: Date.now() });
     } catch (err) {
       log.error({
         err,
@@ -888,17 +874,46 @@ export async function startDaemon(options: {
   if (isManagedKeyMode()) {
     log.info('Using managed API key mode');
 
-    // Set up callback for when managed key changes
-    onManagedKeyChanged((newKey) => {
-      log.info({ newKeyPrefix: newKey.substring(0, 8) }, 'Managed key changed, reconnecting WebSocket');
-      // Reconnect WebSocket with new key
-      unifiedClient.disconnect();
-      // Small delay to allow config to be saved
-      setTimeout(() => {
-        if (!getIsShuttingDown()) {
-          unifiedClient.connect();
+    // Set up callback for when managed key changes.
+    //
+    // 2026-07-05 incident fix: rotations detected by the renewal service's
+    // polling rails (scheduled refresh / grace poll / heartbeat / reconnect)
+    // previously only reconnected the WebSocket — the new key was never
+    // propagated to plugins or exec env files, so plugin-deployed key files
+    // (e.g. payara's ZINC_CONFIG_VAULT_API_KEY) stayed stale until an agent
+    // restart whenever the WebSocket rotation event was lost. Rail detections
+    // now run the same propagation path as the WebSocket event handler.
+    // The renewal service has already persisted the key (updateManagedKey),
+    // so the propagator is invoked without the persist option.
+    onManagedKeyChanged((newKey, meta) => {
+      if (getIsShuttingDown()) {
+        log.debug({ keyName: meta.keyName }, 'Ignoring managed key change during shutdown');
+        return;
+      }
+      // The renewal service's bind resolved just before this callback fired.
+      const detectedAt = Date.now();
+      void (async () => {
+        // Count as an active deployment so graceful shutdown waits for the
+        // consumer updates (same invariant as the WebSocket rotation handler).
+        activeDeployments++;
+        try {
+          await keyRotationPropagator.propagate(newKey, meta, { detectedAt });
+        } catch (err) {
+          log.error({ err, keyName: meta.keyName }, 'Failed to propagate rail-detected key rotation');
+        } finally {
+          activeDeployments--;
         }
-      }, 500);
+
+        log.info({ newKeyPrefix: newKey.substring(0, 8), source: meta.source }, 'Managed key changed, reconnecting WebSocket');
+        // Reconnect WebSocket with new key
+        unifiedClient.disconnect();
+        // Small delay to allow config to be saved
+        setTimeout(() => {
+          if (!getIsShuttingDown()) {
+            unifiedClient.connect();
+          }
+        }, 500);
+      })();
     });
 
     // Start managed key renewal service and AWAIT initial bind
@@ -933,6 +948,10 @@ export async function startDaemon(options: {
       log.error({ err }, 'Failed to start plugins');
     }
   }
+
+  // Start the polling rail for non-own tracked keys AFTER plugins are running
+  // so their keyRotated handlers receive the dispatches.
+  trackedKeyPoller.start();
 
   // Initial sync - certificates
   if (config.targets.length > 0) {
@@ -1059,6 +1078,8 @@ export async function startDaemon(options: {
     // Stop accepting new events
     clearInterval(pollTimer);
     if (keySyncTimer) clearInterval(keySyncTimer);
+    trackedKeyPoller.stop();
+    keyRotationPropagator.stop();
     unifiedClient.disconnect();
 
     // Stop API key renewal service (managed or standard)

@@ -203,7 +203,14 @@ describe('Managed Key Renewal Service', () => {
       // Force refresh to trigger key change
       await forceRefresh();
 
-      expect(callback).toHaveBeenCalledWith('znv_rotated_key_99999');
+      // Callback receives rotation metadata so the daemon can propagate the
+      // new key to plugins/env files (2026-07-05 incident fix).
+      expect(callback).toHaveBeenCalledWith('znv_rotated_key_99999', expect.objectContaining({
+        keyName: 'test-managed-key',
+        newPrefix: 'znv_new_',
+        rotationMode: 'scheduled',
+        source: 'manual',
+      }));
     });
 
     it('should not call callback when key stays the same', async () => {

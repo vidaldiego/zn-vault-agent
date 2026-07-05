@@ -5,6 +5,84 @@ All notable changes to ZnVault Agent will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> Note: entries between 1.13.0 and 1.23.0 were tracked in git history and
+> `CLAUDE.md` → "Known Issues & Important Fixes" only.
+
+## [1.23.0] - 2026-07-05 - Managed Key Rotation Propagation
+
+Fixes the 2026-07-05 production incident: a scheduled managed-key rotation was
+never propagated to plugin-deployed API key files (e.g. the payara plugin's
+`ZINC_CONFIG_VAULT_API_KEY`) while the agent was running. The WebSocket
+`apikey.rotated` event was the ONLY runtime refresh path for those files; when
+it was lost, the renewal service's polling rails detected the rotation and
+silently fixed the agent's own credentials, but consumers kept the old key
+until the grace period expired (401s) — only an agent restart re-rendered the
+file. Sync logs reported success throughout because the hourly poll only
+covers `secretTargets`, which the key file is not part of.
+
+### Fixed
+- **Rail-detected rotations now propagate to all consumers**
+  (`src/lib/key-rotation-propagation.ts`): rotations detected by the renewal
+  service (scheduled refresh, grace poll, heartbeat, reconnect) run the same
+  propagation as the WebSocket event handler — live config mutation (plugins
+  read `ctx.config`), plugin `keyRotated` dispatch, exec env-file update, and
+  optional child restart. Bounded pickup within one refresh cycle (≤60s
+  around a scheduled rotation, ≤5min fallback) even if every WebSocket event
+  is lost.
+- **Polling rail for ALL tracked keys** (`src/services/managed-key/
+  tracked-keys-poller.ts`): managed keys referenced by exec/plugin `api-key:`
+  mappings that are NOT the agent's auth key previously had the WebSocket
+  event as their single runtime refresh path (the renewal service polls only
+  the agent's own key). A `TrackedKeyPoller` now binds each tracked non-own
+  key on a per-key schedule derived from its `nextRotationAt` (minimum 60s
+  around rotations, 5min fallback) and feeds the result through the
+  propagator — unchanged values are no-ops via the per-key dedup. Active in
+  daemon mode and exec watch mode.
+- **Exec watch mode** (`--output` env-file mode): rail-detected rotations now
+  update the output env file; previously only the WebSocket event did.
+- **Latent multi-key clobber**: a rotation event for a managed key that is NOT
+  the agent's own auth key no longer overwrites `config.auth.apiKey` /
+  `managedKey` metadata (previously the WebSocket handler mutated them
+  unconditionally).
+
+### Added
+- Explicit rotation-pickup logging: `Managed key rotation propagated to
+  consumers` with `source` (`ws_event`/`scheduled`/`grace_poll`/`heartbeat`/
+  `reconnect`), old/new key prefixes, `pluginsNotified`, `envVarsUpdated`.
+- Duplicate suppression across detection channels: propagations are
+  serialized and deduplicated per key, so the same rotated value is
+  propagated once even when both the WebSocket event and a polling rail fire
+  concurrently (previously this could double-dispatch plugins and
+  double-restart the child process). Stale detections are discarded — a slow
+  bind response can no longer revert consumers to an older key. A
+  partially-failed propagation (e.g. plugin error) is retried automatically
+  (bounded, 30s apart) since no detection channel re-fires for the same
+  rotation.
+- Child restarts triggered by rotations detected during startup's initial
+  bind are skipped until the child process has started (the initial start
+  reads the already-updated config); rail-path propagation participates in
+  graceful-shutdown accounting like the WebSocket path.
+- `onKeyChanged` callback now receives rotation metadata
+  (`KeyChangeMeta`: keyName, prefix, nextRotationAt, graceExpiresAt,
+  rotationMode, source).
+- TEST-ONLY fault injection `ZNVAULT_TEST_SUPPRESS_WS_TOPICS` (comma-separated
+  topics) to simulate lost WebSocket deliveries; logs a warning when active.
+  Never set in production.
+- Tests: unit coverage for the propagator (`key-rotation-propagation.test.ts`)
+  and dispatcher suppression; integration tests
+  (`test/integration/rotation-propagation.test.ts`) covering rotate → plugin
+  file refresh without restart, via the WebSocket path (ROTATION-01) and via
+  the polling rails with WebSocket events suppressed — the incident scenario
+  (ROTATION-02). Test fixture `test/fixtures/key-file-plugin.mjs` mirrors the
+  payara plugin's API-key-file semantics.
+
+### Notes
+- No server-side changes required; safe to roll out agent-first.
+- The payara plugin needs no change: its existing `onKeyRotated` hook is now
+  reliably invoked regardless of which channel detected the rotation. Plugins
+  wanting a generic "secret file changed" signal continue to use
+  `onKeyRotated`/`onSecretChanged`.
+
 ## [1.13.0] - 2026-01-09 - Degraded State Recovery
 
 ### Added

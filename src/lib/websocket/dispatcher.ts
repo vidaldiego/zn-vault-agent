@@ -41,6 +41,25 @@ import { getPluginLoader } from '../../plugins/loader.js';
 const DELIVERY_DEDUP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const DELIVERY_DEDUP_MAX_ENTRIES = 1000;
 
+/**
+ * TEST-ONLY topic suppression (see handleEventMessage). Parsed lazily and
+ * memoized on the raw env value so the per-message cost is one string compare;
+ * entries are trimmed so "apikeys, secrets" works as expected.
+ */
+let suppressCacheRaw: string | undefined = '__uninitialized__';
+let suppressCacheSet: ReadonlySet<string> = new Set();
+
+function getTestSuppressedTopics(): ReadonlySet<string> {
+  const raw = process.env.ZNVAULT_TEST_SUPPRESS_WS_TOPICS;
+  if (raw !== suppressCacheRaw) {
+    suppressCacheRaw = raw;
+    suppressCacheSet = new Set(
+      (raw ?? '').split(',').map((t) => t.trim()).filter((t) => t.length > 0)
+    );
+  }
+  return suppressCacheSet;
+}
+
 class DeliveryIdDedup {
   private readonly seen = new Map<string, number>();
 
@@ -207,6 +226,18 @@ export class MessageDispatcher {
   }
 
   private handleEventMessage(message: UnifiedAgentEvent): void {
+    // TEST-ONLY fault injection: drop events for the listed topics to simulate
+    // lost WebSocket deliveries (chaos/regression testing of the polling-rail
+    // fallback — see the 2026-07-05 rotation-staleness incident). Never set
+    // this in production; the warn log makes accidental use visible.
+    if (message.topic && getTestSuppressedTopics().has(message.topic)) {
+      log.warn({
+        topic: message.topic,
+        suppressedTopics: process.env.ZNVAULT_TEST_SUPPRESS_WS_TOPICS,
+      }, 'TEST MODE: WebSocket event suppressed via ZNVAULT_TEST_SUPPRESS_WS_TOPICS');
+      return;
+    }
+
     if (message.topic === 'certificates' && message.data) {
       const event = message.data as CertificateEvent;
       log.info({ event: event.event, certId: event.certificateId }, 'Received certificate event');

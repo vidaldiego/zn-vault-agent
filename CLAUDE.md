@@ -535,4 +535,58 @@ echo "Config: $(cat /etc/zn-vault-agent/config.json | jq -r '.auth.apiKey[:16]')
 
 **Workaround (if upgrade not possible):** Restart the agent - it auto-fixes stale API key files on startup via `syncManagedKeyFile()`.
 
+### Rail-Detected Rotations Not Propagated to Consumers (Fixed in v1.23.0)
+
+**Issue (2026-07-05 production incident):** When the WebSocket `apikey.rotated`
+event was lost, plugin-deployed API key files (payara's
+`ZINC_CONFIG_VAULT_API_KEY`) stayed stale for the whole grace period even
+though the agent itself kept working — consumers started failing with 401 when
+grace expired, and only an agent restart re-rendered the file.
+
+**Root Cause:** The plugin key file had exactly ONE runtime refresh path: the
+live WebSocket rotation event (`handleApiKeyRotationEvent` → bind → plugin
+`keyRotated` dispatch). The managed-key renewal service's polling safety rails
+(scheduled refresh at `nextRotationAt`−30s, grace poll, heartbeat, reconnect)
+DID detect the rotation and updated the agent's own credentials
+(config + `process.env`), but their `onKeyChanged` callback only reconnected
+the WebSocket — no plugin dispatch, no exec env-file update, and (in
+disk-config mode) no mutation of the live config object plugins read via
+`ctx.config`. The hourly "Secret sync complete ... success: N" poll is
+truthful but structurally blind: it only covers `secretTargets`, which the
+key file is not part of.
+
+**Fix Location:** `src/lib/key-rotation-propagation.ts` — a single propagator
+both channels go through (live config mutation, plugin `keyRotated` dispatch,
+exec env-file update, optional child restart, per-key serialized duplicate
+suppression, stale-detection guard, retry-on-partial-failure). Wired in
+`src/lib/websocket.ts` (`handleApiKeyRotationEvent` + the
+`onManagedKeyChanged` callback) and `src/commands/exec.ts` (watch mode). The
+renewal service's `onKeyChanged` callback now carries rotation metadata
+(`KeyChangeMeta`). Tracked keys BEYOND the agent's own (exec/plugin
+`api-key:` mappings) get their polling rail from
+`src/services/managed-key/tracked-keys-poller.ts`, which binds each such key
+on a per-key schedule and feeds the propagator.
+
+**Symptoms (if running < v1.23.0):**
+- Key file prefix ≠ `znvault apikey managed show <name>` prefix after a
+  rotation, while agent logs show hourly sync success
+- Journal shows `Managed key rotated` (source: scheduled/grace_poll/
+  heartbeat/reconnect) with NO subsequent plugin `keyRotated` log
+- Consumers (e.g. ZincAPI KMS calls) fail with 401 when grace expires
+
+**Verification (v1.23.0+):**
+```bash
+# Force a rotation, then watch for the propagation log WITHOUT restarting:
+grep "Managed key rotation propagated to consumers" /var/log/zn-vault-agent/agent.log
+# Compare file prefix with the vault's current prefix - must match within ~60s:
+sudo head -c 8 /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY
+znvault apikey managed show <name>
+```
+
+**Workaround (if upgrade not possible):** Restart the agent after rotations,
+or trigger rotations only when a restart window is available.
+
+See `docs/POSTMORTEM-2026-07-05-MANAGED-KEY-ROTATION-PROPAGATION.md` for the
+full analysis.
+
 See `docs/TROUBLESHOOTING.md` for more details.

@@ -1,6 +1,8 @@
 // Path: src/services/managed-key/types.ts
 // Constants and types for managed API key renewal
 
+import type { KeyRotationMeta, KeyRotationSource } from '../../lib/key-rotation-propagation.js';
+
 // ============================================================================
 // Configuration Constants
 // ============================================================================
@@ -49,21 +51,23 @@ export interface RotationTracking {
   missedRotations: number;
 }
 
-/** Source of key refresh trigger */
-export type RefreshSource =
-  | 'scheduled'
-  | 'ws_event'
-  | 'grace_poll'
-  | 'reconnect'
-  | 'heartbeat'
-  | 'manual';
+/** Source of key refresh trigger (canonical union lives with the propagator) */
+export type RefreshSource = KeyRotationSource;
+
+/**
+ * Rotation metadata passed to the onKeyChanged callback so consumers
+ * (plugin keyRotated dispatch, exec env files) can be refreshed regardless
+ * of which channel detected the rotation (2026-07-05 incident fix).
+ * Same shape the key-rotation propagator consumes.
+ */
+export type KeyChangeMeta = KeyRotationMeta;
 
 /** Managed key service state */
 export interface ManagedKeyState {
   isRunning: boolean;
   currentKey: string | null;
   staleKeyDetected: boolean;
-  onKeyChangedCallback: ((newKey: string) => void) | null;
+  onKeyChangedCallback: ((newKey: string, meta: KeyChangeMeta) => void) | null;
 }
 
 /** Managed key status response */

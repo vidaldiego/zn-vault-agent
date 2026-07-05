@@ -109,6 +109,49 @@ describe('MessageDispatcher apikey deliveryId dedup', () => {
   });
 });
 
+describe('MessageDispatcher test-only event suppression (ZNVAULT_TEST_SUPPRESS_WS_TOPICS)', () => {
+  let dispatcher: MessageDispatcher;
+  let handlerCalls: ApiKeyRotationEvent[];
+
+  beforeEach(() => {
+    dispatcher = new MessageDispatcher({
+      managedKeyNames: ['test-key'],
+      onPongReceived: () => {},
+    });
+    handlerCalls = [];
+    dispatcher.onApiKeyRotationEvent((event) => {
+      handlerCalls.push(event);
+    });
+  });
+
+  afterEach(() => {
+    delete process.env.ZNVAULT_TEST_SUPPRESS_WS_TOPICS;
+    dispatcher.resetDedupForTesting();
+  });
+
+  it('drops events for suppressed topics (lost-event fault injection)', () => {
+    process.env.ZNVAULT_TEST_SUPPRESS_WS_TOPICS = 'apikeys';
+
+    dispatcher.handleMessage(null, makeApiKeyMessage('suppress-1'));
+
+    expect(handlerCalls).toHaveLength(0);
+  });
+
+  it('delivers events for topics not in the suppression list', () => {
+    process.env.ZNVAULT_TEST_SUPPRESS_WS_TOPICS = 'secrets,certificates';
+
+    dispatcher.handleMessage(null, makeApiKeyMessage('suppress-2'));
+
+    expect(handlerCalls).toHaveLength(1);
+  });
+
+  it('delivers all events when the variable is unset', () => {
+    dispatcher.handleMessage(null, makeApiKeyMessage('suppress-3'));
+
+    expect(handlerCalls).toHaveLength(1);
+  });
+});
+
 describe('MessageDispatcher update-available', () => {
   let dispatcher: MessageDispatcher;
   let updateCalls: AgentUpdateEvent[];

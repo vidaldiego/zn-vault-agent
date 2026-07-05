@@ -5,7 +5,7 @@ import type { Command } from 'commander';
 import chalk from 'chalk';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { isConfigured, isManagedKeyMode } from '../lib/config.js';
+import { isConfigured, isManagedKeyMode, loadConfig } from '../lib/config.js';
 import {
   parseSecretMapping,
   parseEnvFileReference,
@@ -16,10 +16,11 @@ import {
   extractSecretIds,
   extractApiKeyNames,
   extractEnvFileSecretIds,
-  findEnvVarsForApiKey,
   type SecretMapping,
   type EnvFileMapping,
 } from '../lib/secret-env.js';
+import { createKeyRotationPropagator } from '../lib/key-rotation-propagation.js';
+import { TrackedKeyPoller } from '../services/managed-key/tracked-keys-poller.js';
 import { createUnifiedWebSocketClient, type ApiKeyRotationEvent, type SecretEvent } from '../lib/websocket.js';
 import { bindManagedApiKey, getSecret } from '../lib/api.js';
 import { execLogger as log } from '../lib/logger.js';
@@ -255,11 +256,35 @@ async function startWatchMode(
     apiKeyNames,
   }, 'Starting watch mode');
 
+  // Unified propagation of rotated keys to the env file (2026-07-05 incident
+  // fix): both detection channels — the WebSocket rotation event and the
+  // renewal service's polling rails — go through this one path, which
+  // serializes per key, deduplicates across channels, discards stale
+  // detections, and retries partial failures.
+  const keyRotationPropagator = createKeyRotationPropagator({
+    config: loadConfig(),
+    getPluginLoader: () => null,
+    execOutputFile: outputPath,
+    execSecretMappings: mappings,
+    onEnvVarUpdated: (envVar, value) => {
+      currentEnv[envVar] = value;
+      console.log(chalk.green('✓') + ` Updated ${envVar} in ${outputPath} (API key rotated)`);
+    },
+    isShuttingDown: () => isShuttingDown,
+  });
+
   // Start managed key renewal if in managed key mode
   if (isManagedKeyMode()) {
     log.info('Starting managed key renewal service');
-    onManagedKeyChanged((newKey) => {
-      log.info({ newKeyPrefix: newKey.substring(0, 8) }, 'Managed key changed');
+    // Rail-detected rotations (scheduled refresh, grace poll, heartbeat,
+    // reconnect) must update the env file just like the WebSocket rotation
+    // event handler below — otherwise a lost event leaves the output file
+    // stale until restart.
+    onManagedKeyChanged((newKey, meta) => {
+      const detectedAt = Date.now();
+      void keyRotationPropagator.propagate(newKey, meta, { detectedAt }).catch((err: unknown) => {
+        log.error({ err, keyName: meta.keyName }, 'Failed to propagate rail-detected key rotation');
+      });
     });
     try {
       await startManagedKeyRenewal();
@@ -267,6 +292,16 @@ async function startWatchMode(
       log.error({ err }, 'Failed to start managed key renewal');
     }
   }
+
+  // Polling rail for tracked keys BEYOND the agent's own auth key: the
+  // renewal service above covers only config.managedKey.name; other
+  // `api-key:` mappings would otherwise depend solely on WebSocket events.
+  const trackedKeyPoller = new TrackedKeyPoller({
+    keyNames: apiKeyNames.filter((name) => name !== loadConfig().managedKey?.name),
+    propagate: (newKey, meta, opts) => keyRotationPropagator.propagate(newKey, meta, opts),
+    isShuttingDown: () => isShuttingDown,
+  });
+  trackedKeyPoller.start();
 
   // Create WebSocket client with subscriptions
   const wsClient = createUnifiedWebSocketClient(secretIds, apiKeyNames);
@@ -289,21 +324,18 @@ async function startWatchMode(
     }, 'API key rotation event received');
 
     try {
-      // Fetch the new key via bind
+      // Fetch the new key via bind, then propagate through the shared path
+      // (env-file update + currentEnv cache via onEnvVarUpdated; dedup with
+      // the rail callback above).
       const bindResponse = await bindManagedApiKey(event.apiKeyName);
-      const newKey = bindResponse.key;
-
-      // Find which env vars map to this API key
-      const envVars = findEnvVarsForApiKey(mappings, event.apiKeyName);
-
-      for (const envVar of envVars) {
-        // Update local cache
-        currentEnv[envVar] = newKey;
-
-        // Update env file
-        updateEnvFile(outputPath, envVar, newKey);
-        console.log(chalk.green('✓') + ` Updated ${envVar} in ${outputPath} (API key rotated)`);
-      }
+      await keyRotationPropagator.propagate(bindResponse.key, {
+        keyName: event.apiKeyName,
+        newPrefix: event.newPrefix ?? bindResponse.prefix,
+        nextRotationAt: bindResponse.nextRotationAt,
+        graceExpiresAt: bindResponse.graceExpiresAt ?? event.graceExpiresAt,
+        rotationMode: bindResponse.rotationMode ?? event.rotationMode,
+        source: 'ws_event',
+      }, { detectedAt: Date.now() });
     } catch (err) {
       log.error({ err, keyName: event.apiKeyName }, 'Failed to handle API key rotation');
       console.error(chalk.red('✗') + ` Failed to update API key ${event.apiKeyName}: ${err instanceof Error ? err.message : String(err)}`);
@@ -433,6 +465,7 @@ async function startWatchMode(
     console.log(chalk.blue('\nℹ') + ` Received ${signal}, shutting down...`);
 
     wsClient.disconnect();
+    trackedKeyPoller.stop();
 
     if (isManagedKeyMode()) {
       stopManagedKeyRenewal();

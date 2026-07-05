@@ -44,6 +44,8 @@ export interface AgentConfig {
   insecure?: boolean;
   targets?: unknown[];
   secretTargets?: unknown[];
+  managedKey?: { name: string; rotationMode?: string };
+  plugins?: { package: string; path?: string; config?: Record<string, unknown> }[];
 }
 
 export class AgentRunner {
@@ -447,6 +449,8 @@ export class AgentRunner {
     healthPort?: number;
     metricsEnabled?: boolean;
     pollInterval?: number;
+    /** Extra environment variables for the daemon process (e.g. fault injection) */
+    env?: Record<string, string>;
     // Combined mode options
     exec?: string;
     secrets?: string[];
@@ -493,6 +497,7 @@ export class AgentRunner {
       ...process.env,
       ZNVAULT_AGENT_CONFIG_DIR: this.configDir,
       LOG_LEVEL: 'info',
+      ...opts?.env,
     };
 
     const proc = spawn('node', [AGENT_BIN, ...args], {
