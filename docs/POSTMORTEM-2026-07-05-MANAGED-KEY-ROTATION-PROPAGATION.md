@@ -165,3 +165,85 @@ journalctl -u zn-vault-agent | grep "Managed key rotation propagated"
 - **Post-rollout check per host:** force one rotation of a low-stakes managed
   key and confirm the `Managed key rotation propagated to consumers` journal
   line + file prefix change without an agent restart.
+
+## Rollout record (2026-07-05/06)
+
+**Release:** v1.23.0 published 2026-07-05 via tag-push CI (commits `9840c58`
+fix + `073f277` release, tag `v1.23.0`; npm `latest` confirmed).
+
+**Fleet rollout (2026-07-06), canary-first on the incident fleet:**
+
+| Host | Result |
+|------|--------|
+| payara-staging-1 (.55, canary) | 1.23.0, healthy, key file correct, ZincAPI redeployed, `/health` 200 |
+| payara-staging-2 (.56) | 1.23.0, healthy, `keySync: true` |
+| payara-staging-3 (.57) | 1.23.0, healthy, `keySync: true` |
+| payara-staging-worker-1 (.58) | 1.23.0, healthy, `keySync: true` |
+
+Remaining 13 agents (zn-admin ×4, archon ×5, haproxy-s1/s2, minio-proxy ×2)
+still on 1.22.5 at time of writing — same latent bug, pending a separate
+rollout window.
+
+**Acceptance test 1 — live rotation (the incident scenario):** with all four
+hosts on 1.23.0, forced rotation of `zincapi-staging`
+(`znv_6928` → `znv_3b62`). All four key files updated within seconds; every
+host logged `Managed key rotation propagated to consumers` (source:
+`ws_event`); agent uptimes predate the rotation (no restarts); ZincAPI
+`/health` stayed 200 throughout (zero-downtime rotation via the file-read
+key mode).
+
+**Acceptance test 2 — rotation while the agent is down (reboot scenario):**
+agent stopped on .55, key rotated (`znv_3b62` → `znv_6516`), agent started.
+The startup initial bind detected the missed rotation (`Managed key rotated`,
+source: `scheduled`), the propagator refreshed the file within seconds of
+start, and the store-first pending events redelivered on reconnect were
+correctly deduplicated (5 events, one propagation). Payara restarted, WAR
+deployed, `/health` 200, plugin healthy.
+
+The polling-rail path (WebSocket events lost entirely) is covered by
+integration test ROTATION-02/03 rather than a production drill.
+
+**Operational notes from the rollout:**
+
+- `znvault agent update <target>` needs an IP (SSH tunnel does not resolve
+  agent hostnames) and the profile's SSH user set
+  (`znvault ssh config set user sysadmin`) — otherwise the SSH-CA tunnel
+  tries the local username and fails with `Permission denied (publickey)`.
+- On payara hosts, the agent restart bounces Payara (aggressive-mode startup
+  is a clean-slate stop/start/redeploy) — plan a brief app blip per host.
+- The plugin's `onStart` hit the 30s loader timeout mid-WAR-deploy on the
+  canary (`Plugin 'payara' onStart timed out after 30000ms`). The asadmin
+  deploy completed in the background and the plugin auto-recovered via its
+  health check (`Plugin recovered from error state`, ~100s after start).
+  Pre-existing behavior, not a v1.23.0 regression — follow-up below.
+- `systemctl stop zn-vault-agent` on payara hosts also stops ZincAPI: the
+  Payara JVM lives inside the agent's systemd cgroup (same mechanism as the
+  v1.22.3/v1.22.4 MemoryMax fixes). An agent stop/update is an app outage on
+  these hosts.
+
+## Follow-ups
+
+1. **Plugin `onStart` timeout too short for aggressive-mode startup** — the
+   30s loader timeout expires mid-deploy (~35–45s sequence). Raise the
+   timeout, make it configurable, or move the deploy out of `onStart`. Until
+   then every agent restart on a payara host logs a transient plugin error
+   that self-heals.
+2. **Payara JVM inside the agent cgroup** — agent stop/update takes the app
+   down with it. Consider launching Payara in its own systemd scope/unit so
+   agent lifecycle and app lifecycle are independent.
+3. **Dispatcher deliveryId dedup registers before handlers run**
+   (`src/lib/websocket/dispatcher.ts`) — a failed live handling permanently
+   swallows the redelivered copy. Weigh ack-after-success against the
+   2026-05-03 event-storm protection. Mitigated by the polling rails.
+4. **`ChildProcessManager.restart()` is not reentrant** (pre-existing) —
+   concurrent restarts can double-spawn; propagator serialization removes
+   the common trigger but the primitive should be hardened.
+5. **P9 (2026-06-12 incident)** — the broadcast-scoping anomaly and
+   fleet-wide WS drop remain the open suspects for the original event loss;
+   still worth closing on the vault server side.
+6. **Roll v1.23.0 to the remaining 13 agents.**
+7. **CI actions on deprecated Node 20 runners** — bump `actions/checkout` /
+   `setup-node` to v5 in the publish workflow.
+8. **`last_bound_at` phantom field** — the CLI renders `Last Bound: Never`
+   from a field the server never returns; either implement bind tracking
+   server-side or drop the row from `znvault apikey managed show`.

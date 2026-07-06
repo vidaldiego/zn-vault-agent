@@ -586,7 +586,20 @@ znvault apikey managed show <name>
 **Workaround (if upgrade not possible):** Restart the agent after rotations,
 or trigger rotations only when a restart window is available.
 
+**Status:** Fixed in v1.23.0, verified in production 2026-07-06 on the
+payara-staging fleet (.55–.58): forced rotation propagated to all four key
+files in seconds without agent restarts (source `ws_event`), and a
+rotation-while-agent-down test recovered at startup (source `scheduled`,
+redelivered events deduped).
+
+**Rollout gotchas (payara hosts):** `znvault agent update` needs the target
+IP + `znvault ssh config set user sysadmin`; an agent restart bounces Payara
+(aggressive-mode startup) and hits a pre-existing 30s plugin `onStart`
+timeout mid-deploy that self-heals via the health check ("Plugin recovered
+from error state"); `systemctl stop zn-vault-agent` also stops ZincAPI (the
+Payara JVM lives in the agent's cgroup).
+
 See `docs/POSTMORTEM-2026-07-05-MANAGED-KEY-ROTATION-PROPAGATION.md` for the
-full analysis.
+full analysis, rollout record, and follow-ups.
 
 See `docs/TROUBLESHOOTING.md` for more details.
