@@ -49,6 +49,11 @@ describe('updater path-activation units', () => {
     expect(unit).toContain('WantedBy=paths.target');
   });
 
+  it('has no timer activation in either managed updater unit', () => {
+    expect(buildUpdaterPathUnit()).not.toContain('OnCalendar=');
+    expect(buildUpdaterUnit()).not.toContain('OnCalendar=');
+  });
+
   it('buildUpdaterUnit ExecStart runs the wrapper script, not inline npm', () => {
     const unit = buildUpdaterUnit();
     expect(unit).toContain('ExecStart=/usr/local/lib/zn-vault-agent/zn-vault-agent-update.sh');

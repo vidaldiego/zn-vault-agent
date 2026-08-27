@@ -38,6 +38,11 @@ const UPDATER_SERVICE_FILE = `${SYSTEMD_DIR}/${UPDATER_SERVICE_NAME}.service`;
 const SUDOERS_FILE = `/etc/sudoers.d/${SYSTEM_USER}`;
 const UPDATER_PATH_NAME = 'zn-vault-agent-updater';
 const UPDATER_PATH_FILE = `${SYSTEMD_DIR}/${UPDATER_PATH_NAME}.path`;
+// Obsolete polling activation shipped by an early updater bootstrap. Starting
+// the trigger-consuming oneshot on a clock with no trigger makes it fail every
+// day and leaves otherwise healthy hosts in systemd's degraded state. The
+// event-driven .path unit below is the sole supported activation mechanism.
+const LEGACY_UPDATER_TIMER_FILE = `${SYSTEMD_DIR}/${UPDATER_SERVICE_NAME}.timer`;
 const WRAPPER_INSTALL_DIR = '/usr/local/lib/zn-vault-agent';
 const WRAPPER_INSTALL_PATH = `${WRAPPER_INSTALL_DIR}/zn-vault-agent-update.sh`;
 const TRIGGER_FILE = `${DATA_DIR}/.update-trigger`;
@@ -291,6 +296,16 @@ LOG_LEVEL=info
   chownSafe(UPDATER_PATH_FILE, 'root:root');
   console.log(chalk.green(`  Installed ${UPDATER_PATH_FILE}`));
 
+  // Retire the legacy daily timer before daemon-reload. A current setup must
+  // also heal hosts upgraded from that older activation model; merely writing
+  // the new .path unit leaves the old timer enabled indefinitely.
+  systemctlSafeQuiet('stop', `${UPDATER_SERVICE_NAME}.timer`);
+  systemctlSafeQuiet('disable', `${UPDATER_SERVICE_NAME}.timer`);
+  if (existsSync(LEGACY_UPDATER_TIMER_FILE)) {
+    unlinkSync(LEGACY_UPDATER_TIMER_FILE);
+    console.log(chalk.green(`  Removed obsolete ${LEGACY_UPDATER_TIMER_FILE}`));
+  }
+
   // Remove any stale trigger so enabling the .path does not fire-on-enable.
   if (existsSync(TRIGGER_FILE)) {
     unlinkSync(TRIGGER_FILE);
@@ -431,6 +446,12 @@ async function handleUninstall(options: { purge?: boolean; yes?: boolean }): Pro
     console.log(`Removing ${UPDATER_PATH_FILE}...`);
     unlinkSync(UPDATER_PATH_FILE);
     console.log(chalk.green(`  Removed ${UPDATER_PATH_FILE}`));
+  }
+  systemctlSafeQuiet('stop', `${UPDATER_SERVICE_NAME}.timer`);
+  systemctlSafeQuiet('disable', `${UPDATER_SERVICE_NAME}.timer`);
+  if (existsSync(LEGACY_UPDATER_TIMER_FILE)) {
+    unlinkSync(LEGACY_UPDATER_TIMER_FILE);
+    console.log(chalk.green(`  Removed ${LEGACY_UPDATER_TIMER_FILE}`));
   }
   if (existsSync(WRAPPER_INSTALL_PATH)) {
     unlinkSync(WRAPPER_INSTALL_PATH);
