@@ -18,6 +18,7 @@ export type {
   PluginHealthStatus,
   LoadedPlugin,
   PluginEventMap,
+  PluginEventDispatchResult,
 } from './types.js';
 
 // Loader

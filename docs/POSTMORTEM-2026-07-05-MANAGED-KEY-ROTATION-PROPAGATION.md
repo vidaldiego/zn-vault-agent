@@ -223,11 +223,11 @@ integration test ROTATION-02/03 rather than a production drill.
 
 ## Follow-ups
 
-1. **Plugin `onStart` timeout too short for aggressive-mode startup** — the
-   30s loader timeout expires mid-deploy (~35–45s sequence). Raise the
-   timeout, make it configurable, or move the deploy out of `onStart`. Until
-   then every agent restart on a payara host logs a transient plugin error
-   that self-heals.
+1. **Resolved 2026-08-27 — plugin `onStart` timeout too short for
+   aggressive-mode startup.** `onStart` now has a dedicated 120s budget, and
+   `keyRotated` is delivered even to a plugin left in `error` by a late
+   startup. Dispatch returns real handler counts, warns on lifecycle skips,
+   and exposes failures/skips to the rotation propagator so it retries.
 2. **Payara JVM inside the agent cgroup** — agent stop/update takes the app
    down with it. Consider launching Payara in its own systemd scope/unit so
    agent lifecycle and app lifecycle are independent.

@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Note: entries between 1.13.0 and 1.23.0 were tracked in git history and
 > `CLAUDE.md` → "Known Issues & Important Fixes" only.
 
+## [Unreleased]
+
+### Fixed
+
+- **Payara managed-key rotations no longer depend on an external agent health
+  check after cold startup.** Plugin `onStart` now has a dedicated 120-second
+  budget (the production WAR deployment takes 50-90 seconds). A
+  recovery-critical `keyRotated` event is still delivered when a plugin is in
+  `error`, covering an uncancellable startup hook that finishes after its
+  timeout.
+- Plugin event dispatch now returns exact invoked/succeeded/failed/skipped
+  handler counts. Rotation logs report `pluginsNotified` as the number of
+  handlers actually invoked instead of a success-shaped boolean; skipped
+  handlers produce a warning, and failed or skipped rotation handlers keep the
+  propagation incomplete so its bounded retry can self-heal.
+- The integration runner now isolates daemon config overrides from the SDK
+  harness, preserves tracked fixtures when cleaning temporary plugins, avoids
+  deleting other workers' config directories, and bounds daemon shutdown.
+
 ## [1.23.0] - 2026-07-05 - Managed Key Rotation Propagation
 
 Fixes the 2026-07-05 production incident: a scheduled managed-key rotation was

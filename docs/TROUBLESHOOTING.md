@@ -161,10 +161,10 @@ zn-vault-agent login --url https://vault.example.com \
 **Verification:**
 ```bash
 # After upgrading to v1.20.12+, check logs for plugin event dispatch
-sudo grep "keyRotated.*dispatched" /var/log/zn-vault-agent/agent.log
+sudo grep "keyRotated event dispatch completed" /var/log/zn-vault-agent/agent.log
 
 # You should see:
-# "Plugin keyRotated event dispatched successfully"
+# "Plugin keyRotated event dispatch completed" with handlersInvoked > 0
 ```
 
 ---
@@ -172,14 +172,15 @@ sudo grep "keyRotated.*dispatched" /var/log/zn-vault-agent/agent.log
 ### Plugin Start Timeout
 
 **Symptoms:**
-- Log shows "Plugin 'name' onStart timed out after 30000ms"
+- Log shows "Plugin 'name' onStart timed out after 120000ms"
 - Plugin shows status "error" in health endpoint
 
-**Cause:** Plugin's `onStart` hook took longer than 30 seconds (common with Payara during WAR deployment).
+**Cause:** Plugin's `onStart` hook took longer than 120 seconds. Startup has a larger budget than
+other plugin hooks because Payara WAR deployment normally takes 50-90 seconds.
 
 **Solutions:**
 
-1. **Increase timeout (if using Payara plugin):**
+1. **Check the plugin's own operation/deploy timeouts (if using Payara):**
    ```json
    {
      "plugins": [{
@@ -191,6 +192,9 @@ sudo grep "keyRotated.*dispatched" /var/log/zn-vault-agent/agent.log
      }]
    }
    ```
+
+   These settings govern Payara operations inside the plugin; the agent's `onStart` lifecycle
+   budget is 120 seconds and is not changed by them.
 
 2. **Check the underlying service:**
    ```bash

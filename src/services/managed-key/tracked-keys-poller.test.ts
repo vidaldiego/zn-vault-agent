@@ -62,7 +62,7 @@ describe('TrackedKeyPoller', () => {
     const bindKey = vi.fn().mockImplementation((name: string) =>
       Promise.resolve(makeBindResponse(name, `znv_${name}_value_1`))
     );
-    const propagate = vi.fn().mockResolvedValue({ propagated: true, pluginsNotified: false, envVarsUpdated: [], errors: [] });
+    const propagate = vi.fn().mockResolvedValue({ propagated: true, pluginsNotified: 0, envVarsUpdated: [], errors: [] });
 
     poller = new TrackedKeyPoller({
       keyNames: [KEY_1, KEY_2],
@@ -95,7 +95,7 @@ describe('TrackedKeyPoller', () => {
       // nextRotationAt in the near future → clamped to minIntervalMs
       Promise.resolve(makeBindResponse(name, 'znv_same_value', new Date(Date.now() + 10).toISOString()))
     );
-    const propagate = vi.fn().mockResolvedValue({ propagated: false, skipped: 'duplicate', pluginsNotified: false, envVarsUpdated: [], errors: [] });
+    const propagate = vi.fn().mockResolvedValue({ propagated: false, skipped: 'duplicate', pluginsNotified: 0, envVarsUpdated: [], errors: [] });
 
     poller = new TrackedKeyPoller({
       keyNames: [KEY_1],
@@ -116,7 +116,7 @@ describe('TrackedKeyPoller', () => {
     const bindKey = vi.fn()
       .mockRejectedValueOnce(new Error('vault unreachable'))
       .mockResolvedValue(makeBindResponse(KEY_1, 'znv_recovered'));
-    const propagate = vi.fn().mockResolvedValue({ propagated: true, pluginsNotified: false, envVarsUpdated: [], errors: [] });
+    const propagate = vi.fn().mockResolvedValue({ propagated: true, pluginsNotified: 0, envVarsUpdated: [], errors: [] });
 
     poller = new TrackedKeyPoller({
       keyNames: [KEY_1],
@@ -139,7 +139,7 @@ describe('TrackedKeyPoller', () => {
     const bindKey = vi.fn().mockImplementation(() =>
       Promise.resolve(makeBindResponse(KEY_1, 'znv_value'))
     );
-    const propagate = vi.fn().mockResolvedValue({ propagated: true, pluginsNotified: false, envVarsUpdated: [], errors: [] });
+    const propagate = vi.fn().mockResolvedValue({ propagated: true, pluginsNotified: 0, envVarsUpdated: [], errors: [] });
 
     poller = new TrackedKeyPoller({
       keyNames: [KEY_1],
@@ -178,7 +178,7 @@ describe('TrackedKeyPoller', () => {
     const bindKey = vi.fn().mockImplementation(() =>
       Promise.resolve(makeBindResponse(KEY_1, 'znv_value'))
     );
-    const propagate = vi.fn().mockResolvedValue({ propagated: true, pluginsNotified: false, envVarsUpdated: [], errors: [] });
+    const propagate = vi.fn().mockResolvedValue({ propagated: true, pluginsNotified: 0, envVarsUpdated: [], errors: [] });
 
     poller = new TrackedKeyPoller({
       keyNames: [KEY_1],

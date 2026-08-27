@@ -442,6 +442,24 @@ export interface PluginEventMap {
 }
 
 /**
+ * Outcome of dispatching one event across the loaded plugins.
+ *
+ * A handler is "invoked" once execution has been attempted, whether it later
+ * succeeds or fails. "Skipped" counts plugins that implement the handler but
+ * whose lifecycle state does not allow that event to run.
+ */
+export interface PluginEventDispatchResult {
+  /** Handlers whose execution was attempted. */
+  handlersInvoked: number;
+  /** Invoked handlers that completed successfully. */
+  handlersSucceeded: number;
+  /** Invoked handlers that threw or timed out. */
+  handlersFailed: number;
+  /** Implemented handlers skipped because of plugin lifecycle state. */
+  handlersSkipped: number;
+}
+
+/**
  * Plugin event handler names
  */
 export const PLUGIN_EVENT_HANDLERS = {

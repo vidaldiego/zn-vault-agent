@@ -8,7 +8,6 @@
 
 import { beforeAll, afterAll } from 'vitest';
 import { VaultTestClient, waitForVault } from './helpers/vault-client.js';
-import { cleanupAllTests } from './helpers/agent-runner.js';
 
 // Test environment configuration
 // Environment variables are set by sdk-test-run.sh:
@@ -64,6 +63,8 @@ beforeAll(async () => {
  * Global test teardown
  */
 afterAll(() => {
-  cleanupAllTests();
+  // Each AgentRunner owns and removes its own unique directory. Deleting the
+  // shared .test-config root here races other integration files because this
+  // setup file runs once per Vitest worker.
   globalVaultClient = null;
 });

@@ -63,7 +63,12 @@ interface TestContext {
 
 function makeDeps(overrides?: Partial<KeyRotationPropagatorDeps>): { deps: KeyRotationPropagatorDeps; ctx: TestContext } {
   const config = makeConfig();
-  const dispatchEvent = vi.fn().mockResolvedValue(undefined);
+  const dispatchEvent = vi.fn().mockResolvedValue({
+    handlersInvoked: 1,
+    handlersSucceeded: 1,
+    handlersFailed: 0,
+    handlersSkipped: 0,
+  });
   const persistManagedKey = vi.fn();
   const updateEnvFileFn = vi.fn().mockReturnValue({ updated: true, added: false });
   const restartChild = vi.fn().mockResolvedValue(undefined);
@@ -102,6 +107,7 @@ describe('createKeyRotationPropagator', () => {
     const result = await propagator.propagate(KEY_B, META);
 
     expect(result.propagated).toBe(true);
+    expect(result.pluginsNotified).toBe(1);
     expect(ctx.dispatchEvent).toHaveBeenCalledTimes(1);
     expect(ctx.dispatchEvent).toHaveBeenCalledWith('keyRotated', expect.objectContaining({
       keyName: KEY_NAME,
@@ -223,6 +229,66 @@ describe('createKeyRotationPropagator', () => {
     propagator.stop();
   });
 
+  it('should retry when the loader reports a failed plugin handler', async () => {
+    const { deps, ctx } = makeDeps();
+    ctx.dispatchEvent
+      .mockResolvedValueOnce({
+        handlersInvoked: 1,
+        handlersSucceeded: 0,
+        handlersFailed: 1,
+        handlersSkipped: 0,
+      })
+      .mockResolvedValueOnce({
+        handlersInvoked: 1,
+        handlersSucceeded: 1,
+        handlersFailed: 0,
+        handlersSkipped: 0,
+      });
+    deps.retryDelayMs = 60_000;
+    const propagator = createKeyRotationPropagator(deps);
+
+    const first = await propagator.propagate(KEY_B, META);
+    expect(first.pluginsNotified).toBe(1);
+    expect(first.errors).toContain('plugin dispatch failed for 1 handler(s)');
+
+    const second = await propagator.propagate(KEY_B, META);
+    expect(second.propagated).toBe(true);
+    expect(second.errors).toEqual([]);
+    expect(ctx.dispatchEvent).toHaveBeenCalledTimes(2);
+
+    propagator.stop();
+  });
+
+  it('should retry when the loader skips a plugin handler', async () => {
+    const { deps, ctx } = makeDeps();
+    ctx.dispatchEvent
+      .mockResolvedValueOnce({
+        handlersInvoked: 0,
+        handlersSucceeded: 0,
+        handlersFailed: 0,
+        handlersSkipped: 1,
+      })
+      .mockResolvedValueOnce({
+        handlersInvoked: 1,
+        handlersSucceeded: 1,
+        handlersFailed: 0,
+        handlersSkipped: 0,
+      });
+    deps.retryDelayMs = 60_000;
+    const propagator = createKeyRotationPropagator(deps);
+
+    const first = await propagator.propagate(KEY_B, META);
+    expect(first.pluginsNotified).toBe(0);
+    expect(first.errors).toContain('plugin dispatch skipped 1 handler(s)');
+
+    const second = await propagator.propagate(KEY_B, META);
+    expect(second.propagated).toBe(true);
+    expect(second.pluginsNotified).toBe(1);
+    expect(second.errors).toEqual([]);
+
+    propagator.stop();
+  });
+
   it('should auto-retry a partially-failed propagation (no detection channel re-fires for it)', async () => {
     const { deps, ctx } = makeDeps();
     ctx.dispatchEvent.mockRejectedValueOnce(new Error('transient plugin error'));
@@ -321,7 +387,7 @@ describe('createKeyRotationPropagator', () => {
 
     const result = await propagator.propagate(KEY_B, META);
     expect(result.propagated).toBe(true);
-    expect(result.pluginsNotified).toBe(false);
+    expect(result.pluginsNotified).toBe(0);
   });
 
   it('should not update managedKey metadata for a different key than the agent`s own', async () => {

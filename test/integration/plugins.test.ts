@@ -123,7 +123,6 @@ describe('Plugin System', () => {
     // Cleanup mock plugin
     try {
       rmSync(mockPluginPath, { force: true });
-      rmSync(dirname(mockPluginPath), { recursive: true, force: true });
     } catch { /* ignore */ }
 
     if (testApiKey) {

@@ -151,6 +151,9 @@ describe('Managed Key Rotation Propagation', () => {
       const finalKey = readKeyFile(env.keyFilePath);
       expect(finalKey).not.toBe(env.initialKey);
       expect(finalKey?.startsWith(rotation.newPrefix)).toBe(true);
+    } catch (err) {
+      console.error('ROTATION-01 daemon output:', env.daemon.getOutput());
+      throw err;
     } finally {
       await env.cleanup();
     }
@@ -186,6 +189,9 @@ describe('Managed Key Rotation Propagation', () => {
 
       const finalKey = readKeyFile(env.keyFilePath);
       expect(finalKey).not.toBe(env.initialKey);
+    } catch (err) {
+      console.error('ROTATION-02 daemon output:', env.daemon.getOutput());
+      throw err;
     } finally {
       await env.cleanup();
     }

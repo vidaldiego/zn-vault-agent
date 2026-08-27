@@ -371,6 +371,33 @@ describe('PluginLoader', () => {
 
       expect(loader.getPluginStatus('start-once')).toBe('running');
     });
+
+    it('should allow a production-length startup hook to finish', async () => {
+      vi.useFakeTimers();
+
+      try {
+        const pluginPath = writeTestPlugin(testDir, 'slow-start-plugin', `
+          export default {
+            name: 'slow-start',
+            version: '1.0.0',
+            async onStart() {
+              await new Promise((resolve) => setTimeout(resolve, 90000));
+            }
+          };
+        `);
+
+        await loader.loadPlugin({ path: pluginPath });
+        await loader.initializePlugins();
+
+        const startPromise = loader.startPlugins();
+        await vi.advanceTimersByTimeAsync(90_000);
+        await startPromise;
+
+        expect(loader.getPluginStatus('slow-start')).toBe('running');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe('dispatchEvent', () => {
@@ -400,7 +427,7 @@ describe('PluginLoader', () => {
       await loader.initializePlugins();
       await loader.startPlugins();
 
-      await loader.dispatchEvent('certificateDeployed', {
+      const result = await loader.dispatchEvent('certificateDeployed', {
         certId: 'cert-123',
         name: 'test-cert',
         paths: { combined: '/etc/ssl/test.pem' },
@@ -410,8 +437,12 @@ describe('PluginLoader', () => {
         isUpdate: true,
       });
 
-      // The event handler was called (we can't easily verify the exact call
-      // since it's in a dynamic import, but the test passing means no errors)
+      expect(result).toEqual({
+        handlersInvoked: 1,
+        handlersSucceeded: 1,
+        handlersFailed: 0,
+        handlersSkipped: 0,
+      });
     });
 
     it('should continue dispatching if one handler throws', async () => {
@@ -441,18 +472,82 @@ describe('PluginLoader', () => {
       await loader.initializePlugins();
       await loader.startPlugins();
 
-      // Should not throw
-      await expect(
-        loader.dispatchEvent('certificateDeployed', {
-          certId: 'cert-123',
-          name: 'test',
-          paths: {},
-          fingerprint: 'abc',
-          expiresAt: '',
-          commonName: '',
-          isUpdate: false,
-        })
-      ).resolves.not.toThrow();
+      const result = await loader.dispatchEvent('certificateDeployed', {
+        certId: 'cert-123',
+        name: 'test',
+        paths: {},
+        fingerprint: 'abc',
+        expiresAt: '',
+        commonName: '',
+        isUpdate: false,
+      });
+
+      expect(result).toEqual({
+        handlersInvoked: 2,
+        handlersSucceeded: 1,
+        handlersFailed: 1,
+        handlersSkipped: 0,
+      });
+    });
+
+    it('should dispatch keyRotated to a plugin left in error by onStart', async () => {
+      const pluginPath = writeTestPlugin(testDir, 'errored-key-plugin', `
+        export default {
+          name: 'errored-key-plugin',
+          version: '1.0.0',
+          async onStart() {
+            throw new Error('startup timed out');
+          },
+          async onKeyRotated() {}
+        };
+      `);
+
+      await loader.loadPlugin({ path: pluginPath });
+      await loader.initializePlugins();
+      await loader.startPlugins();
+      expect(loader.getPluginStatus('errored-key-plugin')).toBe('error');
+
+      const result = await loader.dispatchEvent('keyRotated', {
+        keyName: 'zincapi-staging',
+        newPrefix: 'znv_new',
+        rotationMode: 'scheduled',
+      });
+
+      expect(result).toEqual({
+        handlersInvoked: 1,
+        handlersSucceeded: 1,
+        handlersFailed: 0,
+        handlersSkipped: 0,
+      });
+    });
+
+    it('should report a handler skipped for non-critical events while not running', async () => {
+      const pluginPath = writeTestPlugin(testDir, 'not-started-plugin', `
+        export default {
+          name: 'not-started-plugin',
+          version: '1.0.0',
+          async onCertificateDeployed() {}
+        };
+      `);
+
+      await loader.loadPlugin({ path: pluginPath });
+
+      const result = await loader.dispatchEvent('certificateDeployed', {
+        certId: 'cert-123',
+        name: 'test',
+        paths: {},
+        fingerprint: 'abc',
+        expiresAt: '',
+        commonName: '',
+        isUpdate: false,
+      });
+
+      expect(result).toEqual({
+        handlersInvoked: 0,
+        handlersSucceeded: 0,
+        handlersFailed: 0,
+        handlersSkipped: 1,
+      });
     });
   });
 

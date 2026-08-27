@@ -24,6 +24,38 @@ function getNextDaemonPort(): number {
   return portBase + (portCounter++ % 100);
 }
 
+/**
+ * Build a daemon environment without inheriting config overrides from the SDK
+ * test harness itself. Every runner has a private config.json; a parent
+ * ZNVAULT_API_KEY (the suite admin key) would otherwise shadow it and can make
+ * managed-key startup look like a rotation.
+ */
+function createIsolatedAgentEnv(
+  configDir: string,
+  logLevel: string,
+  overrides?: Record<string, string>
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ZNVAULT_AGENT_CONFIG_DIR: configDir,
+    LOG_LEVEL: logLevel,
+  };
+
+  for (const name of [
+    'ZNVAULT_URL',
+    'ZNVAULT_TENANT_ID',
+    'ZNVAULT_API_KEY',
+    'ZNVAULT_USERNAME',
+    'ZNVAULT_PASSWORD',
+    'ZNVAULT_INSECURE',
+    'ZNVAULT_CA_CERT_PATH',
+  ]) {
+    delete env[name];
+  }
+
+  return { ...env, ...overrides };
+}
+
 export interface AgentRunResult {
   exitCode: number;
   stdout: string;
@@ -35,6 +67,7 @@ export interface DaemonHandle {
   healthPort: number;
   stop: () => Promise<void>;
   waitForReady: () => Promise<void>;
+  getOutput: () => { stdout: string; stderr: string };
 }
 
 export interface AgentConfig {
@@ -104,10 +137,10 @@ export class AgentRunner {
     const timeout = options?.timeout ?? 30000;
 
     return new Promise((resolve, reject) => {
-      const env: Record<string, string> = {
+      const env: NodeJS.ProcessEnv = {
         ...process.env,
         ZNVAULT_AGENT_CONFIG_DIR: this.configDir,
-        LOG_LEVEL: 'error',  // Reduce noise in tests
+        LOG_LEVEL: 'error', // Reduce noise in tests
         ...options?.env,
       };
 
@@ -493,12 +526,7 @@ export class AgentRunner {
       args.push('--restart-window', String(opts.restartWindow));
     }
 
-    const env: Record<string, string> = {
-      ...process.env,
-      ZNVAULT_AGENT_CONFIG_DIR: this.configDir,
-      LOG_LEVEL: 'info',
-      ...opts?.env,
-    };
+    const env = createIsolatedAgentEnv(this.configDir, 'info', opts?.env);
 
     const proc = spawn('node', [AGENT_BIN, ...args], {
       env,
@@ -525,16 +553,45 @@ export class AgentRunner {
     });
 
     const stop = async (): Promise<void> => {
+      if (exitCode !== null || proc.exitCode !== null || proc.signalCode !== null) {
+        return;
+      }
+
       return new Promise((resolve) => {
-        proc.on('close', () => resolve());
+        let forceTimer: NodeJS.Timeout | undefined;
+        let settleTimer: NodeJS.Timeout | undefined;
+        let settled = false;
+
+        const finish = (): void => {
+          if (settled) return;
+          settled = true;
+          if (forceTimer) clearTimeout(forceTimer);
+          if (settleTimer) clearTimeout(settleTimer);
+          proc.off('close', finish);
+          resolve();
+        };
+
+        proc.once('close', finish);
+
+        // The process may have exited between the initial check and listener
+        // registration. Do not wait for a close event that already fired.
+        if (exitCode !== null || proc.exitCode !== null || proc.signalCode !== null) {
+          finish();
+          return;
+        }
+
         proc.kill('SIGTERM');
 
-        // Force kill after 5 seconds
-        setTimeout(() => {
-          if (!proc.killed) {
+        // ChildProcess.killed only means a signal was sent; it does not mean
+        // the process has exited. Check exit state before escalating.
+        forceTimer = setTimeout(() => {
+          if (exitCode === null && proc.exitCode === null && proc.signalCode === null) {
             proc.kill('SIGKILL');
           }
         }, 5000);
+
+        // Keep test cleanup bounded even if the OS never emits close.
+        settleTimer = setTimeout(finish, 7000);
       });
     };
 
@@ -580,6 +637,7 @@ export class AgentRunner {
       healthPort,
       stop,
       waitForReady,
+      getOutput: () => ({ stdout, stderr }),
     };
   }
 

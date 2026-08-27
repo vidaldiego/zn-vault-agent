@@ -37,7 +37,11 @@ import type { AgentConfig } from './config.js';
 import { updateManagedKey } from './config.js';
 import { updateEnvFile, findEnvVarsForApiKey } from './secret-env.js';
 import type { SecretMapping } from './secret-env.js';
-import type { KeyRotatedEvent, PluginEventMap } from '../plugins/types.js';
+import type {
+  KeyRotatedEvent,
+  PluginEventDispatchResult,
+  PluginEventMap,
+} from '../plugins/types.js';
 import { createLogger } from './logger.js';
 
 /** Where a rotation was detected (mirrors the renewal service's RefreshSource). */
@@ -54,7 +58,7 @@ export interface KeyRotatedDispatcher {
   dispatchEvent<K extends keyof PluginEventMap>(
     eventType: K,
     event: PluginEventMap[K]
-  ): Promise<void>;
+  ): Promise<PluginEventDispatchResult>;
 }
 
 /** Rotation metadata accompanying a propagation. */
@@ -115,8 +119,8 @@ export interface PropagationResult {
   propagated: boolean;
   /** Set when skipped. */
   skipped?: 'duplicate' | 'stale' | 'shutting_down';
-  /** True when the plugin keyRotated event was dispatched without error. */
-  pluginsNotified: boolean;
+  /** Number of plugin keyRotated handlers whose execution was attempted. */
+  pluginsNotified: number;
   /** Env vars rewritten in the exec output file. */
   envVarsUpdated: string[];
   /** Non-fatal errors encountered (plugin dispatch, env file, child restart). */
@@ -244,7 +248,7 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
     const detectedAt = opts?.detectedAt ?? Date.now();
 
     if (deps.isShuttingDown?.()) {
-      return { propagated: false, skipped: 'shutting_down', pluginsNotified: false, envVarsUpdated: [], errors: [] };
+      return { propagated: false, skipped: 'shutting_down', pluginsNotified: 0, envVarsUpdated: [], errors: [] };
     }
 
     // Monotonicity: an older detection must never overwrite a newer one.
@@ -255,7 +259,7 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
         detectedAt,
         newerDetectionAt: state.lastDetectedAt,
       }, 'Discarding stale key rotation propagation (a newer detection already ran)');
-      return { propagated: false, skipped: 'stale', pluginsNotified: false, envVarsUpdated: [], errors: [] };
+      return { propagated: false, skipped: 'stale', pluginsNotified: 0, envVarsUpdated: [], errors: [] };
     }
 
     if (newKey === state.lastPropagatedValue) {
@@ -265,7 +269,7 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
         source: meta.source,
         keyPrefix: newKey.substring(0, 8),
       }, 'Key already propagated - skipping duplicate rotation propagation');
-      return { propagated: false, skipped: 'duplicate', pluginsNotified: false, envVarsUpdated: [], errors: [] };
+      return { propagated: false, skipped: 'duplicate', pluginsNotified: 0, envVarsUpdated: [], errors: [] };
     }
 
     const startTime = Date.now();
@@ -302,7 +306,7 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
     }
 
     // 3. Dispatch keyRotated to plugins (e.g. payara rewrites its API key file).
-    let pluginsNotified = false;
+    let pluginsNotified = 0;
     const pluginLoader = deps.getPluginLoader();
     if (pluginLoader) {
       const keyEvent: KeyRotatedEvent = {
@@ -313,9 +317,18 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
         rotationMode: meta.rotationMode ?? 'scheduled',
       };
       try {
-        await pluginLoader.dispatchEvent('keyRotated', keyEvent);
-        pluginsNotified = true;
-        log.debug({ keyName: meta.keyName }, 'Plugin keyRotated event dispatched successfully');
+        const dispatchResult = await pluginLoader.dispatchEvent('keyRotated', keyEvent);
+        pluginsNotified = dispatchResult.handlersInvoked;
+        if (dispatchResult.handlersFailed > 0) {
+          errors.push(`plugin dispatch failed for ${dispatchResult.handlersFailed} handler(s)`);
+        }
+        if (dispatchResult.handlersSkipped > 0) {
+          errors.push(`plugin dispatch skipped ${dispatchResult.handlersSkipped} handler(s)`);
+        }
+        log.debug({
+          keyName: meta.keyName,
+          ...dispatchResult,
+        }, 'Plugin keyRotated event dispatch completed');
       } catch (pluginErr) {
         const message = pluginErr instanceof Error ? pluginErr.message : String(pluginErr);
         errors.push(`plugin dispatch failed: ${message}`);

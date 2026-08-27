@@ -14,6 +14,7 @@ import type {
   PluginContext,
   LoadedPlugin,
   PluginEventMap,
+  PluginEventDispatchResult,
   PluginHealthStatus,
 } from './types.js';
 import { PLUGIN_EVENT_HANDLERS } from './types.js';
@@ -23,8 +24,14 @@ import type { ChildProcessManager } from '../services/child-process-manager.js';
 
 const log = createLogger({ module: 'plugin-loader' });
 
-/** Default timeout for plugin hooks (30 seconds) */
+/** Default timeout for plugin hooks (30 seconds). */
 const PLUGIN_HOOK_TIMEOUT_MS = 30_000;
+
+/**
+ * Startup hooks may perform real service deployment work. Payara WAR startup
+ * takes 50-90 seconds in production, so it needs a separate lifecycle budget.
+ */
+const PLUGIN_START_TIMEOUT_MS = 120_000;
 
 /** Cached global npm prefix */
 let cachedGlobalPrefix: string | null = null;
@@ -417,7 +424,7 @@ export class PluginLoader extends EventEmitter {
         try {
           await withTimeout(
             loaded.plugin.onStart(ctx),
-            PLUGIN_HOOK_TIMEOUT_MS,
+            PLUGIN_START_TIMEOUT_MS,
             name,
             'onStart'
           );
@@ -507,21 +514,51 @@ export class PluginLoader extends EventEmitter {
   async dispatchEvent<K extends keyof PluginEventMap>(
     eventType: K,
     event: PluginEventMap[K]
-  ): Promise<void> {
+  ): Promise<PluginEventDispatchResult> {
     const handlerName = PLUGIN_EVENT_HANDLERS[eventType] as keyof AgentPlugin;
+    const result: PluginEventDispatchResult = {
+      handlersInvoked: 0,
+      handlersSucceeded: 0,
+      handlersFailed: 0,
+      handlersSkipped: 0,
+    };
 
     log.debug({ eventType, plugins: this.plugins.size }, 'Dispatching event to plugins');
 
     for (const [name, loaded] of this.plugins) {
-      if (loaded.status !== 'running') continue;
-
       const handler = loaded.plugin[handlerName] as
         | ((event: PluginEventMap[K], ctx: PluginContext) => Promise<void>)
         | undefined;
 
       if (!handler) continue;
 
+      // A key rotation is a recovery-critical event: a plugin whose startup
+      // hook timed out may have completed its uncancellable work after the
+      // loader marked it as errored. It must still receive the fresh key.
+      const canDispatch = loaded.status === 'running'
+        || (eventType === 'keyRotated' && loaded.status === 'error');
+
+      if (!canDispatch) {
+        result.handlersSkipped += 1;
+        log.warn({
+          name,
+          eventType,
+          status: loaded.status,
+        }, 'Skipping plugin event handler because plugin is not running');
+        continue;
+      }
+
+      if (loaded.status === 'error') {
+        log.warn({
+          name,
+          eventType,
+          status: loaded.status,
+          startupError: loaded.error?.message,
+        }, 'Dispatching recovery-critical event to plugin in error state');
+      }
+
       const ctx = createPluginContext(name, this.agentInternals, this);
+      result.handlersInvoked += 1;
 
       try {
         await withTimeout(
@@ -530,11 +567,15 @@ export class PluginLoader extends EventEmitter {
           name,
           handlerName
         );
+        result.handlersSucceeded += 1;
       } catch (err) {
+        result.handlersFailed += 1;
         log.error({ err, name, eventType }, 'Plugin event handler error');
         // Don't fail other plugins
       }
     }
+
+    return result;
   }
 
   /**
