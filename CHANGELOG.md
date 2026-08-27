@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.23.2] - 2026-08-27 - Resilient Plugin Key Rotation
+
 ### Fixed
 
 - **Payara managed-key rotations no longer depend on an external agent health
