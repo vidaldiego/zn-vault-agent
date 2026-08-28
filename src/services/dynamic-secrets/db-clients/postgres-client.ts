@@ -7,6 +7,23 @@ import { replaceStatementPlaceholders } from './utils.js';
 
 const log = createLogger({ module: 'dynamic-secrets-pg' });
 
+function getSafePostgresFailureMetadata(error: unknown): Record<string, string> {
+  if (typeof error !== 'object' || error === null) return {};
+  try {
+    const candidate = error as {code?: unknown; name?: unknown};
+    const metadata: Record<string, string> = {};
+    if (typeof candidate.code === 'string' && /^[A-Z0-9]{5}$/.test(candidate.code)) {
+      metadata.databaseErrorCode = candidate.code;
+    }
+    if (typeof candidate.name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(candidate.name)) {
+      metadata.errorType = candidate.name;
+    }
+    return metadata;
+  } catch {
+    return {};
+  }
+}
+
 // ============================================================================
 // PostgreSQL Client
 // ============================================================================
@@ -44,14 +61,18 @@ export class PostgresClient implements DatabaseClient {
 
       // Handle pool errors
       this.pool.on('error', (err) => {
-        log.error({ err }, 'PostgreSQL pool error');
+        log.error(getSafePostgresFailureMetadata(err), 'PostgreSQL pool error');
       });
 
       return this.pool;
-    } catch {
-      throw new Error(
-        'PostgreSQL client (pg) is not installed. Install it with: npm install pg'
-      );
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('Cannot find module')) {
+        throw new Error(
+          'PostgreSQL client (pg) is not installed. Install it with: npm install pg'
+        );
+      }
+      log.error(getSafePostgresFailureMetadata(error), 'PostgreSQL client initialization failed');
+      throw new Error('PostgreSQL client initialization failed');
     }
   }
 
@@ -66,7 +87,7 @@ export class PostgresClient implements DatabaseClient {
         client.release();
       }
     } catch (err) {
-      log.error({ err }, 'PostgreSQL connection test failed');
+      log.error(getSafePostgresFailureMetadata(err), 'PostgreSQL connection test failed');
       return false;
     }
   }
@@ -82,9 +103,13 @@ export class PostgresClient implements DatabaseClient {
 
     try {
       // Execute each statement in order
-      for (const statement of statements) {
+      for (const [index, statement] of statements.entries()) {
         const sql = replaceStatementPlaceholders(statement, username, password, expiresAt);
-        log.debug({ sql: sql.replace(password, '***') }, 'Executing creation statement');
+        log.debug({
+          username,
+          statementNumber: index + 1,
+          statementLength: sql.length,
+        }, 'Executing creation statement');
         await client.query(sql);
       }
 
@@ -100,13 +125,31 @@ export class PostgresClient implements DatabaseClient {
 
     try {
       // Execute each statement in order
-      for (const statement of statements) {
+      for (const [index, statement] of statements.entries()) {
         const sql = replaceStatementPlaceholders(statement, username, '', '');
-        log.debug({ sql }, 'Executing revocation statement');
+        log.debug({
+          username,
+          statementNumber: index + 1,
+          statementLength: sql.length,
+        }, 'Executing revocation statement');
         await client.query(sql);
       }
 
       log.info({ username }, 'Revoked PostgreSQL credential');
+    } finally {
+      client.release();
+    }
+  }
+
+  async credentialExists(username: string): Promise<boolean> {
+    const pool = await this.getPool();
+    const client = await pool.connect();
+    try {
+      const result = await client.query<{ credential_exists: boolean }>(
+        'SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1) AS credential_exists',
+        [username]
+      );
+      return result.rows[0]?.credential_exists === true;
     } finally {
       client.release();
     }
@@ -127,9 +170,13 @@ export class PostgresClient implements DatabaseClient {
 
     try {
       // Execute each statement in order
-      for (const statement of statements) {
+      for (const [index, statement] of statements.entries()) {
         const sql = replaceStatementPlaceholders(statement, username, '', expiresAt);
-        log.debug({ sql }, 'Executing renewal statement');
+        log.debug({
+          username,
+          statementNumber: index + 1,
+          statementLength: sql.length,
+        }, 'Executing renewal statement');
         await client.query(sql);
       }
 

@@ -111,11 +111,12 @@ export function clearAllConfigs(): void {
 /**
  * Decrypt and store a config from encrypted envelope
  */
-export function decryptAndStoreConfig(
+export async function decryptAndStoreConfig(
   connectionId: string,
   configVersion: number,
-  encryptedConfigJson: string
-): { success: boolean; error?: string } {
+  encryptedConfigJson: string,
+  beforeStore?: (config: DynamicSecretsConfig) => Promise<void>
+): Promise<{ success: boolean; error?: string; updated?: boolean }> {
   try {
     // Parse encrypted envelope
     const envelope = JSON.parse(encryptedConfigJson) as EncryptedConfigEnvelope;
@@ -145,17 +146,29 @@ export function decryptAndStoreConfig(
         connectionId,
         expectedVersion: configVersion,
         actualVersion: config.configVersion,
-      }, 'Config version mismatch (using actual version)');
+      }, 'Rejected dynamic secrets config with mismatched version');
+      return {
+        success: false,
+        error: 'Dynamic secrets config version mismatch',
+      };
     }
 
-    // Store the config
+    const existing = configStore.get(config.connectionId);
+    if (existing && existing.configVersion >= config.configVersion) {
+      storeConfig(config);
+      return {success: true, updated: false};
+    }
+
+    // Evict/close the cached client before the new endpoint/admin config can
+    // become visible. The handler serializes all operations per connection,
+    // so no generation/revocation can race this transition.
+    await beforeStore?.(config);
     storeConfig(config);
 
-    return { success: true };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    log.error({ err: message, connectionId }, 'Failed to decrypt and store config');
-    return { success: false, error: message };
+    return {success: true, updated: true};
+  } catch {
+    log.error({connectionId}, 'Failed to decrypt and store config');
+    return {success: false, error: 'Dynamic secrets config update failed'};
   }
 }
 

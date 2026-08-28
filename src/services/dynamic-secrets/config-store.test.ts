@@ -1,6 +1,14 @@
 // Path: zn-vault-agent/src/services/dynamic-secrets/config-store.test.ts
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+const keypairSpies = vi.hoisted(() => ({
+  decryptAesKey: vi.fn(() => Buffer.alloc(32)),
+  decryptConfig: vi.fn(),
+}));
+
+vi.mock('./keypair.js', () => keypairSpies);
+
 import {
   storeConfig,
   getConfig,
@@ -10,6 +18,7 @@ import {
   clearAllConfigs,
   getStoreStats,
   removeConfig,
+  decryptAndStoreConfig,
 } from './config-store.js';
 import type { DynamicSecretsConfig } from './types.js';
 
@@ -17,6 +26,7 @@ describe('Dynamic Secrets Config Store', () => {
   const mockConfig: DynamicSecretsConfig = {
     connectionId: 'conn-123',
     configVersion: 1,
+    targetVersion: 1,
     connectionType: 'POSTGRESQL',
     connectionString: 'postgresql://admin:pass@localhost:5432/db',
     connectionTimeoutSeconds: 30,
@@ -24,6 +34,8 @@ describe('Dynamic Secrets Config Store', () => {
     roles: [
       {
         roleId: 'role-1',
+        roleVersion: 1,
+        templateBacked: true,
         roleName: 'readonly',
         usernameTemplate: 'v_{{role}}_{{random:8}}',
         creationStatements: ['CREATE USER "{{username}}"'],
@@ -34,6 +46,8 @@ describe('Dynamic Secrets Config Store', () => {
       },
       {
         roleId: 'role-2',
+        roleVersion: 1,
+        templateBacked: true,
         roleName: 'readwrite',
         usernameTemplate: 'v_{{role}}_{{random:8}}',
         creationStatements: ['CREATE USER "{{username}}"'],
@@ -47,6 +61,7 @@ describe('Dynamic Secrets Config Store', () => {
 
   beforeEach(() => {
     clearAllConfigs();
+    vi.clearAllMocks();
   });
 
   afterEach(() => {
@@ -92,6 +107,34 @@ describe('Dynamic Secrets Config Store', () => {
       // Should still have version 2 config
       expect(getConfig('conn-123')?.configVersion).toBe(2);
       expect(getConfig('conn-123')?.connectionTimeoutSeconds).toBe(30);
+    });
+  });
+
+  describe('decryptAndStoreConfig', () => {
+    it('fails closed on outer/inner config-version mismatch without evicting or storing', async () => {
+      keypairSpies.decryptConfig.mockReturnValue(JSON.stringify({
+        ...mockConfig,
+        configVersion: 2,
+      }));
+      const beforeStore = vi.fn();
+
+      await expect(decryptAndStoreConfig(
+        mockConfig.connectionId,
+        3,
+        JSON.stringify({
+          encryptedKey: 'opaque-key',
+          ciphertext: 'opaque-ciphertext',
+          nonce: 'opaque-nonce',
+          authTag: 'opaque-tag',
+        }),
+        beforeStore
+      )).resolves.toEqual({
+        success: false,
+        error: 'Dynamic secrets config version mismatch',
+      });
+
+      expect(beforeStore).not.toHaveBeenCalled();
+      expect(getConfig(mockConfig.connectionId)).toBeUndefined();
     });
   });
 

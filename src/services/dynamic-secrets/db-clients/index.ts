@@ -61,8 +61,9 @@ export function getOrCreateClient(
 
   // Close old client if exists
   if (cached) {
-    cached.client.close().catch((err: unknown) => {
-      log.warn({ err, connectionId }, 'Failed to close old database client');
+    clientCache.delete(connectionId);
+    cached.client.close().catch(() => {
+      log.warn({connectionId}, 'Failed to close old database client');
     });
   }
 
@@ -86,8 +87,16 @@ export function getOrCreateClient(
 export async function closeClient(connectionId: string): Promise<void> {
   const cached = clientCache.get(connectionId);
   if (cached) {
-    await cached.client.close();
+    // Evict synchronously before awaiting close so no caller can acquire the
+    // stale endpoint/admin pool while shutdown is in flight.
     clientCache.delete(connectionId);
+    try {
+      await cached.client.close();
+    } catch {
+      // The stale client is unreachable after eviction. Preserve progress to
+      // the new config without exposing raw connection/driver context.
+      log.warn({connectionId}, 'Failed to close evicted database client');
+    }
     log.debug({ connectionId }, 'Closed and removed database client');
   }
 }
@@ -100,8 +109,8 @@ export async function closeAllClients(): Promise<void> {
 
   for (const [connectionId, cached] of clientCache) {
     closePromises.push(
-      cached.client.close().catch((err: unknown) => {
-        log.warn({ err, connectionId }, 'Failed to close database client');
+      cached.client.close().catch(() => {
+        log.warn({connectionId}, 'Failed to close database client');
       })
     );
   }

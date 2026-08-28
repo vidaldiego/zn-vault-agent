@@ -9,10 +9,15 @@
  * Request agent to generate credentials for a connection/role
  */
 export interface DynamicSecretsGenerateRequest {
-  event: 'dynamic-secrets.generate';
+  event: 'dynamic-secrets.generate-v2';
+  protocolVersion: 2;
   requestId: string;
+  leaseId: string;
   connectionId: string;
   roleId: string;
+  configVersion: number;
+  targetVersion: number;
+  roleVersion: number;
   ttlSeconds: number;
   maxTtlSeconds: number;
   usernameTemplate: string;
@@ -28,11 +33,17 @@ export interface DynamicSecretsGenerateRequest {
  * Request agent to revoke credentials
  */
 export interface DynamicSecretsRevokeRequest {
-  event: 'dynamic-secrets.revoke';
+  /** V2 is a distinct event so pre-v2 agents cannot execute it unsafely. */
+  event: 'dynamic-secrets.revoke-v2';
+  protocolVersion: 2;
   requestId: string;
   leaseId: string;
   connectionId: string;
+  roleId: string;
   username: string;
+  configVersion: number;
+  targetVersion: number;
+  roleVersion: number;
   reason?: string;
   timestamp: string;
   deliveryId?: string;
@@ -42,12 +53,16 @@ export interface DynamicSecretsRevokeRequest {
  * Request agent to renew credentials
  */
 export interface DynamicSecretsRenewRequest {
-  event: 'dynamic-secrets.renew';
+  event: 'dynamic-secrets.renew-v2';
+  protocolVersion: 2;
   requestId: string;
   leaseId: string;
   connectionId: string;
   roleId: string;
   username: string;
+  configVersion: number;
+  targetVersion: number;
+  roleVersion: number;
   newExpiresAt: string;
   timestamp: string;
   deliveryId?: string;
@@ -77,6 +92,15 @@ export interface DynamicSecretsConfigRevoke {
   deliveryId?: string;
 }
 
+export interface DynamicSecretsConfigInventory {
+  event: 'dynamic-secrets.config-inventory-v2';
+  protocolVersion: 2;
+  requestId: string;
+  connectionIds: string[];
+  timestamp: string;
+  deliveryId?: string;
+}
+
 // ============================================================================
 // Agent → Server Messages
 // ============================================================================
@@ -85,10 +109,16 @@ export interface DynamicSecretsConfigRevoke {
  * Agent reports successful credential generation
  */
 export interface DynamicSecretsGeneratedResponse {
-  event: 'dynamic-secrets.generated';
+  event: 'dynamic-secrets.generated-v2';
+  protocolVersion: 2;
   requestId: string;
   leaseId: string;
+  connectionId: string;
+  roleId: string;
   username: string;
+  configVersion: number;
+  targetVersion: number;
+  roleVersion: number;
   encryptedPassword: string;
   expiresAt: string;
   timestamp: string;
@@ -99,8 +129,15 @@ export interface DynamicSecretsGeneratedResponse {
  */
 export interface DynamicSecretsRevokedResponse {
   event: 'dynamic-secrets.revoked';
+  protocolVersion: 2;
   requestId: string;
   leaseId: string;
+  connectionId: string;
+  roleId: string;
+  username: string;
+  configVersion: number;
+  targetVersion: number;
+  roleVersion: number;
   success: boolean;
   timestamp: string;
 }
@@ -109,9 +146,16 @@ export interface DynamicSecretsRevokedResponse {
  * Agent reports successful renewal
  */
 export interface DynamicSecretsRenewedResponse {
-  event: 'dynamic-secrets.renewed';
+  event: 'dynamic-secrets.renewed-v2';
+  protocolVersion: 2;
   requestId: string;
   leaseId: string;
+  connectionId: string;
+  roleId: string;
+  username: string;
+  configVersion: number;
+  targetVersion: number;
+  roleVersion: number;
   success: boolean;
   newExpiresAt: string;
   timestamp: string;
@@ -148,6 +192,16 @@ export interface DynamicSecretsConfigAck {
   timestamp: string;
 }
 
+export interface DynamicSecretsConfigInventoryAck {
+  event: 'dynamic-secrets.config-inventory-ack-v2';
+  protocolVersion: 2;
+  requestId: string;
+  retainedCount: number;
+  removedCount: number;
+  success: boolean;
+  timestamp: string;
+}
+
 // ============================================================================
 // Union Types
 // ============================================================================
@@ -157,14 +211,16 @@ export type DynamicSecretsServerMessage =
   | DynamicSecretsRevokeRequest
   | DynamicSecretsRenewRequest
   | DynamicSecretsConfigPush
-  | DynamicSecretsConfigRevoke;
+  | DynamicSecretsConfigRevoke
+  | DynamicSecretsConfigInventory;
 
 export type DynamicSecretsAgentMessage =
   | DynamicSecretsGeneratedResponse
   | DynamicSecretsRevokedResponse
   | DynamicSecretsRenewedResponse
   | DynamicSecretsErrorResponse
-  | DynamicSecretsConfigAck;
+  | DynamicSecretsConfigAck
+  | DynamicSecretsConfigInventoryAck;
 
 // ============================================================================
 // Config Types (Decrypted)
@@ -180,6 +236,7 @@ export interface DynamicSecretsConfig {
   maxOpenConnections: number;
   connectionTimeoutSeconds: number;
   configVersion: number;
+  targetVersion: number;
   roles: DynamicSecretsRoleConfig[];
 }
 
@@ -189,6 +246,15 @@ export interface DynamicSecretsConfig {
 export interface DynamicSecretsRoleConfig {
   roleId: string;
   roleName: string;
+  roleVersion: number;
+  /** Only server-owned template roles may issue through an agent. */
+  templateBacked: boolean;
+  /**
+   * False means the role is present only so historical leases can be revoked.
+   * Optional for mixed rollout compatibility: legacy vaults only sent enabled
+   * roles, so an omitted field retains the legacy enabled meaning.
+   */
+  generationEnabled?: boolean;
   creationStatements: string[];
   revocationStatements: string[];
   renewStatements: string[];

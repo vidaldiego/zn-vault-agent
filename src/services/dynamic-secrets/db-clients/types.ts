@@ -32,6 +32,15 @@ export interface DatabaseClient {
   revokeCredential(statements: string[], username: string): Promise<void>;
 
   /**
+   * Check whether any credential with this exact username still exists.
+   * Used to make a retried revoke idempotent after an ACK/commit crash.
+   */
+  credentialExists(username: string): Promise<boolean>;
+
+  /** MySQL canonical-account fallback when mysql.user introspection is denied. */
+  ensureCredentialAbsent?(username: string): Promise<void>;
+
+  /**
    * Renew a credential by executing renewal statements
    * @param statements - SQL statements with placeholders
    * @param username - Username to renew

@@ -7,6 +7,29 @@ import { replaceStatementPlaceholders } from './utils.js';
 
 const log = createLogger({ module: 'dynamic-secrets-mysql' });
 
+function getSafeMySqlFailureMetadata(error: unknown): Record<string, string | number> {
+  if (typeof error !== 'object' || error === null) return {};
+  try {
+    const candidate = error as {code?: unknown; errno?: unknown; sqlState?: unknown; name?: unknown};
+    const metadata: Record<string, string | number> = {};
+    if (typeof candidate.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(candidate.code)) {
+      metadata.databaseErrorCode = candidate.code;
+    }
+    if (typeof candidate.errno === 'number' && Number.isSafeInteger(candidate.errno)) {
+      metadata.databaseErrorNumber = candidate.errno;
+    }
+    if (typeof candidate.sqlState === 'string' && /^[A-Z0-9]{5}$/.test(candidate.sqlState)) {
+      metadata.databaseSqlState = candidate.sqlState;
+    }
+    if (typeof candidate.name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(candidate.name)) {
+      metadata.errorType = candidate.name;
+    }
+    return metadata;
+  } catch {
+    return {};
+  }
+}
+
 // ============================================================================
 // MySQL Client
 // ============================================================================
@@ -55,7 +78,8 @@ export class MysqlClient implements DatabaseClient {
           'MySQL client (mysql2) is not installed. Install it with: npm install mysql2'
         );
       }
-      throw err;
+      log.error(getSafeMySqlFailureMetadata(err), 'MySQL client initialization failed');
+      throw new Error('MySQL client initialization failed');
     }
   }
 
@@ -70,7 +94,7 @@ export class MysqlClient implements DatabaseClient {
         conn.release();
       }
     } catch (err) {
-      log.error({ err }, 'MySQL connection test failed');
+      log.error(getSafeMySqlFailureMetadata(err), 'MySQL connection test failed');
       return false;
     }
   }
@@ -86,9 +110,13 @@ export class MysqlClient implements DatabaseClient {
 
     try {
       // Execute each statement in order
-      for (const statement of statements) {
+      for (const [index, statement] of statements.entries()) {
         const sql = replaceStatementPlaceholders(statement, username, password, expiresAt);
-        log.debug({ sql: sql.replace(password, '***') }, 'Executing creation statement');
+        log.debug({
+          username,
+          statementNumber: index + 1,
+          statementLength: sql.length,
+        }, 'Executing creation statement');
         await conn.query(sql);
       }
 
@@ -104,13 +132,50 @@ export class MysqlClient implements DatabaseClient {
 
     try {
       // Execute each statement in order
-      for (const statement of statements) {
+      for (const [index, statement] of statements.entries()) {
         const sql = replaceStatementPlaceholders(statement, username, '', '');
-        log.debug({ sql }, 'Executing revocation statement');
+        log.debug({
+          username,
+          statementNumber: index + 1,
+          statementLength: sql.length,
+        }, 'Executing revocation statement');
         await conn.query(sql);
       }
 
       log.info({ username }, 'Revoked MySQL credential');
+    } finally {
+      conn.release();
+    }
+  }
+
+  async credentialExists(username: string): Promise<boolean> {
+    const pool = await this.getPool();
+    const conn = await pool.getConnection();
+    try {
+      // A username can have multiple MySQL Host rows. Absence across all hosts
+      // is the only safe proof available in the v2 request (which intentionally
+      // carries no caller-controlled host fragment).
+      const [rows] = await conn.query(
+        'SELECT EXISTS (SELECT 1 FROM mysql.user WHERE User = ?) AS credential_exists',
+        [username]
+      ) as [{ credential_exists?: number | string | boolean }[], unknown];
+      const value = rows[0]?.credential_exists;
+      return value === true || value === 1 || value === '1';
+    } finally {
+      conn.release();
+    }
+  }
+
+  async ensureCredentialAbsent(username: string): Promise<void> {
+    if (!/^[a-z][a-z0-9_]{0,30}$/.test(username)) {
+      throw new Error('Unsafe credential identity');
+    }
+    const pool = await this.getPool();
+    const conn = await pool.getConnection();
+    try {
+      // CREATE USER privilege permits DROP USER. The strict username gate and
+      // fixed @'%' host make this safe without granting SELECT on mysql.*.
+      await conn.query(`DROP USER IF EXISTS '${username}'@'%'`);
     } finally {
       conn.release();
     }
@@ -131,9 +196,13 @@ export class MysqlClient implements DatabaseClient {
 
     try {
       // Execute each statement in order
-      for (const statement of statements) {
+      for (const [index, statement] of statements.entries()) {
         const sql = replaceStatementPlaceholders(statement, username, '', expiresAt);
-        log.debug({ sql }, 'Executing renewal statement');
+        log.debug({
+          username,
+          statementNumber: index + 1,
+          statementLength: sql.length,
+        }, 'Executing renewal statement');
         await conn.query(sql);
       }
 
