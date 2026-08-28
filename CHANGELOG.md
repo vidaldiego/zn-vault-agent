@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.23.3] - 2026-08-28 - Dynamic Credential Ownership v2
+
+### Security
+
+- Dynamic-secret generation, renewal, and revocation now use distinct v2
+  events carrying the exact tenant, connection, role, lease, target, config,
+  and lifecycle epochs. The agent refuses stale or mismatched work instead of
+  executing it against a changed database identity.
+- Database configuration is reloaded at dispatch time and stale clients are
+  evicted when the authoritative Vault inventory changes. Raw AGENT roles are
+  rejected, and ambiguous target outcomes never return a credential as usable.
+
 ## [1.23.2] - 2026-08-27 - Resilient Plugin Key Rotation
 
 ### Fixed
