@@ -10,6 +10,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-01 - Cross-Process Mutation Fence
+
+### Breaking
+
+- The supported runtime is now Node.js 22.13.0 or newer. Node.js 18 and 20
+  are no longer supported.
+- `@zincapp/znvault-plugin-payara` 3.x (`>=3.0.0 <4.0.0`) is required. The agent now
+  aborts startup before importing an older npm package because its legacy
+  check/write/remove mutation lock is incompatible with the ownership-safe
+  create-exclusive lock introduced in agent 2.0.0.
+- The exec option that expands every field of a Vault secret is now
+  `-e, --env-secret`. The old long name `--env-file` collides with a native
+  Node.js 22/24 runtime option and could be consumed before the agent started;
+  `-e` remains supported.
+- Stable Agent 2.x artifacts initially publish under the non-auto-update
+  `dr-m4` npm dist-tag. Publishing 2.0.0 does not promote `latest` or deploy it;
+  that fleet migration is a separate operational gate.
+
+### Security
+
+- Certificate, secret, plugin, CLI, and startup-cleanup mutations now share a
+  host-wide create-exclusive lock with the Payara plugin. Process-wide signal
+  coordination defers shutdown until the final lock participant releases and
+  then rejects new mutation work.
+- Reload and health-check commands run in isolated process groups with a
+  monotonic TERM-to-KILL deadline. Template sources reject symlinks, FIFOs,
+  non-regular files, and oversized input before entering a mutation.
+- Setup now creates a separate private local mutation credential as a
+  no-follow, single-link `0600` file without printing or replacing its bytes.
+  Daemon startup fails closed without it. Only `/health`, `/ready`, `/live`,
+  and `/metrics` remain public; every core control and plugin route requires its
+  Bearer value, and Payara applies the same credential in a second inherited
+  guard before body parsing. The token value is never accepted through argv or
+  environment variables; isolated tests/installers may override only its path.
+  Payara API-key files use an explicit two-identity contract: an Agent-owned
+  setgid `2750` directory in Payara's primary group and an Agent-owned `0640`
+  file. Permission or traversal drift fails closed before a rotation is
+  accepted.
+- Authenticated on-demand plugin updates now require one configured package
+  and exact target version. The agent installs only that immutable artifact,
+  verifies the installed version, rejects partial/unrelated receipts, and uses
+  a create-exclusive owner-bound lock in its systemd runtime directory.
+- API keys, registration/reprovision tokens, connection strings, and all
+  credential-derived prefixes are excluded from logs, CLI output, health
+  status, parse errors, and malformed-response diagnostics. Structured logger
+  redaction also covers legacy fragment field names emitted by plugins.
+
+### Fixed
+
+- Coalesced WebSocket retries retain unapplied generations as pending and
+  unhealthy after exhaustion, while a genuinely newer generation receives a
+  fresh retry budget.
+- A configured Payara plugin is now mandatory at startup: a missing package,
+  import failure, invalid factory, or duplicate registration aborts the agent
+  instead of leaving a superficially running service without Payara custody.
+- Plugin health reported as `unhealthy` now makes the agent globally unhealthy
+  and not ready, so systemd and operators cannot mistake a failed Payara child
+  for a degraded-but-serviceable state.
+- Graceful shutdown drains active certificate, secret, plugin-dispatch, and
+  child-restart work before service teardown. The generated systemd unit now
+  uses `TimeoutStopSec=900` and `KillMode=mixed`.
+- Daemon mode now owns one stable, exclusive `SIGINT`/`SIGTERM` handler across
+  startup and mutation-lock handoffs. Transitive storage cleanup hooks can no
+  longer re-raise a signal before the asynchronous drain reaches the managed
+  child, which previously could orphan that child during shutdown.
+- Child-process evidence now lives in the systemd-managed, restart-preserved
+  `/run/zn-vault-agent/` directory and binds the PID to its Linux process start
+  time and executable. Orphan recovery fails closed when that identity cannot
+  be revalidated, preventing a reused PID from receiving TERM or KILL.
+
 ## [1.23.3] - 2026-08-28 - Dynamic Credential Ownership v2
 
 ### Security
@@ -81,7 +151,8 @@ covers `secretTargets`, which the key file is not part of.
 ### Added
 - Explicit rotation-pickup logging: `Managed key rotation propagated to
   consumers` with `source` (`ws_event`/`scheduled`/`grace_poll`/`heartbeat`/
-  `reconnect`), old/new key prefixes, `pluginsNotified`, `envVarsUpdated`.
+  `reconnect`), `pluginsNotified`, and `envVarsUpdated`; credential values and
+  fragments are deliberately excluded.
 - Duplicate suppression across detection channels: propagations are
   serialized and deduplicated per key, so the same rotated value is
   propagated once even when both the WebSocket event and a polling rail fire

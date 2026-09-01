@@ -15,18 +15,21 @@ export default defineConfig({
     setupFiles: ['test/setup.ts'],
     testTimeout: 60000, // 60s timeout for integration tests
     hookTimeout: 60000,
-    // Enable file-level parallelism - different test files run concurrently
-    // Tests within each file still run sequentially
-    // Safe because: unique ports (auto-assigned 19000+), unique IDs (Date.now())
+    // The integration files share one live Vault and its WebSocket/IP rate
+    // limiter. Running daemon-heavy files concurrently can make the harness
+    // reject its own connections with HTTP 429 / close code 4029, which tests
+    // test-runner saturation rather than agent behaviour. Keep this gate
+    // serial; unique ports alone do not isolate the shared server quota.
     pool: 'forks',
+    fileParallelism: false,
     minWorkers: 1,
-    maxWorkers: 4, // Limit concurrent files to avoid overwhelming the vault
+    maxWorkers: 1,
     // Ensure tests within a file run sequentially
     sequence: {
       shuffle: false,
     },
-    // Retry flaky network tests once
-    retry: 1,
+    // A release gate must surface the first failure rather than masking it.
+    retry: 0,
     // Reporter for CI
     reporters: process.env.CI ? ['default', 'junit'] : ['default'],
     outputFile: {

@@ -5,6 +5,7 @@ import ora from 'ora';
 import chalk from 'chalk';
 import { loadConfig, saveConfig, getConfigPath } from '../lib/config.js';
 import { login as apiLogin, listCertificates, getApiKeySelf, bindManagedApiKey } from '../lib/api.js';
+import type { ApiKeySelfInfo } from '../lib/api.js';
 import { exchangeBootstrapToken, applyRegistrationResult } from '../lib/auth/bootstrap.js';
 import type { LoginCommandOptions } from './types.js';
 
@@ -56,6 +57,61 @@ function isValidBootstrapToken(token: string): boolean {
   return /^zrt_[a-f0-9]{64}$/i.test(token);
 }
 
+/** Return a constant display marker without retaining any credential bytes. */
+export function formatBootstrapTokenForDisplay(_token: string): string {
+  return '[REDACTED]';
+}
+
+/**
+ * Validate an API key using the permission-neutral self endpoint and persist
+ * the tenant identity it owns before any capability-specific probes.
+ */
+export async function discoverApiKeyIdentity(
+  config: ReturnType<typeof loadConfig>
+): Promise<ApiKeySelfInfo> {
+  const keyInfo = await getApiKeySelf();
+  config.tenantId = keyInfo.tenantId;
+  saveConfig(config);
+  return keyInfo;
+}
+
+/**
+ * Certificate listing is onboarding information, not an authentication gate.
+ */
+export async function listCertificatesForLogin(): Promise<
+  Awaited<ReturnType<typeof listCertificates>> | null
+> {
+  try {
+    return await listCertificates();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Authenticate a username/password account and persist the tenant asserted by
+ * the authenticated response. Password credentials alone are not a complete
+ * agent configuration because subsequent requests require a tenant identity.
+ */
+export async function authenticatePasswordAndDiscoverTenant(
+  config: ReturnType<typeof loadConfig>,
+  username: string,
+  password: string
+): Promise<string> {
+  const response = await apiLogin(username, password);
+  const tenantId = response.user.tenantId?.trim();
+
+  if (!tenantId) {
+    throw new Error(
+      'Authenticated account is not associated with a tenant; configuration remains incomplete'
+    );
+  }
+
+  config.tenantId = tenantId;
+  saveConfig(config);
+  return tenantId;
+}
+
 /**
  * Handle bootstrap token authentication flow.
  * This is the recommended secure way to provision new agents.
@@ -93,7 +149,7 @@ async function handleBootstrapToken(
 
   console.log(`  Vault URL:   ${options.url}`);
   console.log(`  Hostname:    ${hostname}${options.hostName ? '' : chalk.gray(' (auto-detected)')}`);
-  console.log(`  Token:       ${token.substring(0, 8)}...`);
+  console.log(`  Token:       ${formatBootstrapTokenForDisplay(token)}`);
   console.log(`  TLS Verify:  ${insecure ? 'disabled' : 'enabled'}`);
   console.log();
 
@@ -365,6 +421,9 @@ Bootstrap Token Flow (Recommended for Production):
           process.exit(1);
         }
         config.auth = { username, password };
+        // The tenant must come from a successful authenticated response. Do
+        // not retain a possibly unrelated tenant from earlier credentials.
+        config.tenantId = '';
         config.managedKey = undefined; // Clear managed key config
       }
 
@@ -375,7 +434,17 @@ Bootstrap Token Flow (Recommended for Production):
       if (options.skipTest) {
         console.log(chalk.green('✓') + ` Configuration saved to: ${getConfigPath()}`);
         console.log(chalk.yellow('!') + ' Connection test skipped (--skip-test)');
-        console.log(chalk.yellow('!') + ' Tenant will be auto-detected on first API call');
+        if (authMethod === 'password') {
+          console.log(
+            chalk.yellow('!') +
+              ' Tenant was not verified; password configuration remains incomplete until login succeeds without --skip-test'
+          );
+        } else {
+          console.log(
+            chalk.yellow('!') +
+              ' Tenant was not verified; rerun login without --skip-test to persist it'
+          );
+        }
         return;
       }
 
@@ -384,70 +453,76 @@ Bootstrap Token Flow (Recommended for Production):
 
       try {
         if (authMethod === 'password' && username && password) {
-          await apiLogin(username, password);
-        }
+          // Password onboarding keeps the existing capability check.
+          const tenantId = await authenticatePasswordAndDiscoverTenant(
+            config,
+            username,
+            password
+          );
+          const certs = await listCertificates();
 
-        // Try to list certificates
-        const certs = await listCertificates();
+          spinner.succeed('Connection successful!');
 
-        spinner.succeed('Connection successful!');
+          console.log();
+          console.log(chalk.green('✓') + ` Configuration saved to: ${getConfigPath()}`);
+          console.log(chalk.green('✓') + ` Tenant: ${tenantId}`);
+          console.log(chalk.green('✓') + ` Found ${certs.total} certificate(s) in vault`);
+          console.log(chalk.green('✓') + ' Password authentication configured');
+        } else {
+          // API-key identity is the authentication gate. The self endpoint does
+          // not require certificate:list and provides the tenant needed by the
+          // rest of the agent.
+          spinner.text = 'Validating API key...';
+          const keyInfo = await discoverApiKeyIdentity(config);
 
-        console.log();
-        console.log(chalk.green('✓') + ` Configuration saved to: ${getConfigPath()}`);
-        console.log(chalk.green('✓') + ` Found ${certs.total} certificate(s) in vault`);
+          let managedKeyName: string | undefined;
+          let managedKeyNextRotation: string | undefined;
 
-        // Get tenant info and check if it's a managed key
-        spinner.start('Retrieving account information...');
-        try {
-          const keyInfo = await getApiKeySelf();
+          if (keyInfo.isManaged && keyInfo.managedKeyName) {
+            spinner.text = 'Binding to managed API key...';
+            const bindResponse = await bindManagedApiKey(keyInfo.managedKeyName);
 
-          // Save tenant ID from API key info
-          config.tenantId = keyInfo.tenantId;
-          saveConfig(config);
+            config.auth.apiKey = bindResponse.key;
+            config.managedKey = {
+              name: keyInfo.managedKeyName,
+              nextRotationAt: bindResponse.nextRotationAt,
+              graceExpiresAt: bindResponse.graceExpiresAt,
+              rotationMode: bindResponse.rotationMode,
+              lastBind: new Date().toISOString(),
+            };
+            saveConfig(config);
 
+            managedKeyName = keyInfo.managedKeyName;
+            managedKeyNextRotation = bindResponse.nextRotationAt
+              ? new Date(bindResponse.nextRotationAt).toLocaleString()
+              : 'unknown';
+          }
+
+          // This probe is informational only. A valid API key may deliberately
+          // omit certificate:list and must still complete onboarding.
+          const certs = await listCertificatesForLogin();
+
+          spinner.succeed('Connection successful!');
+
+          console.log();
+          console.log(chalk.green('✓') + ` Configuration saved to: ${getConfigPath()}`);
           console.log(chalk.green('✓') + ` Tenant: ${keyInfo.tenantId}`);
 
-          if (authMethod === 'apiKey') {
-            if (keyInfo.isManaged && keyInfo.managedKeyName) {
-              spinner.text = 'Binding to managed API key...';
-
-              // Bind to get the current key value and metadata
-              const bindResponse = await bindManagedApiKey(keyInfo.managedKeyName);
-
-              // Update config with bound key and managed key metadata
-              config.auth.apiKey = bindResponse.key;
-              config.managedKey = {
-                name: keyInfo.managedKeyName,
-                nextRotationAt: bindResponse.nextRotationAt,
-                graceExpiresAt: bindResponse.graceExpiresAt,
-                rotationMode: bindResponse.rotationMode,
-                lastBind: new Date().toISOString(),
-              };
-              saveConfig(config);
-
-              spinner.succeed('Managed API key detected and bound');
-
-              const nextRotation = bindResponse.nextRotationAt
-                ? new Date(bindResponse.nextRotationAt).toLocaleString()
-                : 'unknown';
-              console.log(chalk.green('✓') + ` Managed key: ${keyInfo.managedKeyName} (rotates: ${nextRotation})`);
-              console.log(chalk.gray('  Auto-rotation enabled - key will refresh before expiration'));
-            } else {
-              spinner.succeed('Static API key configured');
-              console.log(chalk.yellow('⚠') + ' ' + chalk.yellow('Security recommendation:') + ' Consider using a managed API key for automatic rotation.');
-              console.log(chalk.gray('  Create one in the vault dashboard under API Keys → Create Managed Key'));
-            }
+          if (certs) {
+            console.log(chalk.green('✓') + ` Found ${certs.total} certificate(s) in vault`);
           } else {
-            spinner.succeed('Password authentication configured');
+            console.log(chalk.yellow('!') + ' Certificate listing unavailable for this key (authentication succeeded)');
           }
-        } catch {
-          // If self endpoint doesn't exist or fails, continue without tenant info
-          spinner.info('Authentication configured (could not retrieve account information)');
-          if (authMethod === 'apiKey') {
+
+          if (managedKeyName) {
+            console.log(chalk.green('✓') + ` Managed key: ${managedKeyName} (rotates: ${managedKeyNextRotation})`);
+            console.log(chalk.gray('  Auto-rotation enabled - key will refresh before expiration'));
+          } else {
+            console.log(chalk.green('✓') + ' Static API key configured');
             console.log(chalk.yellow('⚠') + ' ' + chalk.yellow('Security recommendation:') + ' Consider using a managed API key for automatic rotation.');
+            console.log(chalk.gray('  Create one in the vault dashboard under API Keys → Create Managed Key'));
           }
         }
-
         console.log();
         console.log('Next steps:');
         console.log('  1. Add certificates to sync: ' + chalk.cyan('zn-vault-agent add'));

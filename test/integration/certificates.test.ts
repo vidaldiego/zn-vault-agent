@@ -7,11 +7,13 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
-import { existsSync, readFileSync, statSync } from 'fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 import { AgentRunner, createTempOutputDir } from '../helpers/agent-runner.js';
 import { VaultTestClient, generateTestCertificate } from '../helpers/vault-client.js';
 import { TEST_ENV, getVaultClient } from '../setup.js';
+
+const testRunId = `${process.pid}-${Date.now()}`;
 
 describe('Certificate Management', () => {
   let agent: AgentRunner;
@@ -25,9 +27,10 @@ describe('Certificate Management', () => {
 
     // Create test API key
     testApiKey = await vault.createApiKey({
-      name: 'cert-test-key',
-      expiresInDays: 1,
+      name: `cert-test-key-${testRunId}`,
+      expiresInDays: 90,
       permissions: [
+        'certificate:list',
         'certificate:read:metadata',
         'certificate:read:value',
       ],
@@ -39,7 +42,7 @@ describe('Certificate Management', () => {
     const combinedPem = certPem + '\n' + keyPem;
     testCert = await vault.createCertificate({
       clientId: TEST_ENV.tenantId,
-      alias: 'test-certificate',
+      alias: `test-certificate-${testRunId}`,
       certificateData: Buffer.from(combinedPem).toString('base64'),
       certificateType: 'PEM',
     });
@@ -83,7 +86,7 @@ describe('Certificate Management', () => {
       const result = await agent.availableCertificates();
 
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain('test-certificate');
+      expect(result.stdout).toContain(testCert!.name);
     });
 
     it('CERT-07: should list configured certificate targets', async () => {
@@ -223,7 +226,7 @@ describe('Certificate Management', () => {
       const result2 = await agent.sync();
       expect(result2.exitCode).toBe(0);
       // Output should indicate no changes needed
-      expect(result2.stdout.toLowerCase()).toMatch(/no changes|up to date|already synced/);
+      expect(result2.stdout.toLowerCase()).toMatch(/no changes|up to date|already synced|unchanged/);
     });
 
     it('should support dry-run mode', async () => {
@@ -245,25 +248,39 @@ describe('Certificate Management', () => {
     it('should sync specific target by name', async () => {
       const output1 = resolve(outputDir, 'target1.pem');
       const output2 = resolve(outputDir, 'target2.pem');
-
-      await agent.addCertificate({
-        certId: testCert!.id,
-        name: 'target1',
-        output: output1,
+      const { certPem, keyPem } = generateTestCertificate();
+      const secondCert = await vault.createCertificate({
+        clientId: TEST_ENV.tenantId,
+        alias: `test-certificate-target-two-${Date.now()}`,
+        certificateData: Buffer.from(`${certPem}\n${keyPem}`).toString('base64'),
+        certificateType: 'PEM',
       });
 
-      await agent.addCertificate({
-        certId: testCert!.id,
-        name: 'target2',
-        output: output2,
-      });
+      try {
+        await agent.addCertificate({
+          certId: testCert!.id,
+          name: 'target1',
+          output: output1,
+        });
 
-      // Sync only target1
-      const result = await agent.sync({ name: 'target1' });
+        await agent.addCertificate({
+          certId: secondCert.id,
+          name: 'target2',
+          output: output2,
+        });
 
-      expect(result.exitCode).toBe(0);
-      expect(existsSync(output1)).toBe(true);
-      expect(existsSync(output2)).toBe(false);
+        // Sync only target1
+        const result = await agent.sync({ name: 'target1' });
+
+        expect(
+          result.exitCode,
+          `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`
+        ).toBe(0);
+        expect(existsSync(output1)).toBe(true);
+        expect(existsSync(output2)).toBe(false);
+      } finally {
+        await vault.deleteCertificate(secondCert.id);
+      }
     });
   });
 
@@ -304,23 +321,23 @@ describe('Certificate Management', () => {
     it('should fail with invalid certificate ID', async () => {
       const outputPath = resolve(outputDir, 'invalid.pem');
 
-      await agent.addCertificate({
+      const result = await agent.addCertificate({
         certId: 'invalid-uuid',
         name: 'invalid-test',
         output: outputPath,
       });
 
-      const result = await agent.sync();
-
-      // Should complete but report error
-      expect(result.stderr.toLowerCase()).toMatch(/not found|invalid|error/);
+      expect(result.exitCode).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`.toLowerCase()).toMatch(/not found|invalid|error/);
     });
 
     it('should fail if output directory does not exist and cannot be created', async () => {
+      const nonDirectoryPath = resolve(outputDir, 'not-a-directory');
+      writeFileSync(nonDirectoryPath, 'regular file');
       const result = await agent.addCertificate({
         certId: testCert!.id,
         name: 'bad-path',
-        output: '/root/cannot/create/this.pem',
+        output: resolve(nonDirectoryPath, 'this.pem'),
       });
 
       // Should either fail during add or during sync

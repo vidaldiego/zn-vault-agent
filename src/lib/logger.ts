@@ -6,12 +6,67 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const isDev = process.env.NODE_ENV !== 'production';
-const logFile = process.env.LOG_FILE ?? (isDev ? undefined : '/var/log/zn-vault-agent/agent.log');
+// systemd captures stdout in journald. File logging is opt-in so an
+// unconfigured host cannot accumulate an unrotated duplicate log.
+const logFile = process.env.LOG_FILE;
+
+interface ReopenableDestination extends pino.DestinationStream {
+  reopen(): void;
+}
+
+let fileDestination: ReopenableDestination | undefined;
+
+/**
+ * Credential values and credential-derived fragments must never reach an
+ * output stream. Explicit fragment names are included as a defence in depth
+ * for plugins that still attach the legacy managed-key prefix to a log object.
+ */
+export const SENSITIVE_LOG_PATHS: string[] = [
+  'password',
+  'apiKey',
+  'bootstrapToken',
+  'registrationToken',
+  'reprovisionToken',
+  'bearerToken',
+  'token',
+  'secret',
+  'keyPrefix',
+  'tokenPrefix',
+  'valuePrefix',
+  'oldPrefix',
+  'newPrefix',
+  'newKeyPrefix',
+  'currentKeyPrefix',
+  'backupPrefix',
+  'expectedPrefix',
+  'configKeyPrefix',
+  'fileKeyPrefix',
+  'currentPrefix',
+  'auth.password',
+  'auth.apiKey',
+  'auth.bootstrapToken',
+  'config.auth.password',
+  'config.auth.apiKey',
+  'config.auth.bootstrapToken',
+  'response.apiKey',
+  'response.token',
+  'response.secret',
+  'response.password',
+  'headers.authorization',
+  'headers["x-api-key"]',
+  '*.keyPrefix',
+  '*.tokenPrefix',
+  '*.valuePrefix',
+  '*.oldPrefix',
+  '*.newPrefix',
+  '*.newKeyPrefix',
+  '*.currentKeyPrefix',
+];
 
 /**
  * Create file stream for logging if LOG_FILE is set
  */
-function createFileStream(): pino.DestinationStream | undefined {
+function createFileStream(): ReopenableDestination | undefined {
   if (!logFile) return undefined;
 
   // Ensure log directory exists
@@ -26,11 +81,12 @@ function createFileStream(): pino.DestinationStream | undefined {
   }
 
   try {
-    return pino.destination({
+    fileDestination = pino.destination({
       dest: logFile,
       sync: false, // Async writes for performance
       mkdir: true,
-    });
+    }) as ReopenableDestination;
+    return fileDestination;
   } catch {
     return undefined;
   }
@@ -81,8 +137,16 @@ function createTransport(): pino.TransportSingleOptions | pino.TransportMultiOpt
  *
  * Configure via environment variables:
  * - LOG_LEVEL: trace, debug, info, warn, error, fatal (default: debug in dev, info in prod)
- * - LOG_FILE: Path to log file (default: /var/log/zn-vault-agent/agent.log in prod)
+ * - LOG_FILE: Optional path that mirrors production JSON logs alongside journald
  */
+const productionFileStream = !isDev && logFile ? createFileStream() : undefined;
+const productionOutput = productionFileStream
+  ? pino.multistream([
+      { stream: process.stdout },
+      { stream: productionFileStream },
+    ])
+  : undefined;
+
 export const logger = pino(
   {
     level: process.env.LOG_LEVEL ?? (isDev ? 'debug' : 'info'),
@@ -93,25 +157,14 @@ export const logger = pino(
     },
     // Redact sensitive fields
     redact: {
-      paths: [
-        'password',
-        'apiKey',
-        'token',
-        'secret',
-        'auth.password',
-        'auth.apiKey',
-        'config.auth.password',
-        'config.auth.apiKey',
-        'headers.authorization',
-        'headers["x-api-key"]',
-      ],
+      paths: SENSITIVE_LOG_PATHS,
       censor: '[REDACTED]',
     },
     // Add timestamp in ISO format
     timestamp: pino.stdTimeFunctions.isoTime,
   },
-  // In production without transport, we can use multistream for file output
-  !isDev && logFile ? createFileStream() : undefined
+  // When LOG_FILE is explicit, retain journald stdout and mirror to the file.
+  productionOutput
 );
 
 /**
@@ -146,6 +199,15 @@ export async function flushLogs(): Promise<void> {
   });
 }
 
+/** Reopen an optional file destination after external log rotation. */
+export function reopenLogDestination(
+  destination: Pick<ReopenableDestination, 'reopen'> | undefined = fileDestination
+): boolean {
+  if (!destination) return false;
+  destination.reopen();
+  return true;
+}
+
 /**
  * Handle log rotation signal (USR1)
  * Reopens the log file destination
@@ -154,8 +216,17 @@ export function setupLogRotation(): void {
   if (process.platform !== 'win32') {
     process.on('SIGUSR1', () => {
       logger.info('Received SIGUSR1, reopening log files');
-      // Pino destination handles file reopening on next write
-      logger.flush();
+      logger.flush((err) => {
+        if (err) {
+          logger.error({ err }, 'Could not flush logs before rotation');
+          return;
+        }
+        try {
+          reopenLogDestination();
+        } catch (reopenError) {
+          logger.error({ err: reopenError }, 'Could not reopen log file after rotation');
+        }
+      });
     });
   }
 }

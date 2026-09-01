@@ -39,7 +39,7 @@ export function registerExecCommand(program: Command): void {
       acc.push(val);
       return acc;
     }, [])
-    .option('-e, --env-file <ref>', 'Inject all vars from env secret (format: alias:path[:PREFIX_])', (val, acc: string[]) => {
+    .option('-e, --env-secret <ref>', 'Inject all vars from env secret (format: alias:path[:PREFIX_])', (val, acc: string[]) => {
       acc.push(val);
       return acc;
     }, [])
@@ -55,7 +55,7 @@ Secret Mapping Formats:
   ENV_VAR=api-key:name               Managed API key (binds and gets current value)
   ENV_VAR=literal:value              Literal value (no vault fetch)
 
-Env File Format (-e/--env-file):
+Env Secret Format (-e/--env-secret):
   alias:path/to/secret               All key-value pairs as env vars
   alias:path/to/secret:PREFIX_       All vars with PREFIX_ prepended
   uuid                               UUID reference (all key-value pairs)
@@ -112,10 +112,10 @@ Examples:
       }
 
       const secrets = options.secret ?? [];
-      const envFiles = options.envFile ?? [];
+      const envFiles = options.envSecret ?? [];
 
       if (secrets.length === 0 && envFiles.length === 0) {
-        console.error(chalk.red('At least one --secret or --env-file mapping is required'));
+        console.error(chalk.red('At least one --secret or --env-secret mapping is required'));
         process.exit(1);
       }
 
@@ -319,7 +319,6 @@ async function startWatchMode(
 
     log.info({
       keyName: event.apiKeyName,
-      newPrefix: event.newPrefix,
       graceExpiresAt: event.graceExpiresAt,
     }, 'API key rotation event received');
 

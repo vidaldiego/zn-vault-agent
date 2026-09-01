@@ -23,7 +23,7 @@ import path from 'node:path';
  * }} config - `secrets` may contain `api-key:<name>` entries; the plugin does
  *   not resolve them itself, but the agent extracts them to track those keys
  *   for rotation events (mirrors the payara plugin's config shape).
- *   `rotationLogPath` appends one `<keyName>:<newPrefix>` line per keyRotated
+ *   `rotationLogPath` appends one `<keyName>` line per keyRotated
  *   event received — used by tests to observe dispatches for non-own keys.
  */
 export default function createKeyFilePlugin(config) {
@@ -43,7 +43,7 @@ export default function createKeyFilePlugin(config) {
     fs.writeFileSync(tempPath, apiKey, { mode: 0o600 });
     fs.renameSync(tempPath, config.filePath);
     ctx.logger.info(
-      { filePath: config.filePath, keyPrefix: apiKey.substring(0, 8), reason },
+      { filePath: config.filePath, reason },
       'key-file-plugin: API key written to file'
     );
   }
@@ -62,12 +62,12 @@ export default function createKeyFilePlugin(config) {
 
     async onKeyRotated(event, ctx) {
       ctx.logger.info(
-        { keyName: event.keyName, newPrefix: event.newPrefix },
+        { keyName: event.keyName },
         'key-file-plugin: keyRotated event received'
       );
       if (config.rotationLogPath) {
         fs.mkdirSync(path.dirname(config.rotationLogPath), { recursive: true });
-        fs.appendFileSync(config.rotationLogPath, `${event.keyName}:${event.newPrefix}\n`);
+        fs.appendFileSync(config.rotationLogPath, `${event.keyName}\n`);
       }
       writeKeyFile(ctx, 'keyRotated');
     },

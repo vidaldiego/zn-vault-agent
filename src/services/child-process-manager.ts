@@ -3,6 +3,7 @@
 
 import type { ChildProcess } from 'node:child_process';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -22,12 +23,56 @@ const log = logger.child({ module: 'child-process-manager' });
  * PID file location for tracking child process.
  * Used to detect and clean up orphaned processes on startup.
  */
-const CHILD_PID_FILE = process.env.CHILD_PID_FILE ?? '/var/run/zn-vault-agent-child.pid';
+const CHILD_PID_FILE = process.env.CHILD_PID_FILE ?? '/run/zn-vault-agent/child.pid';
+const CHILD_RESERVATION_FILE = process.env.CHILD_RESERVATION_FILE
+  ?? path.join(path.dirname(CHILD_PID_FILE), 'child.owner');
+const CHILD_RESERVATION_CLAIM_FILE = `${CHILD_RESERVATION_FILE}.claim`;
 
 /**
  * Timeout for graceful termination of orphaned processes (5 seconds).
  */
 const ORPHAN_KILL_TIMEOUT_MS = 5000;
+const RESTART_GRACEFUL_STOP_TIMEOUT_MS = 5_000;
+const SHUTDOWN_GRACEFUL_STOP_TIMEOUT_MS = 10_000;
+const FORCE_KILL_CONFIRMATION_TIMEOUT_MS = 5_000;
+const CHILD_PID_EVIDENCE_VERSION = 1;
+
+interface LinuxProcessIdentity {
+  kind: 'linux-procfs';
+  startTimeTicks: string;
+  executablePath: string;
+}
+
+interface UnsupportedProcessIdentity {
+  kind: 'unsupported-platform';
+  platform: NodeJS.Platform;
+}
+
+type ProcessIdentity = LinuxProcessIdentity | UnsupportedProcessIdentity;
+
+interface ChildPidEvidence {
+  version: typeof CHILD_PID_EVIDENCE_VERSION;
+  ownerToken: string;
+  pid: number;
+  configuredExecutable: string;
+  capturedAt: string;
+  identity: ProcessIdentity;
+}
+
+interface ChildReservationEvidence {
+  version: typeof CHILD_PID_EVIDENCE_VERSION;
+  ownerToken: string;
+  managerPid: number;
+  capturedAt: string;
+  identity: ProcessIdentity;
+}
+
+interface LegacyPidEvidence {
+  pid: number;
+  legacy: true;
+}
+
+type ParsedPidEvidence = ChildPidEvidence | LegacyPidEvidence;
 
 /**
  * Child process status
@@ -64,6 +109,11 @@ export interface ChildProcessManagerEvents {
   error: (error: Error) => void;
 }
 
+export interface ChildProcessManagerOptions {
+  /** Daemon mode owns SIGINT/SIGTERM and stops the child after its drain. */
+  forwardTerminationSignals?: boolean;
+}
+
 /**
  * Manages a child process with secrets as environment variables.
  * Handles restart on changes, crash recovery with backoff, and signal forwarding.
@@ -73,19 +123,33 @@ export class ChildProcessManager extends EventEmitter {
   private readonly config: Required<Omit<ExecConfig, 'command' | 'secrets' | 'envFile'>> & Pick<ExecConfig, 'command' | 'secrets' | 'envFile'>;
   private readonly mappings: (SecretMapping & { literal?: string; outputToFile?: boolean })[];
   private readonly useFileMode: boolean;
+  private readonly forwardTerminationSignals: boolean;
   private isShuttingDown = false;
   private restartCount = 0;
   private restartWindowStart = 0;
   private restartTimeout: NodeJS.Timeout | null = null;
+  private lifecycleChain: Promise<void> | null = null;
+  private intentionalRestartChild: ChildProcess | null = null;
+  private readonly spawnedChildren = new WeakSet<ChildProcess>();
+  private readonly terminatedChildren = new WeakSet<ChildProcess>();
   private status: ChildProcessStatus = 'stopped';
   private lastExitCode: number | null = null;
   private lastExitSignal: string | null = null;
   private lastExitTime: string | null = null;
   private lastStartTime: string | null = null;
+  /** Exact durable evidence written by this manager instance, if any. */
+  private ownedPidEvidence: string | null = null;
+  private readonly pidEvidenceOwnerToken = randomUUID();
+  /** Cross-process reservation retained until terminal stop. */
+  private ownedReservationEvidence: string | null = null;
   private readonly signalHandlers = new Map<NodeJS.Signals, () => void>();
 
-  constructor(execConfig: ExecConfig) {
+  constructor(
+    execConfig: ExecConfig,
+    options: ChildProcessManagerOptions = {}
+  ) {
     super();
+    this.forwardTerminationSignals = options.forwardTerminationSignals ?? true;
 
     // Merge with defaults
     this.config = {
@@ -126,48 +190,443 @@ export class ChildProcessManager extends EventEmitter {
       return;
     }
 
-    try {
-      const pidStr = fs.readFileSync(CHILD_PID_FILE, 'utf-8').trim();
-      const pid = parseInt(pidStr, 10);
+    const storedEvidence = fs.readFileSync(CHILD_PID_FILE, 'utf-8');
+    const evidence = this.parsePidEvidence(storedEvidence.trim());
+    if (!evidence) {
+      log.error({ file: CHILD_PID_FILE }, 'Ambiguous child PID evidence; refusing orphan cleanup');
+      throw new Error('Invalid child PID evidence; refusing to signal any process');
+    }
+    const { pid } = evidence;
 
-      if (isNaN(pid) || pid <= 0) {
-        log.debug({ pidStr }, 'Invalid PID in child PID file, cleaning up');
-        this.cleanupPidFile();
+    try {
+      process.kill(pid, 0);
+    } catch (err) {
+      if (!this.isNoSuchProcessError(err)) {
+        log.error({ err, pid }, 'Unable to verify orphaned child process');
+        throw new Error(`Unable to verify orphaned child process ${pid}`);
+      }
+      log.debug({ pid }, 'Orphaned PID file found but process not running');
+      this.cleanupPidFile(storedEvidence);
+      return;
+    }
+
+    this.assertOrphanIdentity(evidence, 'SIGTERM');
+    log.warn({ pid }, 'Found orphaned child process, attempting graceful termination');
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch (err) {
+      if (this.isNoSuchProcessError(err)) {
+        this.cleanupPidFile(storedEvidence);
         return;
       }
+      log.error({ err, pid }, 'Failed to send SIGTERM to orphaned child process');
+      throw new Error(`Unable to terminate orphaned child process ${pid}`);
+    }
 
-      // Check if process exists (signal 0 = check existence)
+    let terminated = await this.waitForProcessExit(pid, ORPHAN_KILL_TIMEOUT_MS);
+    if (!terminated) {
+      this.assertOrphanIdentity(evidence, 'SIGKILL');
+      log.warn({ pid }, 'Orphaned process did not exit gracefully, sending SIGKILL');
       try {
-        process.kill(pid, 0);
-        log.warn({ pid }, 'Found orphaned child process, attempting graceful termination');
+        process.kill(pid, 'SIGKILL');
+      } catch (err) {
+        if (this.isNoSuchProcessError(err)) {
+          terminated = true;
+        } else {
+          log.error({ err, pid }, 'Failed to send SIGKILL to orphaned child process');
+          throw new Error(`Unable to kill orphaned child process ${pid}`);
+        }
+      }
+      if (!terminated) {
+        terminated = await this.waitForProcessExit(
+          pid,
+          FORCE_KILL_CONFIRMATION_TIMEOUT_MS
+        );
+      }
+    }
 
-        // Send SIGTERM for graceful shutdown
-        process.kill(pid, 'SIGTERM');
+    if (!terminated) {
+      log.error({ pid }, 'Orphaned child process did not confirm exit');
+      throw new Error(`Orphaned child process ${pid} did not confirm exit`);
+    }
 
-        // Wait for graceful exit (up to ORPHAN_KILL_TIMEOUT_MS)
-        const terminated = await this.waitForProcessExit(pid, ORPHAN_KILL_TIMEOUT_MS);
+    log.info({ pid }, 'Orphaned child process cleaned up');
+    this.cleanupPidFile(storedEvidence);
+  }
 
-        if (!terminated) {
-          // Force kill if still running
-          log.warn({ pid }, 'Orphaned process did not exit gracefully, sending SIGKILL');
-          try {
-            process.kill(pid, 'SIGKILL');
-          } catch {
-            // Process may have exited between check and kill
+  private parsePidEvidence(rawEvidence: string): ParsedPidEvidence | null {
+    if (/^[1-9]\d*$/.test(rawEvidence)) {
+      const pid = Number(rawEvidence);
+      return Number.isSafeInteger(pid) ? { pid, legacy: true } : null;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawEvidence);
+    } catch {
+      return null;
+    }
+
+    if (!this.isObjectRecord(parsed)
+      || parsed.version !== CHILD_PID_EVIDENCE_VERSION
+      || typeof parsed.ownerToken !== 'string'
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.ownerToken)
+      || !Number.isSafeInteger(parsed.pid)
+      || typeof parsed.pid !== 'number'
+      || parsed.pid <= 0
+      || typeof parsed.configuredExecutable !== 'string'
+      || parsed.configuredExecutable.length === 0
+      || typeof parsed.capturedAt !== 'string'
+      || !this.isObjectRecord(parsed.identity)
+    ) {
+      return null;
+    }
+
+    const identity = parsed.identity;
+    if (identity.kind === 'linux-procfs') {
+      if (typeof identity.startTimeTicks !== 'string'
+        || !/^\d+$/.test(identity.startTimeTicks)
+        || typeof identity.executablePath !== 'string'
+        || identity.executablePath.length === 0
+      ) {
+        return null;
+      }
+      return parsed as unknown as ChildPidEvidence;
+    }
+
+    if (identity.kind === 'unsupported-platform'
+      && typeof identity.platform === 'string'
+      && identity.platform.length > 0
+    ) {
+      return parsed as unknown as ChildPidEvidence;
+    }
+
+    return null;
+  }
+
+  private isObjectRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+  }
+
+  private parseReservationEvidence(rawEvidence: string): ChildReservationEvidence | null {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawEvidence);
+    } catch {
+      return null;
+    }
+
+    if (!this.isObjectRecord(parsed)
+      || parsed.version !== CHILD_PID_EVIDENCE_VERSION
+      || typeof parsed.ownerToken !== 'string'
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.ownerToken)
+      || !Number.isSafeInteger(parsed.managerPid)
+      || typeof parsed.managerPid !== 'number'
+      || parsed.managerPid <= 0
+      || typeof parsed.capturedAt !== 'string'
+      || !this.isObjectRecord(parsed.identity)
+    ) {
+      return null;
+    }
+
+    const identity = parsed.identity;
+    if (identity.kind === 'linux-procfs') {
+      if (typeof identity.startTimeTicks !== 'string'
+        || !/^\d+$/.test(identity.startTimeTicks)
+        || typeof identity.executablePath !== 'string'
+        || identity.executablePath.length === 0
+      ) {
+        return null;
+      }
+      return parsed as unknown as ChildReservationEvidence;
+    }
+
+    if (identity.kind === 'unsupported-platform'
+      && typeof identity.platform === 'string'
+      && identity.platform.length > 0
+    ) {
+      return parsed as unknown as ChildReservationEvidence;
+    }
+
+    return null;
+  }
+
+  /**
+   * Confirm that a live PID still names the exact process captured at spawn.
+   * A legacy PID-only file or a platform without a stable kernel birth marker
+   * is deliberately non-actionable: preserving evidence is safer than killing
+   * an unrelated process after PID reuse.
+   */
+  private assertOrphanIdentity(
+    evidence: ParsedPidEvidence,
+    signal: 'SIGTERM' | 'SIGKILL'
+  ): void {
+    const { pid } = evidence;
+    if ('legacy' in evidence) {
+      log.error({ pid, signal }, 'Legacy PID evidence cannot prove orphan identity');
+      throw new Error(
+        `Cannot verify identity of orphaned child process ${pid}; refusing ${signal}`
+      );
+    }
+
+    if (evidence.identity.kind !== 'linux-procfs') {
+      log.error(
+        { pid, signal, platform: evidence.identity.platform },
+        'Stable orphan identity is unavailable on this platform'
+      );
+      throw new Error(
+        `Cannot verify identity of orphaned child process ${pid}; refusing ${signal}`
+      );
+    }
+
+    let observed: LinuxProcessIdentity;
+    try {
+      observed = this.readLinuxProcessIdentity(pid);
+    } catch (err) {
+      log.error({ err, pid, signal }, 'Unable to read orphan process identity');
+      throw new Error(
+        `Unable to verify identity of orphaned child process ${pid}; refusing ${signal}`,
+        { cause: err }
+      );
+    }
+
+    if (observed.startTimeTicks !== evidence.identity.startTimeTicks
+      || observed.executablePath !== evidence.identity.executablePath
+    ) {
+      log.error(
+        {
+          pid,
+          signal,
+          expectedStartTimeTicks: evidence.identity.startTimeTicks,
+          observedStartTimeTicks: observed.startTimeTicks,
+          expectedExecutablePath: evidence.identity.executablePath,
+          observedExecutablePath: observed.executablePath,
+        },
+        'Orphan process identity mismatch; refusing signal'
+      );
+      throw new Error(
+        `Orphaned child process ${pid} identity mismatch; refusing ${signal}`
+      );
+    }
+  }
+
+  private readLinuxProcessIdentity(pid: number): LinuxProcessIdentity {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    const commandEnd = stat.lastIndexOf(')');
+    if (commandEnd < 0) {
+      throw new Error(`Malformed /proc/${pid}/stat`);
+    }
+
+    // Fields after the command begin at field 3 (state). starttime is field 22.
+    const fieldsAfterCommand = stat.slice(commandEnd + 1).trim().split(/\s+/);
+    const startTimeTicks = fieldsAfterCommand[19];
+    if (!startTimeTicks || !/^\d+$/.test(startTimeTicks)) {
+      throw new Error(`Missing start time in /proc/${pid}/stat`);
+    }
+
+    const executablePath = fs.readlinkSync(`/proc/${pid}/exe`);
+    if (!executablePath) {
+      throw new Error(`Missing executable identity for process ${pid}`);
+    }
+
+    return {
+      kind: 'linux-procfs',
+      startTimeTicks,
+      executablePath,
+    };
+  }
+
+  private isNoSuchProcessError(error: unknown): boolean {
+    return typeof error === 'object'
+      && error !== null
+      && 'code' in error
+      && error.code === 'ESRCH';
+  }
+
+  private isAlreadyExistsError(error: unknown): boolean {
+    return typeof error === 'object'
+      && error !== null
+      && 'code' in error
+      && error.code === 'EEXIST';
+  }
+
+  private isNoSuchFileError(error: unknown): boolean {
+    return typeof error === 'object'
+      && error !== null
+      && 'code' in error
+      && error.code === 'ENOENT';
+  }
+
+  /**
+   * Reserve combined-mode ownership before orphan inspection, secret fetches,
+   * or spawn. The claim file serializes every ownership transition, including
+   * stale-owner recovery. Claims are deliberately never auto-reaped: an
+   * abandoned claim is ambiguous and requires explicit operator intervention.
+   */
+  private acquireChildReservation(): void {
+    if (this.ownedReservationEvidence) {
+      this.assertChildReservationOwnership('reservation reuse');
+      return;
+    }
+
+    const dir = path.dirname(CHILD_RESERVATION_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+
+    const identity: ProcessIdentity = process.platform === 'linux'
+      ? this.readLinuxProcessIdentity(process.pid)
+      : { kind: 'unsupported-platform', platform: process.platform };
+    const evidence: ChildReservationEvidence = {
+      version: CHILD_PID_EVIDENCE_VERSION,
+      ownerToken: this.pidEvidenceOwnerToken,
+      managerPid: process.pid,
+      capturedAt: new Date().toISOString(),
+      identity,
+    };
+    const serializedEvidence = `${JSON.stringify(evidence)}\n`;
+
+    try {
+      fs.writeFileSync(CHILD_RESERVATION_CLAIM_FILE, serializedEvidence, {
+        encoding: 'utf-8',
+        mode: 0o600,
+        flag: 'wx',
+        flush: true,
+      });
+    } catch (err) {
+      if (this.isAlreadyExistsError(err)) {
+        log.error(
+          { file: CHILD_RESERVATION_CLAIM_FILE },
+          'Child reservation claim already exists; explicit operator intervention required'
+        );
+        throw new Error(
+          'Child process reservation recovery is already claimed; refusing to spawn'
+        );
+      }
+      throw new Error('Failed to claim child process reservation transition', { cause: err });
+    }
+
+    let acquisitionFailed = false;
+    let acquisitionError: unknown;
+    try {
+      if (fs.existsSync(CHILD_RESERVATION_FILE)) {
+        let storedEvidence: string;
+        try {
+          storedEvidence = fs.readFileSync(CHILD_RESERVATION_FILE, 'utf-8');
+        } catch (readError) {
+          throw new Error('Unable to read existing child process reservation', {
+            cause: readError,
+          });
+        }
+        const existing = this.parseReservationEvidence(storedEvidence.trim());
+        if (!existing) {
+          throw new Error('Invalid child process reservation; refusing to spawn');
+        }
+
+        let ownerIsStale = false;
+        try {
+          process.kill(existing.managerPid, 0);
+        } catch (probeError) {
+          if (this.isNoSuchProcessError(probeError)) {
+            ownerIsStale = true;
+          } else {
+            throw new Error('Unable to verify existing child process reservation owner', {
+              cause: probeError,
+            });
           }
         }
 
-        log.info({ pid }, 'Orphaned child process cleaned up');
-      } catch {
-        // ESRCH = process doesn't exist, which is fine
-        log.debug({ pid }, 'Orphaned PID file found but process not running');
+        if (!ownerIsStale && existing.identity.kind === 'linux-procfs') {
+          let observedIdentity: LinuxProcessIdentity;
+          try {
+            observedIdentity = this.readLinuxProcessIdentity(existing.managerPid);
+          } catch (identityError) {
+            throw new Error('Unable to verify existing child process reservation owner', {
+              cause: identityError,
+            });
+          }
+          ownerIsStale = observedIdentity.startTimeTicks !== existing.identity.startTimeTicks
+            || observedIdentity.executablePath !== existing.identity.executablePath;
+        }
+
+        if (!ownerIsStale) {
+          throw new Error(
+            `Child process ownership is already reserved by manager ${existing.managerPid}`
+          );
+        }
+
+        // The O_EXCL claim is the mutation lock. Re-read exact evidence while
+        // holding it, then remove the stale owner. No other compliant manager
+        // can replace the owner until this claim is released.
+        const currentEvidence = fs.readFileSync(CHILD_RESERVATION_FILE, 'utf-8');
+        if (currentEvidence !== storedEvidence) {
+          throw new Error('Child process reservation changed during stale-owner recovery');
+        }
+        fs.unlinkSync(CHILD_RESERVATION_FILE);
       }
 
-      this.cleanupPidFile();
+      try {
+        fs.writeFileSync(CHILD_RESERVATION_FILE, serializedEvidence, {
+          encoding: 'utf-8',
+          mode: 0o600,
+          flag: 'wx',
+          flush: true,
+        });
+      } catch (err) {
+        throw new Error('Failed to acquire child process reservation', { cause: err });
+      }
+      this.ownedReservationEvidence = serializedEvidence;
+
+      const persistedEvidence = fs.readFileSync(CHILD_RESERVATION_FILE, 'utf-8');
+      if (persistedEvidence !== serializedEvidence) {
+        this.ownedReservationEvidence = null;
+        throw new Error('Child process reservation changed while it was being acquired');
+      }
     } catch (err) {
-      log.warn({ err }, 'Failed to cleanup orphaned child process');
-      // Still try to remove PID file
-      this.cleanupPidFile();
+      acquisitionFailed = true;
+      acquisitionError = err;
+    }
+
+    if (!this.removeExactEvidence(
+      CHILD_RESERVATION_CLAIM_FILE,
+      serializedEvidence,
+      false
+    )) {
+      log.error(
+        { file: CHILD_RESERVATION_CLAIM_FILE },
+        'Child reservation claim changed; refusing non-owned cleanup'
+      );
+      throw new Error(
+        'Child process reservation claim could not be released; refusing to spawn',
+        acquisitionFailed ? { cause: acquisitionError } : undefined
+      );
+    }
+    if (acquisitionFailed) throw acquisitionError;
+
+    this.assertChildReservationOwnership('reservation acquisition');
+    log.debug({ file: CHILD_RESERVATION_FILE }, 'Child process reservation acquired');
+  }
+
+  /** Revalidate exact ownership at every boundary before external effects. */
+  private assertChildReservationOwnership(stage: string): void {
+    const ownedEvidence = this.ownedReservationEvidence;
+    if (!ownedEvidence) {
+      throw new Error(`Child process reservation is not owned before ${stage}`);
+    }
+
+    // A late claimant may hold the transition claim briefly while it verifies
+    // this exact live owner. It cannot replace live byte-exact ownership, so
+    // the persisted owner evidence remains authoritative here.
+    let currentEvidence: string;
+    try {
+      currentEvidence = fs.readFileSync(CHILD_RESERVATION_FILE, 'utf-8');
+    } catch (err) {
+      throw new Error(`Unable to verify child process reservation before ${stage}`, {
+        cause: err,
+      });
+    }
+    if (currentEvidence !== ownedEvidence) {
+      throw new Error(`Child process reservation ownership changed before ${stage}`);
     }
   }
 
@@ -184,9 +643,9 @@ export class ChildProcessManager extends EventEmitter {
         process.kill(pid, 0);
         // Process still running, wait
         await new Promise(resolve => setTimeout(resolve, checkInterval));
-      } catch {
-        // Process exited
-        return true;
+      } catch (err) {
+        if (this.isNoSuchProcessError(err)) return true;
+        throw err;
       }
     }
 
@@ -194,46 +653,179 @@ export class ChildProcessManager extends EventEmitter {
     try {
       process.kill(pid, 0);
       return false; // Still running
-    } catch {
-      return true; // Exited
+    } catch (err) {
+      if (this.isNoSuchProcessError(err)) return true;
+      throw err;
     }
   }
 
-  /**
-   * Write child PID to file for orphan detection.
-   */
+  /** Persist process birth evidence without replacing any rival owner. */
   private writePidFile(pid: number): void {
+    const dir = path.dirname(CHILD_PID_FILE);
     try {
-      const dir = path.dirname(CHILD_PID_FILE);
       if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       }
-      fs.writeFileSync(CHILD_PID_FILE, String(pid), { mode: 0o644 });
-      log.debug({ pid, file: CHILD_PID_FILE }, 'Child PID file written');
+
+      const identity: ProcessIdentity = process.platform === 'linux'
+        ? this.readLinuxProcessIdentity(pid)
+        : { kind: 'unsupported-platform', platform: process.platform };
+      const evidence: ChildPidEvidence = {
+        version: CHILD_PID_EVIDENCE_VERSION,
+        ownerToken: this.pidEvidenceOwnerToken,
+        pid,
+        configuredExecutable: this.config.command[0] ?? 'unknown',
+        capturedAt: new Date().toISOString(),
+        identity,
+      };
+
+      const serializedEvidence = `${JSON.stringify(evidence)}\n`;
+      fs.writeFileSync(CHILD_PID_FILE, serializedEvidence, {
+        encoding: 'utf-8',
+        mode: 0o600,
+        flag: 'wx',
+        flush: true,
+      });
+      this.ownedPidEvidence = serializedEvidence;
+      log.debug(
+        { pid, file: CHILD_PID_FILE, identityKind: identity.kind },
+        'Child PID evidence written'
+      );
     } catch (err) {
-      // Non-critical - log but don't fail
-      log.warn({ err, file: CHILD_PID_FILE }, 'Failed to write child PID file');
+      log.error({ err, file: CHILD_PID_FILE }, 'Failed to write child PID evidence');
+      throw new Error('Failed to persist child process identity evidence', { cause: err });
     }
   }
 
   /**
    * Remove the child PID file.
    */
-  private cleanupPidFile(): void {
-    try {
-      if (fs.existsSync(CHILD_PID_FILE)) {
-        fs.unlinkSync(CHILD_PID_FILE);
-        log.debug({ file: CHILD_PID_FILE }, 'Child PID file removed');
-      }
-    } catch {
-      // Ignore cleanup errors
+  private cleanupPidFile(expectedEvidence: string): void {
+    if (!this.removeExactEvidence(CHILD_PID_FILE, expectedEvidence)) {
+      throw new Error('Child PID evidence changed during orphan cleanup; refusing to spawn');
     }
+    this.ownedPidEvidence = null;
+    log.debug({ file: CHILD_PID_FILE }, 'Child PID file removed');
+  }
+
+  private removeExactEvidence(
+    file: string,
+    expectedEvidence: string,
+    missingIsSuccess = true
+  ): boolean {
+    try {
+      if (!fs.existsSync(file)) return missingIsSuccess;
+      const currentEvidence = fs.readFileSync(file, 'utf-8');
+      if (currentEvidence !== expectedEvidence) return false;
+      fs.unlinkSync(file);
+      return true;
+    } catch (err) {
+      log.warn({ err, file }, 'Failed to remove exact process ownership evidence');
+      return false;
+    }
+  }
+
+  /**
+   * Remove only evidence written by this manager instance. Evidence found at
+   * startup belongs to a prior process and must remain until orphan cleanup
+   * confirms ESRCH or the exact captured process exits.
+   */
+  private cleanupOwnedPidFile(): void {
+    const ownedEvidence = this.ownedPidEvidence;
+    if (!ownedEvidence) return;
+
+    try {
+      if (!fs.existsSync(CHILD_PID_FILE)) {
+        this.ownedPidEvidence = null;
+        return;
+      }
+
+      const currentEvidence = fs.readFileSync(CHILD_PID_FILE, 'utf-8');
+      if (currentEvidence !== ownedEvidence) {
+        log.warn(
+          { file: CHILD_PID_FILE },
+          'Child PID evidence was replaced; refusing non-owned cleanup'
+        );
+        this.ownedPidEvidence = null;
+        return;
+      }
+
+      fs.unlinkSync(CHILD_PID_FILE);
+      this.ownedPidEvidence = null;
+      log.debug({ file: CHILD_PID_FILE }, 'Owned child PID evidence removed');
+    } catch (err) {
+      log.warn({ err, file: CHILD_PID_FILE }, 'Failed to remove owned child PID evidence');
+    }
+  }
+
+  private cleanupOwnedReservationFile(): void {
+    const ownedEvidence = this.ownedReservationEvidence;
+    if (!ownedEvidence) return;
+
+    if (this.removeExactEvidence(CHILD_RESERVATION_FILE, ownedEvidence)) {
+      this.ownedReservationEvidence = null;
+      log.debug({ file: CHILD_RESERVATION_FILE }, 'Child process reservation released');
+      return;
+    }
+
+    log.warn(
+      { file: CHILD_RESERVATION_FILE },
+      'Child process reservation was replaced; refusing non-owned cleanup'
+    );
+    this.ownedReservationEvidence = null;
+  }
+
+  /**
+   * Serialize every operation that may create, replace, or stop the child.
+   *
+   * The first operation begins immediately, preserving the existing lifecycle
+   * event timing, while the published barrier makes re-entrant operations wait.
+   * A rejected operation does not poison later crash recovery or restart work.
+   */
+  private enqueueLifecycleOperation(operation: () => Promise<void>): Promise<void> {
+    if (!this.lifecycleChain) {
+      let releaseBarrier!: () => void;
+      const firstBarrier = new Promise<void>(resolve => {
+        releaseBarrier = resolve;
+      });
+      this.lifecycleChain = firstBarrier;
+
+      let scheduledOperation: Promise<void>;
+      try {
+        scheduledOperation = operation();
+      } catch (err) {
+        scheduledOperation = Promise.reject(err);
+      }
+      const releaseFirstOperation = (): void => {
+        releaseBarrier();
+        if (this.lifecycleChain === firstBarrier) {
+          this.lifecycleChain = null;
+        }
+      };
+      void scheduledOperation.then(releaseFirstOperation, releaseFirstOperation);
+      return scheduledOperation;
+    }
+
+    const scheduledOperation = this.lifecycleChain.then(operation);
+    const settledOperation = scheduledOperation.catch(() => undefined);
+    this.lifecycleChain = settledOperation;
+    const clearSettledOperation = (): void => {
+      if (this.lifecycleChain === settledOperation) {
+        this.lifecycleChain = null;
+      }
+    };
+    void scheduledOperation.then(clearSettledOperation, clearSettledOperation);
+    return scheduledOperation;
   }
 
   /**
    * Start the child process
    */
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    return this.enqueueLifecycleOperation(async () => this.performStart(false));
+  }
+
+  private async performStart(rejectOnShutdown: boolean): Promise<void> {
     if (this.child) {
       log.warn('Child process already running, ignoring start request');
       return;
@@ -241,20 +833,43 @@ export class ChildProcessManager extends EventEmitter {
 
     if (this.isShuttingDown) {
       log.warn('Manager is shutting down, ignoring start request');
+      if (rejectOnShutdown) {
+        throw new Error('Child process manager is shutting down');
+      }
       return;
     }
 
-    // Kill any orphaned child process from previous run
-    await this.killOrphanedChild();
+    // Cross-process reservation precedes orphan inspection, secret retrieval,
+    // and spawn. Therefore two managers cannot both observe absence and admit
+    // a child, even when their in-process lifecycle queues are independent.
+    try {
+      this.acquireChildReservation();
+      await this.killOrphanedChild();
+    } catch (err) {
+      this.status = 'crashed';
+      throw err;
+    }
+
+    // stop() closes admission synchronously. Revalidate after every awaited
+    // preparation phase so a start cannot spawn after shutdown observed no
+    // child and moved on.
+    if (this.isShuttingDown) {
+      if (rejectOnShutdown) {
+        throw new Error('Child process manager is shutting down');
+      }
+      return;
+    }
 
     this.status = 'starting';
     log.info({ command: this.config.command.join(' '), useFileMode: this.useFileMode }, 'Starting child process');
 
+    let spawnedChild: ChildProcess | null = null;
     try {
       // Fetch secrets and build environment
       // Use file mode if any secrets are marked for file output
       let secretEnv: Record<string, string>;
 
+      this.assertChildReservationOwnership('secret retrieval');
       if (this.useFileMode) {
         const result = await buildSecretEnvWithFiles(this.mappings);
         secretEnv = result.env;
@@ -271,56 +886,184 @@ export class ChildProcessManager extends EventEmitter {
         secretEnv = await buildSecretEnv(this.mappings);
       }
 
+      if (this.isShuttingDown) {
+        if (rejectOnShutdown) {
+          throw new Error('Child process manager is shutting down');
+        }
+        this.status = 'stopped';
+        return;
+      }
+
       const env = this.config.inheritEnv
         ? { ...process.env, ...secretEnv }
         : secretEnv;
 
       // Spawn the child process
       const [cmd, ...args] = this.config.command;
-      this.child = spawn(cmd, args, {
+      this.assertChildReservationOwnership('child spawn');
+      spawnedChild = spawn(cmd, args, {
         env,
         stdio: 'inherit',
         shell: process.platform === 'win32',
       });
-
-      this.lastStartTime = new Date().toISOString();
-      this.status = 'running';
-
+      this.child = spawnedChild;
+      const spawnConfirmed = this.waitForSpawn(spawnedChild);
       this.setupSignalForwarding();
       this.setupChildEventHandlers();
 
-      // Write PID file for orphan detection on next startup
-      if (this.child.pid) {
-        this.writePidFile(this.child.pid);
+      // spawn() returning only means an attempt was admitted by Node. Do not
+      // acknowledge a mutation restart until the child emits `spawn`; an
+      // asynchronous `error` before that point rejects this lifecycle step.
+      await spawnConfirmed;
+
+      if (this.child !== spawnedChild) {
+        throw new Error('Child process failed before startup completed');
+      }
+      if (this.isShuttingDown) {
+        if (rejectOnShutdown) {
+          throw new Error('Child process manager is shutting down');
+        }
+        return;
       }
 
-      log.info({ pid: this.child.pid }, 'Child process started');
-      this.emit('started', this.child.pid);
+      // Never acknowledge or leave a child running without durable identity
+      // evidence. The ChildProcess handle is safe to signal here even if PID
+      // evidence could not be captured, because it is the object just spawned.
+      try {
+        if (!spawnedChild.pid) {
+          throw new Error('Spawned child has no PID');
+        }
+        this.writePidFile(spawnedChild.pid);
+      } catch (evidenceError) {
+        const childExitedBeforeIdentityCapture = evidenceError instanceof Error
+          && (
+            this.isNoSuchFileError(evidenceError.cause)
+            || this.isNoSuchProcessError(evidenceError.cause)
+          );
+        const terminationWasAlreadyHandled = this.terminatedChildren.has(spawnedChild);
+        this.intentionalRestartChild = spawnedChild;
+        let terminationError: unknown;
+        try {
+          await this.terminateChild(spawnedChild, RESTART_GRACEFUL_STOP_TIMEOUT_MS);
+          if (this.child === spawnedChild) this.child = null;
+        } catch (err) {
+          terminationError = err;
+        } finally {
+          this.intentionalRestartChild = null;
+          this.cleanupSignalHandlers();
+        }
+
+        if (terminationError) {
+          throw new AggregateError(
+            [evidenceError, terminationError],
+            'Failed to persist child identity and confirm child termination'
+          );
+        }
+        if (
+          childExitedBeforeIdentityCapture
+          && !terminationWasAlreadyHandled
+          && !this.isShuttingDown
+        ) {
+          // A short-lived Linux child can disappear between the `spawn` event
+          // and the /proc identity read. The termination handler was
+          // deliberately suppressed while we confirmed the child was gone, so
+          // account for this as a real crash and retain bounded recovery.
+          this.handleCrash(
+            spawnedChild.exitCode,
+            spawnedChild.signalCode?.toString() ?? null
+          );
+        }
+        throw evidenceError;
+      }
+
+      this.lastStartTime = new Date().toISOString();
+      this.status = 'running';
+      log.info({ pid: spawnedChild.pid }, 'Child process started');
+      this.emit('started', spawnedChild.pid);
     } catch (err) {
-      this.status = 'crashed';
       const error = err instanceof Error ? err : new Error(String(err));
+      if (!this.isShuttingDown) {
+        if (this.getState().status !== 'max_restarts_exceeded') {
+          this.status = 'crashed';
+        }
+      } else if (!this.child) {
+        this.status = 'stopped';
+      }
       log.error({ err: error }, 'Failed to start child process');
-      this.emit('error', error);
+      // Child event handlers own errors emitted by an admitted process. Errors
+      // from secret preparation or a synchronous spawn failure have no such
+      // handler, so publish them here.
+      if (!spawnedChild) {
+        this.emit('error', error);
+      }
       throw error;
+    }
+  }
+
+  private waitForSpawn(child: ChildProcess): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const onSpawn = (): void => {
+        child.off('error', onError);
+        this.spawnedChildren.add(child);
+        resolve();
+      };
+      const onError = (error: Error): void => {
+        child.off('spawn', onSpawn);
+        reject(error);
+      };
+      child.once('spawn', onSpawn);
+      child.once('error', onError);
+    });
+  }
+
+  /**
+   * Close lifecycle admission before daemon drain or process shutdown.
+   * The child remains running until stop() so already-admitted mutations can
+   * unwind, but crash recovery and new starts/restarts are disabled now.
+   */
+  beginShutdown(): void {
+    this.isShuttingDown = true;
+
+    if (this.restartTimeout) {
+      clearTimeout(this.restartTimeout);
+      this.restartTimeout = null;
     }
   }
 
   /**
    * Stop the child process gracefully
    */
-  async stop(): Promise<void> {
-    this.isShuttingDown = true;
+  stop(): Promise<void> {
+    this.beginShutdown();
 
-    // Clear any pending restart
-    if (this.restartTimeout) {
-      clearTimeout(this.restartTimeout);
-      this.restartTimeout = null;
-    }
+    return this.enqueueLifecycleOperation(async () => this.performStop());
+  }
 
+  private async performStop(): Promise<void> {
     // Remove signal handlers
     this.cleanupSignalHandlers();
 
-    // Clean up secret files if we were using file mode
+    if (!this.child) {
+      this.status = 'stopped';
+      this.cleanupChildArtifacts();
+      this.cleanupOwnedReservationFile();
+      return;
+    }
+
+    const childToStop = this.child;
+    log.info({ pid: childToStop.pid }, 'Stopping child process');
+
+    await this.terminateChild(childToStop, SHUTDOWN_GRACEFUL_STOP_TIMEOUT_MS);
+    if (this.child === childToStop) {
+      this.child = null;
+    }
+    this.status = 'stopped';
+    this.cleanupChildArtifacts();
+    this.cleanupOwnedReservationFile();
+  }
+
+  /** Remove child-owned material only after termination is confirmed. */
+  private cleanupChildArtifacts(): void {
     if (this.useFileMode) {
       try {
         const manager = getSecretFileManager();
@@ -331,60 +1074,35 @@ export class ChildProcessManager extends EventEmitter {
       }
     }
 
-    // Clean up PID file
-    this.cleanupPidFile();
-
-    if (!this.child) {
-      this.status = 'stopped';
-      return;
-    }
-
-    const childToStop = this.child;
-    log.info({ pid: childToStop.pid }, 'Stopping child process');
-
-    await new Promise<void>((resolve) => {
-      const child = childToStop;
-
-      // Set up exit handler
-      const onExit = (): void => {
-        this.child = null;
-        this.status = 'stopped';
-        resolve();
-      };
-
-      // If already dead
-      if (child.exitCode !== null || child.signalCode !== null) {
-        onExit();
-        return;
-      }
-
-      child.once('exit', onExit);
-
-      // Send SIGTERM first
-      child.kill('SIGTERM');
-
-      // Force kill after 10 seconds
-      setTimeout(() => {
-        if (this.child) {
-          log.warn({ pid: this.child.pid }, 'Child did not exit, sending SIGKILL');
-          this.child.kill('SIGKILL');
-        }
-      }, 10000);
-    });
+    this.cleanupOwnedPidFile();
   }
 
   /**
    * Restart the child process (e.g., after cert/secret change)
    */
-  async restart(reason: string): Promise<void> {
+  restart(reason: string): Promise<void> {
     if (this.isShuttingDown) {
-      log.warn('Manager is shutting down, ignoring restart request');
-      return;
+      return Promise.reject(new Error('Child process manager is shutting down'));
     }
 
     if (!this.config.restartOnChange) {
       log.debug({ reason }, 'Restart requested but restartOnChange is disabled');
-      return;
+      return Promise.resolve();
+    }
+
+    // Certificate, secret, exec, plugin/key, crash recovery, initial start and
+    // shutdown all share the same child lifecycle coordinator.
+    return this.enqueueLifecycleOperation(async () => this.performRestart(reason));
+  }
+
+  private async performRestart(reason: string): Promise<void> {
+    if (this.isShuttingDown) {
+      throw new Error('Child process manager is shutting down');
+    }
+
+    if (this.restartTimeout) {
+      clearTimeout(this.restartTimeout);
+      this.restartTimeout = null;
     }
 
     log.info({ reason }, 'Restarting child process');
@@ -393,12 +1111,16 @@ export class ChildProcessManager extends EventEmitter {
 
     // Stop current process
     if (this.child) {
-      this.isShuttingDown = false; // Don't prevent restart
-      await this.stopChild();
+      this.intentionalRestartChild = this.child;
+      try {
+        await this.stopChild();
+      } finally {
+        this.intentionalRestartChild = null;
+      }
     }
 
     // Start with fresh secrets
-    await this.start();
+    await this.performStart(true);
   }
 
   /**
@@ -423,11 +1145,12 @@ export class ChildProcessManager extends EventEmitter {
     return this.status === 'running';
   }
 
-  /**
-   * Check if process is in a degraded state (restarting or max restarts exceeded)
-   */
+  /** Check if process is transitioning or awaiting crash recovery. */
   isDegraded(): boolean {
-    return this.status === 'restarting' || this.status === 'max_restarts_exceeded';
+    return this.status === 'starting'
+      || this.status === 'restarting'
+      || this.status === 'crashed'
+      || this.status === 'max_restarts_exceeded';
   }
 
   /**
@@ -437,30 +1160,80 @@ export class ChildProcessManager extends EventEmitter {
     const childToStop = this.child;
     if (!childToStop) return;
 
-    await new Promise<void>((resolve) => {
-      const child = childToStop;
+    // Remove signal handlers during restart
+    this.cleanupSignalHandlers();
+    await this.terminateChild(childToStop, RESTART_GRACEFUL_STOP_TIMEOUT_MS);
+    if (this.child === childToStop) {
+      this.child = null;
+    }
+  }
 
-      // Remove signal handlers during restart
-      this.cleanupSignalHandlers();
+  /**
+   * Stop one captured child and require exit/close confirmation before success.
+   * An `error` event is deliberately ignored as termination evidence because
+   * Node also emits it for failed kill/send operations while the process lives.
+   */
+  private async terminateChild(
+    child: ChildProcess,
+    gracefulTimeoutMs: number
+  ): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null) return;
 
-      const onExit = (): void => {
-        this.child = null;
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let forceKillTimer: NodeJS.Timeout | null = null;
+      let confirmationTimer: NodeJS.Timeout | null = null;
+
+      const cleanup = (): void => {
+        child.off('exit', onTerminated);
+        child.off('close', onTerminated);
+        if (forceKillTimer) clearTimeout(forceKillTimer);
+        if (confirmationTimer) clearTimeout(confirmationTimer);
+      };
+      const onTerminated = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         resolve();
       };
-
-      if (child.exitCode !== null || child.signalCode !== null) {
-        onExit();
-        return;
-      }
-
-      child.once('exit', onExit);
-      child.kill('SIGTERM');
-
-      setTimeout(() => {
+      const rejectUnconfirmed = (): void => {
+        if (settled) return;
+        settled = true;
         if (this.child === child) {
-          child.kill('SIGKILL');
+          this.status = 'crashed';
         }
-      }, 5000);
+        cleanup();
+        reject(new Error(
+          `Child process ${child.pid ?? 'unknown'} did not confirm exit after SIGKILL`
+        ));
+      };
+      const forceKill = (): void => {
+        if (settled) return;
+        if (child.exitCode !== null || child.signalCode !== null) {
+          onTerminated();
+          return;
+        }
+        log.warn({ pid: child.pid }, 'Child did not exit, sending SIGKILL');
+        try {
+          child.kill('SIGKILL');
+        } catch (err) {
+          log.error({ err, pid: child.pid }, 'Failed to send SIGKILL to child');
+        }
+        confirmationTimer = setTimeout(
+          rejectUnconfirmed,
+          FORCE_KILL_CONFIRMATION_TIMEOUT_MS
+        );
+      };
+
+      child.once('exit', onTerminated);
+      child.once('close', onTerminated);
+      try {
+        child.kill('SIGTERM');
+        forceKillTimer = setTimeout(forceKill, gracefulTimeoutMs);
+      } catch (err) {
+        log.error({ err, pid: child.pid }, 'Failed to send SIGTERM to child');
+        forceKill();
+      }
     });
   }
 
@@ -468,7 +1241,9 @@ export class ChildProcessManager extends EventEmitter {
    * Set up signal forwarding from parent to child
    */
   private setupSignalForwarding(): void {
-    const signals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+    const signals: NodeJS.Signals[] = this.forwardTerminationSignals
+      ? ['SIGINT', 'SIGTERM', 'SIGHUP']
+      : ['SIGHUP'];
 
     for (const signal of signals) {
       const handler = (): void => {
@@ -496,31 +1271,77 @@ export class ChildProcessManager extends EventEmitter {
    * Set up event handlers for child process
    */
   private setupChildEventHandlers(): void {
-    if (!this.child) return;
+    const child = this.child;
+    if (!child) return;
 
-    this.child.on('exit', (code, signal) => {
-      this.lastExitCode = code;
-      this.lastExitSignal = signal?.toString() ?? null;
-      this.lastExitTime = new Date().toISOString();
-
-      log.info({ code, signal, pid: this.child?.pid }, 'Child process exited');
-      this.emit('stopped', code, signal?.toString() ?? null);
-
-      this.child = null;
-      this.cleanupSignalHandlers();
-
-      // Handle crash recovery if not shutting down
-      if (!this.isShuttingDown) {
-        this.handleCrash(code, signal?.toString() ?? null);
-      } else {
-        this.status = 'stopped';
-      }
+    child.on('exit', (code, signal) => {
+      this.handleChildTermination(child, code, signal?.toString() ?? null);
     });
 
-    this.child.on('error', (err) => {
+    // `close` is also terminal and may be the only terminal event after some
+    // spawn failures. The termination guard prevents double handling after
+    // the usual exit -> close sequence.
+    child.on('close', (code, signal) => {
+      this.handleChildTermination(child, code, signal?.toString() ?? null);
+    });
+
+    child.on('error', (err) => {
+      if (this.child === child) {
+        this.status = 'crashed';
+        if (!this.spawnedChildren.has(child)) {
+          // An error before `spawn` proves that no process was created. Errors
+          // after `spawn` can also mean failed kill/send and are not proof of
+          // death, so retain the child and wait for exit/close in that case.
+          this.child = null;
+          this.cleanupSignalHandlers();
+          if (!this.isShuttingDown && this.intentionalRestartChild !== child) {
+            this.handleCrash(null, null);
+          } else if (this.intentionalRestartChild !== child) {
+            this.status = 'stopped';
+          }
+        }
+      }
       log.error({ err }, 'Child process error');
       this.emit('error', err);
     });
+  }
+
+  private handleChildTermination(
+    child: ChildProcess,
+    code: number | null,
+    signal: string | null
+  ): void {
+    if (this.terminatedChildren.has(child)) return;
+    this.terminatedChildren.add(child);
+
+    const isCurrentChild = this.child === child;
+    const isIntentionalRestart = this.intentionalRestartChild === child;
+    if (!isCurrentChild && !isIntentionalRestart) {
+      log.debug({ pid: child.pid }, 'Ignoring stale termination from a replaced child process');
+      return;
+    }
+
+    this.lastExitCode = code;
+    this.lastExitSignal = signal;
+    this.lastExitTime = new Date().toISOString();
+
+    log.info({ code, signal, pid: child.pid }, 'Child process exited');
+    this.emit('stopped', code, signal);
+
+    if (this.child === child) {
+      this.child = null;
+    }
+    this.cleanupSignalHandlers();
+
+    if (isIntentionalRestart) {
+      // performRestart() owns the following start. Scheduling crash recovery
+      // here would create a second child after the intentional SIGTERM.
+      this.status = 'restarting';
+    } else if (!this.isShuttingDown) {
+      this.handleCrash(code, signal);
+    } else {
+      this.status = 'stopped';
+    }
   }
 
   /**

@@ -150,6 +150,6 @@ export function parseConnectionString(connectionString: string): {
       params: Object.keys(params).length > 0 ? params : undefined,
     };
   } catch {
-    throw new Error(`Invalid connection string: ${connectionString.substring(0, 20)}...`);
+    throw new Error('Invalid database connection string');
   }
 }

@@ -178,7 +178,7 @@ znvault host token haproxy-prod
 #
 # Install command:
 # curl -fsSL https://vault.example.com/v1/hosts/bootstrap.sh | \
-#   BOOTSTRAP_TOKEN=zrt_a1b2c3d4... bash
+#   BOOTSTRAP_TOKEN='<token>' bash
 ```
 
 ### Step 4: Bootstrap Agent (On target server)
@@ -186,22 +186,34 @@ znvault host token haproxy-prod
 **Option A: One-command bootstrap**
 ```bash
 curl -fsSL https://vault.example.com/v1/hosts/bootstrap.sh | \
-  BOOTSTRAP_TOKEN=zrt_a1b2c3d4... bash
+  BOOTSTRAP_TOKEN='<token>' bash
 ```
 
 **Option B: Manual setup**
+
+All persistent commands in systemd recipes must run as the service identity
+against the system config directory; abbreviated examples later in this guide
+assume the same prefix:
+
+```bash
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent <command>
+```
+
 ```bash
 # Install agent
 npm install -g @zincapp/zn-vault-agent
-sudo zn-vault-agent setup
+sudo zn-vault-agent setup --yes
 
 # Bootstrap with token (hostname auto-detected from machine)
-zn-vault-agent login \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login \
   --url https://vault.example.com \
   --bootstrap-token zrt_a1b2c3d4...
 
 # Or with explicit hostname
-zn-vault-agent login \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login \
   --url https://vault.example.com \
   --bootstrap-token zrt_a1b2c3d4... \
   --host-name haproxy-prod-01
@@ -299,10 +311,11 @@ znvault agent token create --managed-key server1-key
 ```bash
 # Install
 npm install -g @zincapp/zn-vault-agent
-sudo zn-vault-agent setup
+sudo zn-vault-agent setup --yes
 
 # Bootstrap
-zn-vault-agent login \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login \
   --url https://vault.example.com \
   --bootstrap-token zrt_a1b2c3d4...
 ```
@@ -311,18 +324,25 @@ zn-vault-agent login \
 
 ```bash
 # Add certificates to sync
-zn-vault-agent certs add <cert-id> \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent certs add <cert-id> \
   --name nginx-ssl \
-  --fullchain /etc/nginx/ssl/cert.pem \
-  --key /etc/nginx/ssl/key.pem \
-  --reload "systemctl reload nginx"
+  --fullchain /etc/ssl/znvault/nginx-cert.pem \
+  --key /etc/ssl/znvault/nginx-key.pem \
+  --reload "sudo /usr/bin/systemctl reload nginx"
 
 # Add secrets to sync (optional)
-zn-vault-agent secret add alias:app/config \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent secret add alias:example/app-config \
   --format json \
-  --output /etc/myapp/config.json \
-  --reload "systemctl restart myapp"
+  --output /var/lib/zn-vault-agent/myapp-config.json \
+  --reload "sudo /usr/bin/systemctl restart myapp"
 ```
+
+Provision each exact reload/restart command as its own least-privilege sudoers
+fragment, validate it with `visudo -cf`, and never overwrite the
+setup-managed `/etc/sudoers.d/zn-vault-agent` file. The example output paths
+remain inside the base unit's allowed write paths.
 
 ### Step 5: Start Daemon
 
@@ -437,13 +457,13 @@ Run daemon AND child process in a single instance:
 zn-vault-agent start \
   --exec "python server.py" \
   -s DB_PASSWORD=alias:db.password \
-  -sf API_KEY=api-key:my-key \
+  -F API_KEY=api-key:my-key \
   --restart-on-change \
   --health-port 9100
 ```
 
 - `-s`: Secret as environment variable (visible in logs)
-- `-sf`: Secret as FILE (prevents log exposure, recommended for sensitive values)
+- `-F`, `--secret-file`: Secret as FILE (prevents log exposure, recommended for sensitive values)
 
 ---
 
@@ -597,11 +617,19 @@ Environment variables override config file values:
 | `ZNVAULT_API_KEY` | API key |
 | `ZNVAULT_INSECURE` | Skip TLS verification (`true`/`false`) |
 | `ZNVAULT_AGENT_CONFIG_DIR` | Custom config directory |
+| `ZNVAULT_CONTROL_TOKEN_FILE` | Token-file path override for isolated tests/install roots; never the token value |
 | `LOG_LEVEL` | `trace`, `debug`, `info`, `warn`, `error` |
-| `LOG_FILE` | Log file path |
+| `LOG_FILE` | Optional file mirror; journald logging remains enabled |
 | `AUTO_UPDATE` | Enable auto-updates (`true`/`false`) |
 | `AUTO_UPDATE_INTERVAL` | Check interval in seconds |
-| `AUTO_UPDATE_CHANNEL` | `latest`, `beta`, `next` |
+| `AUTO_UPDATE_CHANNEL` | `latest`, `beta`, `next`, `dr-m4` (Agent 2 default: `dr-m4`) |
+
+Production setup creates `/etc/zn-vault-agent/payara-mutation-token` as the
+service user with mode `0600`. The daemon fails closed if it cannot safely load
+that file. Only `/health`, `/ready`, `/live`, and `/metrics` are public; every
+other HTTP/HTTPS route requires its Bearer value, and Payara plugin routes check
+the same value again. Do not copy the credential into argv, environment values,
+logs, shell history, or temporary files.
 
 ---
 
@@ -636,7 +664,8 @@ cat /etc/zn-vault-agent/config.json | jq '{hostConfigId, agentId, managedKey}'
 2. Import current config: `znvault host config <name> --import /etc/zn-vault-agent/config.json`
 3. Update agent config:
    ```bash
-   zn-vault-agent login --bootstrap-token <new-token>
+   sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+     zn-vault-agent login --url https://vault.example.com --bootstrap-token <new-token>
    # Or manually set configFromVault: true
    ```
 
@@ -690,7 +719,7 @@ services:
       - secrets:/secrets:ro
 
   vault-agent:
-    image: node:20-alpine
+    image: node:22.13-alpine
     command: npx @zincapp/zn-vault-agent start --health-port 9100
     environment:
       - ZNVAULT_URL=https://vault.example.com

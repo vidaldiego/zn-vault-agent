@@ -4,9 +4,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execSync } from 'node:child_process';
 import os from 'node:os';
-import { chownSafe } from '../utils/shell.js';
+import { chownSafeAsync } from '../utils/shell.js';
+import { runReloadCommand } from '../utils/reload-command.js';
 import { validateOutputPath } from '../utils/path.js';
 import type { CertTarget } from './config.js';
 import { decryptCertificate, getCertificate, ackDelivery } from './api.js';
@@ -14,6 +14,12 @@ import { updateTargetFingerprint, loadConfig } from './config.js';
 import { deployLogger as log } from './logger.js';
 import { metrics } from './metrics.js';
 import { updateCertStatus } from './health.js';
+import {
+  SHARED_MUTATION_LOCK_PATH,
+  SharedMutationLockError,
+  type SharedMutationLockErrorCode,
+  withSharedMutationLock,
+} from './shared-mutation-lock.js';
 
 export interface DeployResult {
   success: boolean;
@@ -21,11 +27,13 @@ export interface DeployResult {
   name: string;
   message: string;
   fingerprint?: string;
+  version?: number;
   filesWritten?: string[];
   reloadOutput?: string;
   healthCheckPassed?: boolean;
   rolledBack?: boolean;
   durationMs?: number;
+  errorCode?: SharedMutationLockErrorCode;
 }
 
 /**
@@ -111,7 +119,7 @@ function verifyFile(filePath: string, expectedHash: string): boolean {
 /**
  * Write file with proper ownership and permissions, using atomic write
  */
-function writeSecureFile(filePath: string, content: string, owner?: string, mode?: string): { hash: string } {
+async function writeSecureFile(filePath: string, content: string, owner?: string, mode?: string): Promise<{ hash: string }> {
   // Validate path to prevent traversal attacks
   validateOutputPath(filePath);
 
@@ -125,7 +133,7 @@ function writeSecureFile(filePath: string, content: string, owner?: string, mode
     const [user, group] = owner.split(':');
     const ownerArg = group ? owner : user;
     try {
-      chownSafe(filePath, ownerArg);
+      await chownSafeAsync(filePath, ownerArg);
     } catch (err) {
       log.warn({ filePath, owner, err }, 'Failed to set file ownership');
     }
@@ -199,39 +207,48 @@ function cleanupBackups(backups: Map<string, string>): void {
 /**
  * Execute reload command
  */
-function executeReload(cmd: string): { success: boolean; output: string } {
+async function executeReload(cmd: string): Promise<{ success: boolean; output: string }> {
   log.debug({ cmd }, 'Executing reload command');
-  try {
-    const output = execSync(cmd, { encoding: 'utf-8', timeout: 30000 });
+  const result = await runReloadCommand(cmd);
+  const output = result.stdout || result.stderr || result.message;
+  if (result.success) {
     log.info({ cmd }, 'Reload command succeeded');
     return { success: true, output };
-  } catch (err) {
-    const error = err as { message?: string; stderr?: string };
-    const output = error.stderr ?? error.message ?? 'Unknown error';
-    log.error({ cmd, error: output }, 'Reload command failed');
-    return { success: false, output };
   }
+  log.error(
+    { cmd, error: result.message, timedOut: result.timedOut },
+    'Reload command failed'
+  );
+  return { success: false, output };
 }
 
 /**
  * Execute health check command
  */
-function executeHealthCheck(cmd: string): boolean {
+export async function executeHealthCheck(
+  cmd: string,
+  timeoutMs = 10_000
+): Promise<boolean> {
   log.debug({ cmd }, 'Executing health check');
-  try {
-    execSync(cmd, { encoding: 'utf-8', timeout: 10000, stdio: 'pipe' });
+  const result = await runReloadCommand(cmd, {
+    timeoutMs,
+    operationLabel: 'Health check command',
+  });
+  if (result.success) {
     log.debug({ cmd }, 'Health check passed');
     return true;
-  } catch (err) {
-    log.warn({ cmd, err }, 'Health check failed');
-    return false;
   }
+  log.warn(
+    { cmd, error: result.message, timedOut: result.timedOut },
+    'Health check failed'
+  );
+  return false;
 }
 
 /**
  * Deploy a certificate to its target locations
  */
-export async function deployCertificate(
+async function deployCertificateWithLockHeld(
   target: CertTarget,
   force: boolean = false
 ): Promise<DeployResult> {
@@ -258,6 +275,7 @@ export async function deployCertificate(
         name,
         message: 'Certificate unchanged',
         fingerprint: metadata.fingerprintSha256,
+        version: metadata.version,
         durationMs: duration,
       };
     }
@@ -302,20 +320,20 @@ export async function deployCertificate(
       // Write files based on output configuration
       if (outputs.combined) {
         const combined = [certificate, privateKey, ...chain].filter(Boolean).join('\n');
-        const { hash } = writeSecureFile(outputs.combined, combined, owner, mode);
+        const { hash } = await writeSecureFile(outputs.combined, combined, owner, mode);
         fileHashes.set(outputs.combined, hash);
         filesWritten.push(outputs.combined);
       }
 
       if (outputs.cert) {
-        const { hash } = writeSecureFile(outputs.cert, certificate, owner, mode);
+        const { hash } = await writeSecureFile(outputs.cert, certificate, owner, mode);
         fileHashes.set(outputs.cert, hash);
         filesWritten.push(outputs.cert);
       }
 
       if (outputs.key) {
         if (privateKey) {
-          const { hash } = writeSecureFile(outputs.key, privateKey, owner, mode ?? '0600');
+          const { hash } = await writeSecureFile(outputs.key, privateKey, owner, mode ?? '0600');
           fileHashes.set(outputs.key, hash);
           filesWritten.push(outputs.key);
         } else {
@@ -329,14 +347,14 @@ export async function deployCertificate(
 
       if (outputs.chain && chain.length > 0) {
         const chainContent = chain.join('\n');
-        const { hash } = writeSecureFile(outputs.chain, chainContent, owner, mode);
+        const { hash } = await writeSecureFile(outputs.chain, chainContent, owner, mode);
         fileHashes.set(outputs.chain, hash);
         filesWritten.push(outputs.chain);
       }
 
       if (outputs.fullchain) {
         const fullchain = [certificate, ...chain].filter(Boolean).join('\n');
-        const { hash } = writeSecureFile(outputs.fullchain, fullchain, owner, mode);
+        const { hash } = await writeSecureFile(outputs.fullchain, fullchain, owner, mode);
         fileHashes.set(outputs.fullchain, hash);
         filesWritten.push(outputs.fullchain);
       }
@@ -354,7 +372,7 @@ export async function deployCertificate(
       let reloadOutput: string | undefined;
 
       if (reloadCommand) {
-        const result = executeReload(reloadCommand);
+        const result = await executeReload(reloadCommand);
         reloadOutput = result.output;
 
         if (!result.success) {
@@ -362,7 +380,7 @@ export async function deployCertificate(
           log.warn({ certId, name }, 'Reload failed, rolling back');
           restoreBackups(backups);
           if (reloadCommand) {
-            executeReload(reloadCommand); // Try to reload with old certs
+            await executeReload(reloadCommand); // Try to reload with old certs
           }
           metrics.syncFailure(name, 'reload_failed');
           return {
@@ -379,14 +397,14 @@ export async function deployCertificate(
       // Execute health check
       let healthCheckPassed: boolean | undefined;
       if (healthCheckCmd) {
-        healthCheckPassed = executeHealthCheck(healthCheckCmd);
+        healthCheckPassed = await executeHealthCheck(healthCheckCmd);
 
         if (!healthCheckPassed) {
           // Health check failed, rollback
           log.warn({ certId, name }, 'Health check failed, rolling back');
           restoreBackups(backups);
           if (reloadCommand) {
-            executeReload(reloadCommand); // Reload with old certs
+            await executeReload(reloadCommand); // Reload with old certs
           }
           metrics.syncFailure(name, 'health_check_failed');
           return {
@@ -422,6 +440,7 @@ export async function deployCertificate(
         name,
         message,
         fingerprint: metadata.fingerprintSha256,
+        version: metadata.version,
         filesWritten,
         reloadOutput,
         healthCheckPassed,
@@ -449,9 +468,48 @@ export async function deployCertificate(
 }
 
 /**
+ * Deploy a certificate while excluding Payara lifecycle/deployment mutations
+ * performed by the plugin or another agent/CLI process.
+ */
+export async function deployCertificate(
+  target: CertTarget,
+  force: boolean = false,
+  mutationLockPath = SHARED_MUTATION_LOCK_PATH
+): Promise<DeployResult> {
+  const startTime = Date.now();
+  try {
+    return await withSharedMutationLock(
+      'certificate',
+      async () => deployCertificateWithLockHeld(target, force),
+      mutationLockPath
+    );
+  } catch (err) {
+    const durationMs = Date.now() - startTime;
+    const message = err instanceof Error ? err.message : String(err);
+    log.error(
+      { certId: target.certId, name: target.name, err, durationMs },
+      'Certificate deployment blocked by shared mutation fence'
+    );
+    metrics.syncFailure(target.name, 'mutation_lock');
+    return {
+      success: false,
+      certId: target.certId,
+      name: target.name,
+      message,
+      durationMs,
+      errorCode: err instanceof SharedMutationLockError ? err.code : undefined,
+    };
+  }
+}
+
+/**
  * Deploy all configured certificate targets
  */
-export async function deployAllCertificates(force: boolean = false): Promise<DeployResult[]> {
+export async function deployAllCertificates(
+  force: boolean = false,
+  shouldContinue: () => boolean = () => true,
+  mutationLockPath = SHARED_MUTATION_LOCK_PATH
+): Promise<DeployResult[]> {
   const config = loadConfig();
   const results: DeployResult[] = [];
   let successCount = 0;
@@ -460,7 +518,8 @@ export async function deployAllCertificates(force: boolean = false): Promise<Dep
   log.info({ count: config.targets.length, force }, 'Deploying all certificates');
 
   for (const target of config.targets) {
-    const result = await deployCertificate(target, force);
+    if (!shouldContinue()) break;
+    const result = await deployCertificate(target, force, mutationLockPath);
     results.push(result);
     if (result.success) {
       successCount++;

@@ -2,6 +2,7 @@
 // WebSocket message routing and event dispatch
 
 import type WebSocket from 'ws';
+import semver from 'semver';
 import {
   type CertificateEvent,
   type SecretEvent,
@@ -48,6 +49,33 @@ const DELIVERY_DEDUP_MAX_ENTRIES = 1000;
  */
 let suppressCacheRaw: string | undefined = '__uninitialized__';
 let suppressCacheSet: ReadonlySet<string> = new Set();
+
+function parseAgentUpdateEvent(value: unknown, allowMissingTimestamp: boolean): AgentUpdateEvent | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  const version = candidate.version;
+  const channel = candidate.channel;
+  const force = candidate.force;
+  const timestamp = candidate.timestamp;
+  if (typeof version !== 'string' || semver.valid(version) !== version) return null;
+  if (channel !== 'stable' && channel !== 'beta' && channel !== 'staging') return null;
+  if (force !== undefined && typeof force !== 'boolean') return null;
+  if (timestamp !== undefined && (
+    typeof timestamp !== 'string'
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(timestamp)
+    || Number.isNaN(Date.parse(timestamp))
+    || new Date(timestamp).toISOString() !== timestamp
+  )) return null;
+  if (!allowMissingTimestamp && timestamp === undefined) return null;
+  if (candidate.event !== undefined && candidate.event !== 'update.available') return null;
+  return {
+    event: 'update.available',
+    channel,
+    version,
+    force: force ?? false,
+    timestamp: typeof timestamp === 'string' ? timestamp : new Date().toISOString(),
+  };
+}
 
 function getTestSuppressedTopics(): ReadonlySet<string> {
   const raw = process.env.ZNVAULT_TEST_SUPPRESS_WS_TOPICS;
@@ -249,7 +277,11 @@ export class MessageDispatcher {
       setSecretWebSocketStatus(true, new Date());
       this.handlers.secret.forEach(h => { h(event); });
     } else if (message.topic === 'updates' && message.data) {
-      const event = message.data as AgentUpdateEvent;
+      const event = parseAgentUpdateEvent(message.data, false);
+      if (!event) {
+        log.warn('Ignoring malformed legacy Agent update event');
+        return;
+      }
       log.info({ version: event.version, channel: event.channel }, 'Received update event');
       this.handlers.update.forEach(h => { h(event); });
     } else if (message.topic === 'apikeys' && message.data) {
@@ -273,7 +305,6 @@ export class MessageDispatcher {
       log.info({
         event: event.event,
         keyName: event.apiKeyName,
-        newPrefix: event.newPrefix,
         graceExpiresAt: event.graceExpiresAt,
         deliveryId,
       }, 'Received API key rotation event');
@@ -362,18 +393,11 @@ export class MessageDispatcher {
    * path in handleEventMessage is kept for back-compat.
    */
   private handleUpdateAvailable(message: UnifiedAgentEvent): void {
-    const version = message.version;
-    if (!version) {
-      log.warn({ message }, 'Received update-available message without a version');
+    const event = parseAgentUpdateEvent(message, true);
+    if (!event) {
+      log.warn('Ignoring malformed top-level Agent update event');
       return;
     }
-    const event: AgentUpdateEvent = {
-      event: 'update.available',
-      channel: message.channel ?? 'stable',
-      version,
-      force: message.force ?? false,
-      timestamp: message.timestamp ?? new Date().toISOString(),
-    };
     log.info({ version: event.version, channel: event.channel, force: event.force }, 'Received update event');
     this.handlers.update.forEach(h => { h(event); });
   }

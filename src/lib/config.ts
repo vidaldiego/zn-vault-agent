@@ -17,6 +17,7 @@ export {
   DEFAULT_TLS_CONFIG,
   EMPTY_CONFIG,
   loadConfig,
+  loadPersistedConfig,
   getConfig,
   isConfigured,
   getConfigPath,

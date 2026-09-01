@@ -134,6 +134,20 @@ describe('parseSecretMapping', () => {
     it('should throw for empty secret id', () => {
       expect(() => parseSecretMapping('DB_HOST=')).toThrow('Invalid mapping format');
     });
+
+    it('does not echo a literal credential from an invalid mapping', () => {
+      const canary = 'literal-secret-canary-DO-NOT-PRINT';
+      let error: unknown;
+
+      try {
+        parseSecretMapping(`=literal:${canary}`);
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).not.toContain(canary);
+    });
   });
 
   describe('edge cases', () => {

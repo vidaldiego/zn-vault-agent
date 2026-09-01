@@ -140,10 +140,9 @@ async function refreshManagedKey(
 
     // Detect rotation
     if (oldKey && oldKey !== bindResponse.key) {
-      handleRotationDetected(oldKey, bindResponse, source);
+      handleRotationDetected(bindResponse, source);
     } else {
       log.debug({
-        prefix: bindResponse.key.substring(0, 8),
         nextRotationAt: bindResponse.nextRotationAt,
         source,
       }, 'Managed key refreshed (no change)');
@@ -156,7 +155,6 @@ async function refreshManagedKey(
 }
 
 function handleRotationDetected(
-  oldKey: string,
   bindResponse: ManagedApiKeyBindResponse,
   source: RefreshSource
 ): void {
@@ -164,8 +162,6 @@ function handleRotationDetected(
   const wasPollTriggered = source === 'grace_poll' || source === 'reconnect' || source === 'heartbeat';
 
   log.info({
-    oldPrefix: oldKey.substring(0, 8),
-    newPrefix: bindResponse.key.substring(0, 8),
     nextRotationAt: bindResponse.nextRotationAt,
     source,
     wasWsTriggered,
@@ -212,7 +208,6 @@ function handleRefreshError(err: unknown, source: RefreshSource): null {
   if (error.statusCode === 401 || error.message.includes('Unauthorized')) {
     log.error({
       name: config.managedKey?.name,
-      keyPrefix: config.auth.apiKey?.substring(0, 8),
       source,
     }, 'API key authentication failed - key may have expired while agent was offline');
 
@@ -330,7 +325,6 @@ export async function onWebSocketAuthFailure(): Promise<boolean> {
 
     if (response) {
       log.info({
-        newKeyPrefix: response.key.substring(0, 8),
         nextRotationAt: response.nextRotationAt,
       }, 'Managed key refreshed after auth failure - will reconnect with new key');
 
@@ -530,7 +524,6 @@ export function getManagedKeyStatus(): ManagedKeyStatus {
     staleKeyDetected,
     isManagedMode: isManagedKeyMode(),
     managedKeyName: config.managedKey?.name,
-    currentKeyPrefix: currentKey ? currentKey.substring(0, 8) + '...' : undefined,
     nextRotationAt: config.managedKey?.nextRotationAt,
     graceExpiresAt: config.managedKey?.graceExpiresAt,
     safetyRails: {

@@ -133,9 +133,7 @@ async function checkApiKeyStatus(): Promise<ApiKeyStatus | null> {
 
     // Check for authentication failures
     if (error.message.includes('401') || error.message.includes('Unauthorized')) {
-      log.error({
-        keyPrefix: config.auth.apiKey.substring(0, 8),
-      }, 'API key authentication failed - key may have expired or been revoked');
+      log.error('API key authentication failed - key may have expired or been revoked');
 
       log.error({}, 'RECOVERY REQUIRED: The stored API key is no longer valid.');
       log.error({}, 'To recover, create a new API key and update the agent config:');
@@ -163,7 +161,6 @@ async function rotateApiKey(): Promise<string | null> {
   try {
     const result = await makeRequest<ApiKeyRotateResponse>('POST', '/auth/api-keys/self/rotate', {});
     log.info({
-      newPrefix: result.apiKey.prefix,
       expiresAt: result.apiKey.expires_at,
     }, 'API key rotated successfully');
     return result.key;
@@ -194,7 +191,6 @@ export async function checkAndRenewApiKey(): Promise<boolean> {
   log.info({
     expiresInDays: status.expiresInDays,
     isExpiringSoon: status.isExpiringSoon,
-    prefix: status.prefix,
   }, 'API key status');
 
   // Check if renewal is needed

@@ -8,6 +8,11 @@
  */
 
 import https from 'https';
+import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 export interface VaultTestConfig {
   url: string;
@@ -286,7 +291,7 @@ export class VaultTestClient {
       permissions: opts.permissions || [
         'secret:read:metadata',
         'secret:read:value',
-        'apikey:read',
+        'api_key:read',
       ],
       managed: {
         rotationMode: opts.rotationMode || 'scheduled',
@@ -449,57 +454,33 @@ export function generateTestCertificate(): {
   certPem: string;
   keyPem: string;
 } {
-  // Pre-generated test certificate (valid for 10 years)
-  // Generated with: openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes -subj "/CN=test.cert"
-  return {
-    certPem: `-----BEGIN CERTIFICATE-----
-MIIDCTCCAfGgAwIBAgIUQcbxuAhcEyOYih63rK2QLRVtN6MwDQYJKoZIhvcNAQEL
-BQAwFDESMBAGA1UEAwwJdGVzdC5jZXJ0MB4XDTI2MDEwNTA1MzAwN1oXDTM2MDEw
-MzA1MzAwN1owFDESMBAGA1UEAwwJdGVzdC5jZXJ0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEAsT8wfBllDXhw6Kyd9ns8j/Sszp2uJ2CvEYnTrsJbYm7r
-Z+A0zNqjj3v8GvIbJmI/SamhnxavtybYxedLkPJROQvIK55euT3Vk+lfc62Ou1rZ
-tB49tBGixHLW1DTzYOrG9k5uBDI0Zwhx18+JnJmmh8/JHGdBjheK6QPy68KFCTBC
-FThwGyaNm4prwLbHJeMkp2bfkHbNdcG9kUp0iT1mAuLzaR/mGuj7gJhR92VY1k91
-CVnBakJULm8B7ShX6M01Oaj58gubie4bF0aci/Y8oGVKYkBlEDTZYfyoEmc/AAEx
-o6tQoDVNPs+NzL6wVx6cFpcGSu2J9dKSFuIGtbp4zwIDAQABo1MwUTAdBgNVHQ4E
-FgQU45Tf2xilWxoYjm9bKkGuN2bn/xowHwYDVR0jBBgwFoAU45Tf2xilWxoYjm9b
-KkGuN2bn/xowDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAjKI3
-P9NYX8tCeZKp5+m1vGFJNXnoG1JTcW3yb6v0NF2YBf+g5OQzdPKn/OO+EErGQjvs
-3RJhy0Pk+3Mbz1w82B+v6SkU8c4ad6FaI1vQPgUjJZU0TfGYDGF+JMM3CHI1JZAZ
-Hya7bXgzV0WrL90m/j9RY1GeIQxFiRsljZS8ERV3ZwYSCDYBpFzdZrJkuYHmpkUq
-Adqlsuzz/dBcSoSQX//MiOQe+mkfVbKM6IPfPM1AT8hwKLyA00INl6eQdj8xjDhd
-Y/GGSKqcDR2Inso1VvJtJuS+pKVnbSKlp89nZRRP404dyw4Kjk5duxcovKJISRE/
-hB6xuPt1nQIZu4r2MQ==
------END CERTIFICATE-----`,
-    keyPem: `-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCxPzB8GWUNeHDo
-rJ32ezyP9KzOna4nYK8RidOuwltibutn4DTM2qOPe/wa8hsmYj9JqaGfFq+3JtjF
-50uQ8lE5C8grnl65PdWT6V9zrY67Wtm0Hj20EaLEctbUNPNg6sb2Tm4EMjRnCHHX
-z4mcmaaHz8kcZ0GOF4rpA/LrwoUJMEIVOHAbJo2bimvAtscl4ySnZt+Qds11wb2R
-SnSJPWYC4vNpH+Ya6PuAmFH3ZVjWT3UJWcFqQlQubwHtKFfozTU5qPnyC5uJ7hsX
-RpyL9jygZUpiQGUQNNlh/KgSZz8AATGjq1CgNU0+z43MvrBXHpwWlwZK7Yn10pIW
-4ga1unjPAgMBAAECggEAFJf5a6nNrmt8fuQzdERsTHOKsnTqm6Olo52GbUsisASg
-MFECAX0zvMOUjpLrqaGHpejiIOhTYS3PyOqvQneNDVo7lynO6qnvC0D1uKyFJWqQ
-WdebprTX2whWwpAmaO/OTybcrHsi0IfQJll0LTBDA4uWW8j5emds2db+HftbVq5F
-niM078d6/zJsIN4vgHOfqpOM3GDdJae0Afx+drS/vQoGPxKQhT5exHISFsElE1Ao
-FQazlj5goYTQj1LJatbXTqMBXD1qPbamiDKPeaWTnaJA/LjawZalF8F0SZ1kaXuN
-U5PmAsIMpJGOfhlp0l9U1bGolmoLJ7E/0MiuavBFoQKBgQDi6E/L8MMu+lNeOBes
-Q8UFV0sqzd5cDFcJj+T/d9hUylm3T3/+TDgRzHIOYUtwbG3T+jJDbbttZWCYoDbe
-pZZiePdlBInH3Zlk6rSZPneb0GHiYgCFEoBqQZqy7BJz68JpaY2jCZLCXUnzskCW
-b53B2yvbpW6rtes14Wrh5Sg+4QKBgQDH+OM517PQLPFY96QnA/gG3UnVvmtGCpAV
-S6m5emITsvRn66wfjk/zx3Ps2jly/zbCOCCp2HzJPKCJzng/mZNOoGhssW+Fd/RZ
-JwlopLhcn71BAKQ2/CDExua4yFcctnrmt087KEIbTwyiiXEkr855Z8weDaVpRwjP
-2A1Z+xgdrwKBgDcHjEKzk0KTZyCUjfkzPlb7QrmQz/qW64zgHvNuB0MZCAUS/MGZ
-joeSg57FLdyID2K3bPU5aZkwWurpACWjFwOuvqD7JscYERmOalo38h4RvYt/pQyg
-3g/m9TOrWRZP+QhDlxwROEx2/3ZgppVVYHchRlOwnVR7fB3HG3rJbqdBAoGAOPMA
-gzCS3O5vrU6ZSSMwN4Q9ysl383J+phHuPAxGciW8xPuxASueSWa79PAQ/FcCWT1y
-z+v/XbAOaDCMvlAWS4YTNyExCWmoBNvBKjP+7SHw29o66g3Tpzad7nHfnSW6yonZ
-3pcQfIZ+qqtJtZD71EdjMgvg16KLN+Xnp4CC1bECgYAZ2teqi+cEe8Bi2osU+x1i
-V6vS0reayDgyuaZlCxG0C3VRQu8rthGj2wmgAIA3uuaWF58P/dqXi1aGN9emXTR7
-ODV8o2G0isWoZsdzN8Hq1STn4eEetc87WX+KPANM/QyR684q5WQk82zi9K+Zh0CY
-cOafk5Z5L5eY+Be5lbNfpA==
------END PRIVATE KEY-----`,
-  };
+  const workDir = mkdtempSync(join(tmpdir(), 'zn-vault-agent-cert-'));
+  const certPath = join(workDir, 'cert.pem');
+  const keyPath = join(workDir, 'key.pem');
+
+  try {
+    execFileSync('openssl', [
+      'req',
+      '-x509',
+      '-newkey', 'rsa:2048',
+      '-keyout', keyPath,
+      '-out', certPath,
+      '-days', '2',
+      '-nodes',
+      '-sha256',
+      '-subj', `/CN=znvault-agent-test-${randomUUID()}`,
+    ], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: 30_000,
+    });
+
+    return {
+      certPem: readFileSync(certPath, 'utf-8'),
+      keyPem: readFileSync(keyPath, 'utf-8'),
+    };
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
 }
 
 /**

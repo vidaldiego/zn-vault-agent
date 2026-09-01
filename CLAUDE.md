@@ -34,7 +34,20 @@ The agent communicates with the vault server via:
 - Managed API keys with automatic rotation
 - Plugin system for extensibility
 - Prometheus metrics and health endpoints
-- Scheduler passthrough: `/scheduler/{quiesce,resume,status}` routes forward to znapi's `/internal/scheduler/*` (used by `znvault-plugin-payara` for scheduler-aware deploys). **No deploy secret** — znapi's `/internal/scheduler/*` filter authorizes on loopback (the agent posts to `127.0.0.1`), so the agent sends no `X-Internal-Secret` and requires no provisioned secret file (changed 2026-06-23; previously read `/etc/zincapi/scheduler-deploy-secret` and 500'd when absent). Configured via the single `znapiBaseUrl` field (default `http://127.0.0.1:8080`) — a top-level `AgentConfig` field in `src/lib/config/types.ts`. Implemented in `src/lib/scheduler-routes.ts`, registered from `src/lib/health.ts`.
+- Local HTTP/HTTPS control plane: only `/health`, `/ready`, `/live`, and
+  `/metrics` are public. Every other core or plugin route requires the Bearer
+  credential from `/etc/zn-vault-agent/payara-mutation-token`; Payara checks the
+  same credential again in its inherited route scope. Missing/unsafe token state
+  aborts startup. The token value never belongs in argv or env; the optional
+  `ZNVAULT_CONTROL_TOKEN_FILE` test/install override carries only its path.
+- Scheduler passthrough: authenticated `/scheduler/{quiesce,resume,status}`
+  routes forward to znapi's `/internal/scheduler/*` (used by
+  `znvault-plugin-payara` for scheduler-aware deploys). **No downstream deploy
+  secret** — znapi authorizes the Agent's outbound request on loopback, so the
+  Agent sends no `X-Internal-Secret` (changed 2026-06-23; previously read
+  `/etc/zincapi/scheduler-deploy-secret`). Configured via `znapiBaseUrl`
+  (default `http://127.0.0.1:8080`) in `src/lib/config/types.ts`; implemented in
+  `src/lib/scheduler-routes.ts` and registered from `src/lib/health.ts`.
 
 ## Development Commands
 
@@ -167,7 +180,7 @@ The `secret-env.ts` module (modularized in `secret-env/`) parses several mapping
 - `api-key:name` - Bind to managed API key
 - `literal:value` - Pass-through value (no fetch)
 
-**Env file mappings (`-e/--env-file`):**
+**Env file mappings (`-e/--env-secret`):**
 - `alias:path/to/secret` - Inject all key-value pairs as env vars
 - `alias:path/to/secret:PREFIX_` - Inject with prefix applied to all keys
 - `uuid` or `uuid:PREFIX_` - Same as above using UUID
@@ -238,13 +251,15 @@ curl -fsSL https://vault.example.com/v1/hosts/bootstrap.sh | \
 
 # Option B: Manual (hostname auto-detected)
 npm install -g @zincapp/zn-vault-agent
-sudo zn-vault-agent setup
-zn-vault-agent login --url https://vault.example.com \
+sudo zn-vault-agent setup --yes
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --bootstrap-token zrt_abc123...
 sudo systemctl enable --now zn-vault-agent
 
 # Option C: With explicit hostname
-zn-vault-agent login --url https://vault.example.com \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --bootstrap-token zrt_abc123... \
   --host-name haproxy-prod-01
 ```
@@ -258,29 +273,34 @@ zn-vault-agent login --url https://vault.example.com \
 ```bash
 # 1. Install
 npm install -g @zincapp/zn-vault-agent
-sudo zn-vault-agent setup
+sudo zn-vault-agent setup --yes
 
 # 2. Bootstrap (admin provides token, hostname auto-detected)
-zn-vault-agent login --url https://vault.example.com \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --bootstrap-token zrt_abc123...
 
 # Or with explicit hostname:
-zn-vault-agent login --url https://vault.example.com \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --bootstrap-token zrt_abc123... \
   --host-name my-unique-server
 
 # 3. Configure locally
-zn-vault-agent certs add <cert-id> \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent certs add <cert-id> \
   --name nginx-ssl \
   --fullchain /etc/nginx/ssl/cert.pem \
   --key /etc/nginx/ssl/key.pem \
-  --reload "systemctl reload nginx"
+  --reload "sudo /usr/bin/systemctl reload nginx"
 
 # 4. Start
 sudo systemctl enable --now zn-vault-agent
 ```
 
 **Result:** Agent has local config with targets defined in `/etc/zn-vault-agent/config.json`.
+Provision the exact nginx reload command as a separate least-privilege sudoers
+rule; never overwrite the setup-managed agent sudoers file.
 
 ### Path C: Exec Mode (One-Shot)
 
@@ -402,55 +422,144 @@ From `vitest.integration.config.ts`:
 
 ## Release Process
 
-**Publishing is handled automatically by GitHub Actions CI/CD.**
+**The tag workflow publishes npm only.** `.github/workflows/ci.yml` owns
+push/PR validation. `.github/workflows/publish.yml` owns tag validation and npm
+OIDC publication; it does not create a GitHub Release.
 
 ### Steps to Release
 
-1. Update version in `package.json`:
+1. Record the current npm `latest` fence (it must remain the same Agent 1.x
+   version), set the exact release version without creating a commit or tag,
+   and keep all three version files aligned:
    ```bash
-   npm version patch  # or minor/major
+   export AGENT_LATEST_BEFORE="$(npm view @zincapp/zn-vault-agent dist-tags.latest)"
+   case "$AGENT_LATEST_BEFORE" in 1.*) ;; *) exit 1 ;; esac
+   npm version 2.0.0 --no-git-tag-version
+   printf '%s\n' 2.0.0 > VERSION
    ```
 
-2. Commit the version bump:
+2. Before any tag, build and pack the final Agent 2.0.0 and Payara Plugin 3.0.0
+   snapshots in their respective repositories. Run the exact paired tarballs
+   through the Node.js 22.13/24 smoke:
    ```bash
-   git add package.json package-lock.json
-   git commit -m "chore(release): vX.Y.Z"
+   # Agent repository
+   mkdir -p /tmp/znvault-release
+   npm ci && npm run lint && npm run typecheck && npm run test:unit && npm run build
+   npm pack --pack-destination /tmp/znvault-release
+
+   # Payara plugin repository
+   cd /path/to/znvault-plugin-payara
+   npm ci && npm run lint && npm run typecheck && npm run test:unit && npm run build
+   npm pack --pack-destination /tmp/znvault-release
+
+   # Back in the Agent repository
+   cd /path/to/zn-vault-agent
+   ./test/release/tarball-smoke.sh \
+     /tmp/znvault-release/zincapp-zn-vault-agent-2.0.0.tgz \
+     /tmp/znvault-release/zincapp-znvault-plugin-payara-3.0.0.tgz
    ```
 
-3. Create and push tag:
+   Before commissioning Agent 2 on an existing Agent 1 host, the legacy
+   updater must be inactive and its old two-field trigger must be absent. Both
+   are hard NO-GO gates; setup preserves and rejects legacy evidence:
    ```bash
-   git tag vX.Y.Z
-   git push origin main
-   git push origin vX.Y.Z
+   ! sudo systemctl is-active --quiet zn-vault-agent-updater.service
+   sudo test ! -e /var/lib/zn-vault-agent/.update-trigger
    ```
 
-4. GitHub Actions automatically:
-   - Runs tests
-   - Builds the package
-   - Publishes to npm using OIDC authentication
+   On a `configFromVault: true` host, an exact globally installed Payara 2.x
+   manifest is only a fallback candidate. A reachable Vault remains
+   authoritative (`200` replaces the cache and `304` validates it); only an
+   authentication, bootstrap, or config-fetch failure selects authenticated
+   `UPDATE_REQUIRED` recovery. That process exposes only monitoring and the
+   exact Payara updater, clears cached mutation surfaces, and revalidates the
+   same installed version before listening. After an exact root-attested 2 -> 3
+   install, the next boot requires a full remote `200`, never `304`. If Vault is
+   still down, only the matching active + successful root receipt + restart
+   marker + installed 3.x target enters `STARTUP_CONFIRMATION_PENDING`; it keeps
+   GET at `202`, reloads persisted bootstrap/auth on each 30-second authority
+   probe, and requests one graceful restart only after the full config returns.
+   Normal remote config must then start Payara 3 before the operation becomes
+   terminal. Arbitrary missing, corrupt, 3.x, and future undeclared manifests
+   cannot authorize fallback; invalid evidence fails closed only when remote
+   authority is unavailable. Release publication is not fleet commissioning.
+
+3. Review and stage the complete already-smoked release snapshot (source,
+   tests, workflows, documentation, and version metadata), then commit and
+   push exactly that tree. The release may span many previously uncommitted
+   files, so staging only the version files is unsafe:
+   ```bash
+   git status --short
+   git diff --check
+   git add -A
+   git diff --cached --check
+   git commit -m "chore(release): v2.0.0"
+   git push origin HEAD:main
+   ```
+
+4. Wait for `ci.yml` on that exact commit. Only after it is green, create and push one
+   annotated tag:
+   ```bash
+   git tag -a v2.0.0 -m "v2.0.0"
+   git push origin v2.0.0
+   ```
+
+   Never use `git push --tags`; unrelated local tags may exist.
+
+5. `publish.yml` automatically:
+   - Runs full tests in a job that has no OIDC permission
+   - Uses a dependent minimal OIDC job with `npm ci --ignore-scripts`
+   - Builds and packs once in that job, tests both privileged wrappers from the
+     exact tarball, and records its SHA-256
+   - Rechecks the hash and publishes that same `.tgz` to npm; it never publishes
+     the checkout directory
+
+6. After npm publication succeeds, create the GitHub Release explicitly and
+   keep it out of the latest pointer:
+   ```bash
+   AGENT_GH_LATEST_BEFORE=$(gh api repos/vidaldiego/zn-vault-agent/releases/latest --jq .tag_name)
+   gh release create v2.0.0 --verify-tag --generate-notes --latest=false
+   ```
+
+7. Verify the npm version, integrity/provenance, unchanged npm 1.x `latest`, and
+   unchanged GitHub latest-release pointer.
 
 ### npm Package
 
 - **Package:** `@zincapp/zn-vault-agent`
 - **Registry:** https://www.npmjs.com/package/@zincapp/zn-vault-agent
-- **Channels:** `latest` (stable), `beta` (pre-release), `next` (dev builds)
+- **Channels:** `latest` (stable), `beta` (pre-release), `next` (dev builds),
+  `dr-m4` (fenced Agent 2 migration; Agent 2 updater default)
+- **Agent 2.x migration fence:** stable 2.x artifacts publish under `dr-m4`.
+  Agent 2 accepts and defaults to that channel while periodic update stays
+  disabled by default. `latest` remains on Agent 1.x until a separate
+  fleet-migration decision with registry and node receipts.
 
 ### Verification
 
 ```bash
 # Check published version
-npm view @zincapp/zn-vault-agent version
+npm view @zincapp/zn-vault-agent@2.0.0 version dist.integrity
+npm view @zincapp/zn-vault-agent dist-tags --json
+test "$(npm view @zincapp/zn-vault-agent dist-tags.latest)" = "$AGENT_LATEST_BEFORE"
+test "$(gh api repos/vidaldiego/zn-vault-agent/releases/latest --jq .tag_name)" = "$AGENT_GH_LATEST_BEFORE"
+test "$AGENT_GH_LATEST_BEFORE" != "v2.0.0"
+gh release view v2.0.0 --json tagName,isDraft,isPrerelease \
+  --jq 'select(.tagName == "v2.0.0" and .isDraft == false and .isPrerelease == false)'
 
-# Install latest
-npm install -g @zincapp/zn-vault-agent
+# Install the fenced release by exact version (does not consume latest)
+npm install -g @zincapp/zn-vault-agent@2.0.0
 ```
 
 ### CI/CD Configuration
 
-The GitHub Actions workflow (`.github/workflows/publish.yml`) handles:
-- Running tests on PRs
-- Publishing to npm on version tags (`v*`)
-- OIDC-based npm authentication (provenance enabled)
+- `.github/workflows/ci.yml`: lint, typecheck, build, and unit tests for pushes
+  and pull requests on Node.js 22.13 and 24.
+- `.github/workflows/publish.yml`: unprivileged tag/release gates, followed by a
+  minimal OIDC job that installs without lifecycle scripts, builds one immutable
+  tarball, tests its wrappers, and publishes the same SHA-256-checked artifact.
+- Neither workflow creates a GitHub Release; use the explicit `gh release
+  create ... --latest=false` step above.
 
 ## Known Issues & Important Fixes
 
@@ -474,11 +583,11 @@ The GitHub Actions workflow (`.github/workflows/publish.yml`) handles:
 **Verification:**
 ```bash
 # Check logs for proper tracking (v1.20.12+)
-grep "Managed API keys tracked" /var/log/zn-vault-agent/agent.log
+sudo journalctl -u zn-vault-agent -o cat --no-pager | grep "Managed API keys tracked"
 # Should show: {"totalManagedKeys":N,...}
 
 # Check WebSocket subscription
-grep "Subscriptions updated" /var/log/zn-vault-agent/agent.log | tail -1
+sudo journalctl -u zn-vault-agent -o cat --no-pager | grep "Subscriptions updated" | tail -1
 # Should show: "managedKeys":["your-key-name"]
 ```
 
@@ -488,13 +597,15 @@ grep "Subscriptions updated" /var/log/zn-vault-agent/agent.log | tail -1
 
 The strict agent systemd profile (empty CapabilityBoundingSet + PrivateDevices)
 blocks `sudo`, breaking the old `sudo systemctl start updater` path. Self-update
-now uses a file trigger: the agent atomically creates
-`/var/lib/zn-vault-agent/.update-trigger` ("<version> <channel>"); a root-owned
+now uses a file trigger: the agent publishes an immutable mode-0600 v1 record
+under `/var/lib/zn-vault-agent/.update-trigger`; a root-owned
 `zn-vault-agent-updater.path` (PathExists) activates the updater oneshot, whose
-ExecStart is `/usr/local/lib/zn-vault-agent/zn-vault-agent-update.sh` (reads +
-DELETES the trigger, validates, `npm install -g @pkg@<target>`); ExecStartPost
-`try-restart`s the agent on success only. The sudo path remains as a fallback
-for un-migrated hosts. Channels: `latest | beta | next`. Design:
+ExecStart is `/usr/local/lib/zn-vault-agent/zn-vault-agent-update.sh`. The
+wrapper validates exact current/target/channel, retains the trigger through
+npm, publishes root-owned terminal evidence, and owns restart/reconciliation;
+there is no ExecStartPost. Unprivileged updates fail closed when the `.path`
+rail is not active; there is no direct sudo/npm fallback. Agent 2 defaults to
+the fenced `dr-m4` channel and also recognizes `latest | beta | next`. Design:
 `docs/superpowers/specs/2026-06-22-sudo-free-agent-self-update-design.md`.
 
 ### Plugin Config Race Condition (Fixed in v1.20.14)
@@ -521,16 +632,15 @@ updateManagedKey(newKey, {...});
 ```
 
 **Symptoms (if running < v1.20.14):**
-- API key file has old key prefix after rotation
+- API key file has the old key after rotation
 - Logs show "API key written and verified" but file has wrong value
-- Config FILE has correct (new) prefix, but key file has old prefix
+- Config file has the correct new value, but the key file has the old value
 - Multiple rotation events logged (duplicate handling)
 
 **Verification:**
 ```bash
-# Compare key file prefix with config prefix - they should match
-echo "File:   $(head -c 16 /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY)..."
-echo "Config: $(cat /etc/zn-vault-agent/config.json | jq -r '.auth.apiKey[:16]')..."
+# Compare exact values without printing either credential or a fragment
+sudo sh -c '[ "$(cat /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY)" = "$(jq -r .auth.apiKey /etc/zn-vault-agent/config.json)" ]'
 ```
 
 **Workaround (if upgrade not possible):** Restart the agent - it auto-fixes stale API key files on startup via `syncManagedKeyFile()`.
@@ -568,7 +678,7 @@ renewal service's `onKeyChanged` callback now carries rotation metadata
 on a per-key schedule and feeds the propagator.
 
 **Symptoms (if running < v1.23.0):**
-- Key file prefix ≠ `znvault apikey managed show <name>` prefix after a
+- Key file value differs from the agent's current managed-key value after a
   rotation, while agent logs show hourly sync success
 - Journal shows `Managed key rotated` (source: scheduled/grace_poll/
   heartbeat/reconnect) with NO subsequent plugin `keyRotated` log
@@ -577,10 +687,9 @@ on a per-key schedule and feeds the propagator.
 **Verification (v1.23.0+):**
 ```bash
 # Force a rotation, then watch for the propagation log WITHOUT restarting:
-grep "Managed key rotation propagated to consumers" /var/log/zn-vault-agent/agent.log
-# Compare file prefix with the vault's current prefix - must match within ~60s:
-sudo head -c 8 /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY
-znvault apikey managed show <name>
+sudo journalctl -u zn-vault-agent -o cat --no-pager | grep "Managed key rotation propagated to consumers"
+# Confirm the protected key file changed without printing any credential bytes:
+sudo stat -c '%y %n' /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY
 ```
 
 **Workaround (if upgrade not possible):** Restart the agent after rotations,

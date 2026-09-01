@@ -45,7 +45,7 @@ export type ExtendedSecretMapping = SecretMapping & {
 };
 
 /**
- * Env file mapping from CLI -e/--env-file option
+ * Env file mapping from CLI -e/--env-secret option
  * References an entire secret whose key-value pairs are injected as env vars
  */
 export interface EnvFileMapping {

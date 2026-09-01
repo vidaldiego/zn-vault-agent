@@ -197,7 +197,6 @@ export async function claimReprovisionToken(token: string): Promise<boolean> {
     if (response.success && response.apiKey) {
       log.info({
         keyId: response.keyId,
-        keyPrefix: response.apiKey.substring(0, 8),
       }, 'Reprovision successful, received new credentials');
 
       // Update credentials in config
@@ -211,7 +210,10 @@ export async function claimReprovisionToken(token: string): Promise<boolean> {
 
       return true;
     } else {
-      log.error({ response }, 'Reprovision claim failed');
+      log.error({
+        success: response.success,
+        keyId: response.keyId,
+      }, 'Reprovision claim failed');
       return false;
     }
   } catch (err) {
@@ -278,7 +280,7 @@ function updateCredentials(newKey: string): void {
     // Update API key in config file and environment
     updateApiKey(newKey);
 
-    log.info({ keyPrefix: newKey.substring(0, 8) }, 'Credentials updated successfully');
+    log.info('Credentials updated successfully');
   } catch (err) {
     log.error({ err }, 'Failed to update credentials');
     throw err;

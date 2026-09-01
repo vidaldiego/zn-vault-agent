@@ -572,7 +572,7 @@ export async function probeApiKey(key: string): Promise<ApiKeyProbeResult> {
       return 'valid';
     }
     if (result.statusCode === 401 || result.statusCode === 403) {
-      log.warn({ status: result.statusCode, keyPrefix: key.substring(0, 8) }, 'API key probe rejected by vault');
+      log.warn({ status: result.statusCode }, 'API key probe rejected by vault');
       return 'invalid';
     }
 
@@ -609,7 +609,7 @@ export interface BootstrapResponse {
  * @returns Same response as managed key /bind endpoint
  */
 export async function bootstrapWithToken(token: string): Promise<BootstrapResponse> {
-  log.info({ tokenPrefix: token.substring(0, 8) }, 'Bootstrapping agent with registration token');
+  log.info('Bootstrapping agent with registration token');
 
   return await request({
     method: 'POST',

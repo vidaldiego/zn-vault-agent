@@ -118,6 +118,19 @@ describe('Managed Key Rotation Propagation', () => {
     const daemon = await agent.startDaemon({ env: opts?.daemonEnv });
     await daemon.waitForReady();
 
+    // /health may be 200 before the unified WebSocket has received its server
+    // acknowledgement when no certificate/secret targets are configured.
+    // Wait for the real readiness contract so a rotation cannot race ahead of
+    // the managed-key subscription this test is meant to exercise.
+    await waitFor(async () => {
+      try {
+        const response = await fetch(`http://127.0.0.1:${daemon.healthPort}/ready`);
+        return response.ok;
+      } catch {
+        return false;
+      }
+    }, 30000, 250);
+
     // Plugin writes the file during onInit/onStart
     await waitFor(() => readKeyFile(keyFilePath) === initialKey, 15000, 500);
 
@@ -138,19 +151,18 @@ describe('Managed Key Rotation Propagation', () => {
   it('ROTATION-01: plugin key file is rewritten after rotation via the WebSocket event (no restart)', async () => {
     const env = await setupAgentWithKeyFilePlugin('ws');
     try {
-      const rotation = await vault.rotateManagedKey(env.managedKey.name, TEST_ENV.tenantId);
-      expect(rotation.newPrefix).toBeTruthy();
+      await vault.rotateManagedKey(env.managedKey.name, TEST_ENV.tenantId);
 
       // The live WebSocket apikey.rotated event should drive bind + plugin
       // keyRotated within seconds.
       await waitFor(() => {
         const content = readKeyFile(env.keyFilePath);
-        return content !== null && content !== env.initialKey && content.startsWith(rotation.newPrefix);
+        return content !== null && content !== env.initialKey && content.startsWith('znv_');
       }, 30000, 1000);
 
       const finalKey = readKeyFile(env.keyFilePath);
       expect(finalKey).not.toBe(env.initialKey);
-      expect(finalKey?.startsWith(rotation.newPrefix)).toBe(true);
+      expect(finalKey?.startsWith('znv_')).toBe(true);
     } catch (err) {
       console.error('ROTATION-01 daemon output:', env.daemon.getOutput());
       throw err;
@@ -167,8 +179,7 @@ describe('Managed Key Rotation Propagation', () => {
       daemonEnv: { ZNVAULT_TEST_SUPPRESS_WS_TOPICS: 'apikeys' },
     });
     try {
-      const rotation = await vault.rotateManagedKey(env.managedKey.name, TEST_ENV.tenantId);
-      expect(rotation.newPrefix).toBeTruthy();
+      await vault.rotateManagedKey(env.managedKey.name, TEST_ENV.tenantId);
 
       // File must still hold the OLD key briefly (event suppressed, rail not
       // yet fired) — this is what proved the bug pre-fix.
@@ -209,8 +220,6 @@ describe('Managed Key Rotation Propagation', () => {
       rotationInterval: '60s',
       gracePeriod: '10m',
     });
-    const otherInitialPrefix = otherKey.key.substring(0, 8);
-
     const env = await setupAgentWithKeyFilePlugin('other-key', {
       daemonEnv: { ZNVAULT_TEST_SUPPRESS_WS_TOPICS: 'apikeys' },
       pluginExtraConfig: {
@@ -224,22 +233,21 @@ describe('Managed Key Rotation Propagation', () => {
       // tracked key shortly after plugins start.
       await waitFor(() => {
         const log = readKeyFile(env.rotationLogPath);
-        return log !== null && log.includes(`${otherKey.name}:`);
+        return log !== null && log.split('\n').includes(otherKey.name);
       }, 30000, 1000);
 
-      const rotation = await vault.rotateManagedKey(otherKey.name, TEST_ENV.tenantId);
-      expect(rotation.newPrefix).toBeTruthy();
+      const dispatchCountBeforeRotation = (readKeyFile(env.rotationLogPath) ?? '')
+        .split('\n')
+        .filter((line) => line === otherKey.name).length;
+      await vault.rotateManagedKey(otherKey.name, TEST_ENV.tenantId);
 
       // WS events are suppressed; the poller's next bind (≤60s away) must
-      // detect the rotation and dispatch keyRotated with a fresh prefix.
-      // The 60s rotation interval means the server's scheduled job may
-      // rotate again mid-wait, so assert on "any prefix that is not the
-      // initial one" rather than the exact manual-rotation prefix.
+      // detect the rotation and dispatch keyRotated again. Count dispatches
+      // without persisting any credential-derived fragment in the fixture.
       await waitFor(() => {
         const log = readKeyFile(env.rotationLogPath) ?? '';
-        return log.split('\n').some((line) =>
-          line.startsWith(`${otherKey.name}:`) && !line.endsWith(`:${otherInitialPrefix}`)
-        );
+        return log.split('\n').filter((line) => line === otherKey.name).length
+          > dispatchCountBeforeRotation;
       }, 150000, 2000);
 
       // The agent's own key file must be untouched by the other key's

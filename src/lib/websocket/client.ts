@@ -102,9 +102,23 @@ export function createUnifiedWebSocketClient(
   // server acknowledges us (registered message). connection_established also
   // counts as an ack and is detected via dispatcher.getAgentId().
   dispatcher.onConnect(() => {
-    serverAckReceived = true;
-    maybeMarkConnectionHealthy();
+    markServerAcknowledged();
   });
+
+  /**
+   * Publish connectivity only after the vault acknowledges this socket. A
+   * transport-level `open` can still be rejected or never subscribed, so it
+   * must not make /health claim that push delivery is available.
+   */
+  function markServerAcknowledged(): void {
+    if (serverAckReceived) return;
+    serverAckReceived = true;
+    const acknowledgedAt = new Date();
+    setWebSocketStatus(true, acknowledgedAt);
+    setSecretWebSocketStatus(true, acknowledgedAt);
+    metrics.wsConnected();
+    maybeMarkConnectionHealthy();
+  }
 
   /**
    * Reset healthy-connection tracking (called on open/close/disconnect).
@@ -149,21 +163,48 @@ export function createUnifiedWebSocketClient(
   }
 
   /**
-   * Remove event listeners from WebSocket to prevent memory leaks.
+   * Retire a socket without leaving an unhandled error behind.
+   *
+   * `ws` emits an asynchronous error when close()/terminate() aborts a socket
+   * that is still CONNECTING. Removing its error listener first turns that
+   * expected lifecycle event into a process-level uncaught exception. Detach
+   * data/reconnect listeners now, but retain the existing error path until the
+   * socket emits close so real retirement errors remain logged and dispatched.
    */
-  function removeListeners(socket: WebSocket): void {
-    if (!wsListeners) return;
+  function retireSocket(socket: WebSocket, action: 'close' | 'terminate'): void {
+    const listeners = wsListeners;
+    const errorListener = listeners?.error ?? handleError;
+    let cleaned = false;
+
+    const cleanup = (): void => {
+      if (cleaned) return;
+      cleaned = true;
+      socket.off('error', errorListener);
+      socket.off('close', cleanup);
+    };
+
+    if (listeners) {
+      socket.off('open', listeners.open);
+      socket.off('message', listeners.message);
+      socket.off('close', listeners.close);
+    } else {
+      // Defensive fallback: every socket created here normally has listeners,
+      // but a locally-retired CONNECTING socket must never be left unhandled.
+      socket.on('error', errorListener);
+    }
+    socket.once('close', cleanup);
+    wsListeners = null;
 
     try {
-      socket.off('open', wsListeners.open);
-      socket.off('message', wsListeners.message);
-      socket.off('close', wsListeners.close);
-      socket.off('error', wsListeners.error);
-    } catch {
-      // Ignore errors during listener removal
+      if (action === 'terminate') socket.terminate();
+      else socket.close();
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      handleError(error);
+      cleanup();
     }
 
-    wsListeners = null;
+    if (socket.readyState === WebSocket.CLOSED) cleanup();
   }
 
   /**
@@ -184,12 +225,7 @@ export function createUnifiedWebSocketClient(
     if (ws) {
       const oldWs = ws;
       ws = null;
-      try {
-        removeListeners(oldWs);
-        oldWs.terminate();
-      } catch {
-        // Ignore errors during terminate
-      }
+      retireSocket(oldWs, 'terminate');
     }
 
     // Reset reconnect attempts for faster initial retry
@@ -263,9 +299,9 @@ export function createUnifiedWebSocketClient(
     if (ws) {
       heartbeatManager.start(ws);
     }
-    setWebSocketStatus(true, new Date());
-    setSecretWebSocketStatus(true, new Date());
-    metrics.wsConnected();
+    // Keep health disconnected until `connection_established`/`registered`.
+    setWebSocketStatus(false);
+    setSecretWebSocketStatus(false);
     log.info({ ws: 'unified', isReconnect }, 'Unified WebSocket connected');
 
     // Set WebSocket for dynamic secrets
@@ -298,9 +334,16 @@ export function createUnifiedWebSocketClient(
       const dataStr = dataToString(data);
       const message = JSON.parse(dataStr) as UnifiedAgentEvent;
       dispatcher.handleMessage(ws, message);
+      if (message.type === 'connection_established') {
+        markServerAcknowledged();
+      }
     } catch (err) {
       const dataStr = dataToString(data);
-      log.warn({ ws: 'unified', err, data: dataStr.substring(0, 100) }, 'Failed to parse message');
+      log.warn({
+        ws: 'unified',
+        errorType: err instanceof Error ? err.name : typeof err,
+        messageBytes: Buffer.byteLength(dataStr),
+      }, 'Failed to parse message');
     }
   }
 
@@ -406,10 +449,9 @@ export function createUnifiedWebSocketClient(
 
     if (ws) {
       log.info({ ws: 'unified' }, 'Disconnecting WebSocket');
-      // Remove listeners before closing to prevent memory leaks
-      removeListeners(ws);
-      ws.close();
+      const oldWs = ws;
       ws = null;
+      retireSocket(oldWs, 'close');
     }
 
     setWebSocketStatus(false);

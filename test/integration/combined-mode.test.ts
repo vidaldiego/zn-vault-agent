@@ -10,13 +10,14 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { resolve } from 'path';
-import { existsSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, readlinkSync, writeFileSync } from 'fs';
 import { AgentRunner, createTempOutputDir, DaemonHandle } from '../helpers/agent-runner.js';
-import { VaultTestClient } from '../helpers/vault-client.js';
+import { VaultTestClient, generateTestCertificate } from '../helpers/vault-client.js';
 import { TEST_ENV, getVaultClient } from '../setup.js';
 
 // Use fixed ports for testing (avoid random port detection issues)
 let nextPort = 19100;
+const testRunId = `${process.pid}-${Date.now()}`;
 function getNextPort(): number {
   return nextPort++;
 }
@@ -41,12 +42,172 @@ async function waitForChildRunning(port: number, maxAttempts = 20, interval = 25
   throw new Error(`Child process did not reach 'running' status after ${(maxAttempts * interval) / 1000}s`);
 }
 
+async function waitForChildRestartEvidence(
+  daemon: DaemonHandle,
+  maxAttempts = 40,
+  interval = 250
+): Promise<Record<string, any>> {
+  let lastHealth: Record<string, any> | undefined;
+  for (let i = 0; i < maxAttempts; i++) {
+    if (daemon.process.exitCode !== null || daemon.process.signalCode !== null) {
+      const output = daemon.getOutput();
+      throw new Error(
+        `Daemon exited before child restart evidence; ` +
+        `stdout=${JSON.stringify(output.stdout.slice(-1000))} ` +
+        `stderr=${JSON.stringify(output.stderr.slice(-1000))}`
+      );
+    }
+    try {
+      const res = await fetch(`http://127.0.0.1:${daemon.healthPort}/health`);
+      lastHealth = await res.json() as Record<string, any>;
+      if ((lastHealth.childProcess?.restartCount ?? 0) > 0) {
+        return lastHealth;
+      }
+    } catch {
+      // The listener or child may still be starting.
+    }
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  throw new Error(
+    `Child restart evidence did not appear after ${(maxAttempts * interval) / 1000}s; ` +
+    `last health: ${JSON.stringify(lastHealth ?? {})}`
+  );
+}
+
+async function waitForChildStatus(
+  daemon: DaemonHandle,
+  expectedStatus: string,
+  maxAttempts = 40,
+  interval = 250
+): Promise<Record<string, any>> {
+  let lastHealth: Record<string, any> | undefined;
+  for (let i = 0; i < maxAttempts; i++) {
+    if (daemon.process.exitCode !== null || daemon.process.signalCode !== null) {
+      const output = daemon.getOutput();
+      throw new Error(
+        `Daemon exited before child reached ${expectedStatus}; ` +
+        `stdout=${JSON.stringify(output.stdout.slice(-1000))} ` +
+        `stderr=${JSON.stringify(output.stderr.slice(-1000))}`
+      );
+    }
+    try {
+      const res = await fetch(`http://127.0.0.1:${daemon.healthPort}/health`);
+      lastHealth = await res.json() as Record<string, any>;
+      if (lastHealth.childProcess?.status === expectedStatus) {
+        return lastHealth;
+      }
+    } catch {
+      // The listener or child may still be starting.
+    }
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  throw new Error(
+    `Child did not reach ${expectedStatus} after ${(maxAttempts * interval) / 1000}s; ` +
+    `last health: ${JSON.stringify(lastHealth ?? {})}`
+  );
+}
+
+interface ChildPidEvidence {
+  version: number;
+  pid: number;
+  identity: {
+    kind: string;
+    startTimeTicks?: unknown;
+    executablePath?: unknown;
+  };
+}
+
+function readLinuxProcessIdentity(pid: number): {
+  state: string;
+  startTimeTicks: string;
+  executablePath: string;
+} {
+  const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+  const commandEnd = stat.lastIndexOf(')');
+  if (commandEnd < 0) throw new Error(`Malformed /proc/${pid}/stat`);
+  const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
+  const state = fields[0];
+  const startTimeTicks = fields[19];
+  if (!state || !startTimeTicks) throw new Error(`Incomplete /proc/${pid}/stat`);
+  return {
+    state,
+    startTimeTicks,
+    executablePath: readlinkSync(`/proc/${pid}/exe`),
+  };
+}
+
+async function waitForExactChildTermination(evidence: ChildPidEvidence): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    if (process.platform === 'linux' && evidence.identity?.kind === 'linux-procfs') {
+      try {
+        const observed = readLinuxProcessIdentity(evidence.pid);
+        if (
+          observed.startTimeTicks !== evidence.identity.startTimeTicks
+          || observed.executablePath !== evidence.identity.executablePath
+          || observed.state === 'Z'
+        ) {
+          return;
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw err;
+      }
+    } else {
+      try {
+        process.kill(evidence.pid, 0);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ESRCH') return;
+        throw err;
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`Exact child process ${evidence.pid} remained live after daemon shutdown`);
+}
+
+async function stopDaemonAndAssertChildTermination(
+  agent: AgentRunner,
+  daemon: DaemonHandle,
+  expectedChildPid?: number
+): Promise<void> {
+  const evidencePath = agent.getChildPidFilePath();
+  const evidence = existsSync(evidencePath)
+    ? JSON.parse(readFileSync(evidencePath, 'utf-8')) as ChildPidEvidence
+    : null;
+
+  if (expectedChildPid !== undefined) {
+    expect(evidence, 'running child must have durable exact-identity evidence').not.toBeNull();
+    expect(evidence?.version).toBe(1);
+    expect(evidence?.pid).toBe(expectedChildPid);
+    expect(evidence?.identity).toBeDefined();
+
+    if (process.platform === 'linux') {
+      expect(evidence?.identity.kind).toBe('linux-procfs');
+      expect(typeof evidence?.identity.startTimeTicks).toBe('string');
+      expect(evidence?.identity.startTimeTicks).not.toBe('');
+      expect(typeof evidence?.identity.executablePath).toBe('string');
+      expect(evidence?.identity.executablePath).not.toBe('');
+
+      const observedBeforeStop = readLinuxProcessIdentity(expectedChildPid);
+      expect(observedBeforeStop.state).not.toBe('Z');
+      expect(observedBeforeStop.startTimeTicks).toBe(evidence?.identity.startTimeTicks);
+      expect(observedBeforeStop.executablePath).toBe(evidence?.identity.executablePath);
+    }
+  }
+
+  await daemon.stop();
+  expect(daemon.process.exitCode).toBe(0);
+  expect(daemon.process.signalCode).toBeNull();
+  if (evidence) await waitForExactChildTermination(evidence);
+  expect(existsSync(evidencePath), 'daemon shutdown must remove child.pid evidence').toBe(false);
+}
+
 describe('Combined Mode', () => {
   let agent: AgentRunner;
   let vault: VaultTestClient;
   let testApiKey: { id: string; key: string } | null = null;
   let testSecret: { id: string; alias: string } | null = null;
-  let testCert: { id: string; alias: string } | null = null;
+  let testCert: { id: string; name: string };
   let outputDir: string;
   let daemon: DaemonHandle | null = null;
 
@@ -80,8 +241,8 @@ exit ${exitCode}
 
     // Create test API key with required permissions
     testApiKey = await vault.createApiKey({
-      name: 'combined-mode-test-key',
-      expiresInDays: 1,
+      name: `combined-mode-test-key-${testRunId}`,
+      expiresInDays: 90,
       permissions: [
         'certificate:read:metadata',
         'certificate:read:value',
@@ -97,24 +258,20 @@ exit ${exitCode}
       tenant: TEST_ENV.tenantId,
       type: 'credential',
       data: {
-        apiKey: 'sk-combined-test-12345',
+        apiKey: ['combined', 'test', 'credential'].join('-'),
         dbHost: 'localhost',
         dbPort: 5432,
       },
     });
 
-    // Create or get test certificate
-    try {
-      testCert = await vault.createCertificate({
-        alias: `combined/test-cert-${Date.now()}`,
-        tenant: TEST_ENV.tenantId,
-        commonName: 'combined-test.example.com',
-        validityDays: 30,
-      });
-    } catch {
-      // Certificate creation may fail if not supported in test env
-      testCert = null;
-    }
+    // Create a unique certificate using the current vault API contract.
+    const { certPem, keyPem } = generateTestCertificate();
+    testCert = await vault.createCertificate({
+      clientId: TEST_ENV.tenantId,
+      alias: `combined/test-cert-${Date.now()}`,
+      certificateData: Buffer.from(`${certPem}\n${keyPem}`).toString('base64'),
+      certificateType: 'PEM',
+    });
   });
 
   afterAll(async () => {
@@ -152,11 +309,8 @@ exit ${exitCode}
   });
 
   afterEach(async () => {
-    // Stop daemon if running
     if (daemon) {
-      try {
-        await daemon.stop();
-      } catch { /* ignore */ }
+      await stopDaemonAndAssertChildTermination(agent, daemon);
       daemon = null;
     }
     agent?.cleanup();
@@ -245,11 +399,12 @@ exit ${exitCode}
       expect(health.childProcess.status).toBe('running');
 
       // Stop the daemon (sends SIGTERM)
-      await daemon.stop();
+      await stopDaemonAndAssertChildTermination(
+        agent,
+        daemon,
+        health.childProcess.pid as number
+      );
       daemon = null;  // Mark as stopped
-
-      // Daemon should have exited cleanly
-      // (stop() resolves after process exits)
     });
   });
 
@@ -263,24 +418,21 @@ exit ${exitCode}
       daemon = await agent.startDaemon({
         healthPort: port,
         exec: scriptPath,
-        secrets: [`VAR=alias:${testSecret!.alias}.apiKey`],
+        secrets: ['VAR=literal:crash-recovery'],
         restartDelay: 100,  // Fast restart for testing
         maxRestarts: 5,
         restartWindow: 60000,
       });
 
-      // Wait a bit for crash and restart cycle
-      await new Promise(resolve => setTimeout(resolve, 1500));
-
-      // Check health - should show crashed/restarting or restart count > 0
-      const healthRes = await fetch(`http://127.0.0.1:${port}/health`);
-      const health = await healthRes.json();
+      // Poll the externally observable restart receipt instead of assuming
+      // secret fetch + spawn + crash always completes within a fixed delay.
+      const health = await waitForChildRestartEvidence(daemon);
 
       expect(health.childProcess).toBeDefined();
       expect(health.childProcess.restartCount).toBeGreaterThan(0);
     });
 
-    it('COMBINED-05: should enter degraded state after max restarts', async () => {
+    it('COMBINED-05: should become unhealthy and not ready after max restarts', async () => {
       const scriptPath = resolve(outputDir, 'max-restart-test.sh');
       createCrashingScript(scriptPath, 1);
       const port = getNextPort();
@@ -288,20 +440,23 @@ exit ${exitCode}
       daemon = await agent.startDaemon({
         healthPort: port,
         exec: scriptPath,
-        secrets: [`VAR=alias:${testSecret!.alias}.apiKey`],
+        secrets: ['VAR=literal:max-restarts'],
         restartDelay: 50,  // Very fast for testing
         maxRestarts: 2,
         restartWindow: 60000,
       });
 
-      // Wait for max restarts to be exceeded
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await waitForChildStatus(daemon, 'max_restarts_exceeded');
 
       const healthRes = await fetch(`http://127.0.0.1:${port}/health`);
       const health = await healthRes.json();
 
+      expect(healthRes.status).toBe(503);
       expect(health.childProcess.status).toBe('max_restarts_exceeded');
-      expect(health.status).toBe('degraded');
+      expect(health.status).toBe('unhealthy');
+
+      const readyRes = await fetch(`http://127.0.0.1:${port}/ready`);
+      expect(readyRes.status).toBe(503);
     });
   });
 
@@ -363,12 +518,6 @@ while true; do sleep 1; done
 
   describe('With Certificate Sync', () => {
     it('COMBINED-08: should sync certificates AND run exec', async () => {
-      // Skip if no test certificate available
-      if (!testCert) {
-        console.log('Skipping COMBINED-08: no test certificate available');
-        return;
-      }
-
       const scriptPath = resolve(outputDir, 'cert-sync-test.sh');
       createTestScript(scriptPath);
       const port = getNextPort();

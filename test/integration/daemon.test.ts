@@ -14,6 +14,8 @@ import { AgentRunner, createTempOutputDir, DaemonHandle } from '../helpers/agent
 import { VaultTestClient, generateTestCertificate } from '../helpers/vault-client.js';
 import { TEST_ENV, getVaultClient } from '../setup.js';
 
+const testRunId = `${process.pid}-${Date.now()}`;
+
 describe('Daemon Mode', () => {
   let agent: AgentRunner;
   let vault: VaultTestClient;
@@ -26,8 +28,8 @@ describe('Daemon Mode', () => {
 
     // Create test API key
     testApiKey = await vault.createApiKey({
-      name: 'daemon-test-key',
-      expiresInDays: 1,
+      name: `daemon-test-key-${testRunId}`,
+      expiresInDays: 90,
       permissions: [
         'certificate:read:metadata',
         'certificate:read:value',
@@ -42,7 +44,7 @@ describe('Daemon Mode', () => {
     const combinedPem = certPem + '\n' + keyPem;
     testCert = await vault.createCertificate({
       clientId: TEST_ENV.tenantId,
-      alias: 'daemon-test-cert',
+      alias: `daemon-test-cert-${testRunId}`,
       certificateData: Buffer.from(combinedPem).toString('base64'),
       certificateType: 'PEM',
     });
@@ -193,11 +195,24 @@ describe('Daemon Mode', () => {
     });
 
     it('should return readiness status', async () => {
+      await agent.addCertificate({
+        certId: testCert!.id,
+        name: 'readiness-check',
+        output: resolve(outputDir, 'readiness.pem'),
+      });
       daemon = await agent.startDaemon();
       await daemon.waitForReady();
 
-      const response = await fetch(`http://127.0.0.1:${daemon.healthPort}/ready`);
-      expect(response.ok).toBe(true);
+      // Connected health is published only after the server acknowledgement.
+      // Poll the actual readiness contract within the same 30-second startup
+      // bound used by AgentRunner; loaded full-suite runs can delay the ACK.
+      let response: Response | undefined;
+      for (let attempt = 0; attempt < 120; attempt++) {
+        response = await fetch(`http://127.0.0.1:${daemon.healthPort}/ready`);
+        if (response.ok) break;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      expect(response?.ok).toBe(true);
     });
 
     it('should return liveness status', async () => {
@@ -206,6 +221,38 @@ describe('Daemon Mode', () => {
 
       const response = await fetch(`http://127.0.0.1:${daemon.healthPort}/live`);
       expect(response.ok).toBe(true);
+    });
+
+    it('protects non-monitoring routes with the local control-plane token', async () => {
+      daemon = await agent.startDaemon();
+      await daemon.waitForReady();
+      const url = `http://127.0.0.1:${daemon.healthPort}/agent/update`;
+
+      // An invalid exact-update body exercises the real mutation route while
+      // remaining side-effect free: auth runs first, then request validation
+      // rejects it before any registry lookup or durable rail admission.
+      const unauthenticated = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      expect(unauthenticated.status).toBe(401);
+      expect(await unauthenticated.json()).toMatchObject({
+        error: 'CONTROL_PLANE_AUTH_REQUIRED',
+      });
+
+      const authenticated = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...agent.getControlPlaneHeaders(),
+        },
+        body: '{}',
+      });
+      expect(authenticated.status).toBe(400);
+      expect(await authenticated.json()).toMatchObject({
+        code: 'INVALID_SELF_UPDATE_REQUEST',
+      });
     });
   });
 

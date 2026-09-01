@@ -40,7 +40,7 @@ export async function buildSecretEnv(
         keyValue = bindResponse.key;
 
         log.debug(
-          { apiKeyName: mapping.apiKeyName, hasKey: !!keyValue, prefix: bindResponse.prefix },
+          { apiKeyName: mapping.apiKeyName, hasKey: !!keyValue },
           'Bind response received'
         );
 
@@ -55,7 +55,7 @@ export async function buildSecretEnv(
       }
 
       env[mapping.envVar] = keyValue;
-      log.debug({ envVar: mapping.envVar, keyPrefix: keyValue.substring(0, 8) }, 'API key mapped to env var');
+      log.debug({ envVar: mapping.envVar }, 'API key mapped to env var');
       continue;
     }
 

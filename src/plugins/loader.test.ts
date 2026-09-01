@@ -32,7 +32,17 @@ vi.mock('../lib/config.js', () => ({
   })),
 }));
 
-import { PluginLoader, createPluginLoader, getPluginLoader, clearPluginLoader } from './loader.js';
+import {
+  PluginCompatibilityError,
+  RequiredPluginLoadError,
+  PluginLoader,
+  createPluginLoader,
+  getPluginLoader,
+  clearPluginLoader,
+  inspectConfiguredPayaraManifest,
+  inspectInstalledPayaraRecoveryManifest,
+  inspectPayaraStartupPreflight,
+} from './loader.js';
 import type { AgentPlugin } from './types.js';
 import type { AgentConfig } from '../lib/config.js';
 
@@ -48,9 +58,7 @@ function _createMockPlugin(overrides: Partial<AgentPlugin> = {}): AgentPlugin {
 
 // Create a temp directory for test plugins
 function createTestPluginDir(): string {
-  const tempDir = path.join(os.tmpdir(), `zn-vault-agent-test-${Date.now()}`);
-  fs.mkdirSync(tempDir, { recursive: true });
-  return tempDir;
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'zn-vault-agent-test-'));
 }
 
 // Write a test plugin file
@@ -58,6 +66,23 @@ function writeTestPlugin(dir: string, name: string, content: string): string {
   const filePath = path.join(dir, `${name}.js`);
   fs.writeFileSync(filePath, content);
   return filePath;
+}
+
+function writeTestPackage(
+  nodeModulesDir: string,
+  packageName: string,
+  version: unknown,
+  content: string
+): void {
+  const packageDir = path.join(nodeModulesDir, packageName);
+  fs.mkdirSync(packageDir, { recursive: true });
+  fs.writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify({
+    name: packageName,
+    version,
+    type: 'module',
+    exports: './index.js',
+  }));
+  fs.writeFileSync(path.join(packageDir, 'index.js'), content);
 }
 
 describe('PluginLoader', () => {
@@ -137,6 +162,118 @@ describe('PluginLoader', () => {
 
       expect(plugin).not.toBeNull();
       expect(plugin?.name).toBe('factory-plugin');
+    });
+
+    it('rejects a legacy local Payara plugin before registration', async () => {
+      const pluginPath = writeTestPlugin(testDir, 'legacy-payara-plugin', `
+        export default {
+          name: 'payara',
+          version: '2.99.9',
+        };
+      `);
+
+      const error = await loader.loadPlugin({ path: pluginPath }).catch(caught => caught);
+
+      expect(error).toBeInstanceOf(PluginCompatibilityError);
+      expect(error).toMatchObject({ code: 'PLUGIN_INCOMPATIBLE_VERSION' });
+      expect((error as Error).message)
+        .toMatch(/requires @zincapp\/znvault-plugin-payara >=3\.0\.0 <4\.0\.0/);
+      expect(loader.hasPlugins()).toBe(false);
+    });
+
+    it('rejects an unsupported future Payara major before registration', async () => {
+      const pluginPath = writeTestPlugin(testDir, 'future-payara-plugin', `
+        export default {
+          name: 'payara',
+          version: '4.0.0',
+        };
+      `);
+
+      const error = await loader.loadPlugin({ path: pluginPath }).catch(caught => caught);
+
+      expect(error).toBeInstanceOf(PluginCompatibilityError);
+      expect(error).toMatchObject({ code: 'PLUGIN_INCOMPATIBLE_VERSION' });
+      expect(loader.hasPlugins()).toBe(false);
+    });
+
+    it('loads a local Payara plugin at the minimum compatible version', async () => {
+      const pluginPath = writeTestPlugin(testDir, 'compatible-payara-plugin', `
+        export default {
+          name: 'payara',
+          version: '3.0.0',
+        };
+      `);
+
+      const plugin = await loader.loadPlugin({ path: pluginPath });
+
+      expect(plugin?.name).toBe('payara');
+      expect(plugin?.version).toBe('3.0.0');
+    });
+
+    it('rejects a legacy npm Payara package before importing its entrypoint', async () => {
+      const nodeModulesDir = path.join(testDir, 'node_modules');
+      const importMarker = path.join(testDir, 'legacy-entrypoint-imported');
+      writeTestPackage(
+        nodeModulesDir,
+        '@zincapp/znvault-plugin-payara',
+        '2.7.2-lab.2',
+        `
+          import { writeFileSync } from 'node:fs';
+          writeFileSync(${JSON.stringify(importMarker)}, 'imported');
+          export default { name: 'payara', version: '2.7.2-lab.2' };
+        `
+      );
+      const packageLoader = new PluginLoader(mockInternals, { globalNodeModulesDir: nodeModulesDir });
+
+      await expect(packageLoader.loadPlugin({ package: '@zincapp/znvault-plugin-payara' }))
+        .rejects.toThrow(/legacy or unverified lock protocol/);
+      expect(fs.existsSync(importMarker)).toBe(false);
+      expect(packageLoader.hasPlugins()).toBe(false);
+    });
+
+    it('fails closed when the npm Payara package version is not valid semver', async () => {
+      const nodeModulesDir = path.join(testDir, 'node_modules');
+      writeTestPackage(
+        nodeModulesDir,
+        '@zincapp/znvault-plugin-payara',
+        'latest',
+        `export default { name: 'payara', version: '3.0.0' };`
+      );
+      const packageLoader = new PluginLoader(mockInternals, { globalNodeModulesDir: nodeModulesDir });
+
+      await expect(packageLoader.loadPlugin({ package: '@zincapp/znvault-plugin-payara' }))
+        .rejects.toThrow(/version latest/);
+    });
+
+    it('loads an npm Payara package at the minimum compatible version', async () => {
+      const nodeModulesDir = path.join(testDir, 'node_modules');
+      writeTestPackage(
+        nodeModulesDir,
+        '@zincapp/znvault-plugin-payara',
+        '3.0.0',
+        `export default { name: 'payara', version: '3.0.0' };`
+      );
+      const packageLoader = new PluginLoader(mockInternals, { globalNodeModulesDir: nodeModulesDir });
+
+      const plugin = await packageLoader.loadPlugin({ package: '@zincapp/znvault-plugin-payara' });
+
+      expect(plugin?.version).toBe('3.0.0');
+    });
+
+    it('does not impose the Payara version contract on other npm plugins', async () => {
+      const nodeModulesDir = path.join(testDir, 'node_modules');
+      writeTestPackage(
+        nodeModulesDir,
+        '@example/legacy-plugin',
+        'not-semver',
+        `export default { name: 'legacy-other', version: '1.0.0' };`
+      );
+      const packageLoader = new PluginLoader(mockInternals, { globalNodeModulesDir: nodeModulesDir });
+
+      const plugin = await packageLoader.loadPlugin({ package: '@example/legacy-plugin' });
+
+      expect(plugin?.name).toBe('legacy-other');
+      expect(plugin?.version).toBe('1.0.0');
     });
 
     it('should reject plugin with missing name', async () => {
@@ -260,6 +397,81 @@ describe('PluginLoader', () => {
 
       expect(loader.getPlugins().length).toBe(1);
       expect(loader.getPlugin('good')).toBeDefined();
+    });
+
+    it('propagates Payara compatibility failures instead of continuing startup', async () => {
+      const legacyPayaraPath = writeTestPlugin(testDir, 'legacy-payara', `
+        export default { name: 'payara', version: '2.9.0' };
+      `);
+      const otherPluginPath = writeTestPlugin(testDir, 'other-plugin', `
+        export default { name: 'other', version: '1.0.0' };
+      `);
+      const config = {
+        ...mockInternals.config,
+        plugins: [
+          { path: legacyPayaraPath },
+          { path: otherPluginPath },
+        ],
+      };
+
+      await expect(loader.loadPlugins(config as AgentConfig))
+        .rejects.toBeInstanceOf(PluginCompatibilityError);
+      expect(loader.hasPlugins()).toBe(false);
+    });
+
+    it('fails startup when the configured Payara package is missing', async () => {
+      const nodeModulesDir = path.join(testDir, 'empty-node-modules');
+      fs.mkdirSync(nodeModulesDir, { recursive: true });
+      const packageLoader = new PluginLoader(mockInternals, { globalNodeModulesDir: nodeModulesDir });
+      const config = {
+        ...mockInternals.config,
+        plugins: [{ package: '@zincapp/znvault-plugin-payara' }],
+      };
+
+      await expect(packageLoader.loadPlugins(config as AgentConfig))
+        .rejects.toMatchObject({
+          code: 'REQUIRED_PLUGIN_LOAD_FAILED',
+          name: 'RequiredPluginLoadError',
+        } satisfies Partial<RequiredPluginLoadError>);
+      expect(packageLoader.hasPlugins()).toBe(false);
+    });
+
+    it('fails startup when the configured Payara package throws during import', async () => {
+      const nodeModulesDir = path.join(testDir, 'import-failure-node-modules');
+      writeTestPackage(
+        nodeModulesDir,
+        '@zincapp/znvault-plugin-payara',
+        '3.0.0',
+        `throw new Error('payara import failed');`
+      );
+      const packageLoader = new PluginLoader(mockInternals, { globalNodeModulesDir: nodeModulesDir });
+      const config = {
+        ...mockInternals.config,
+        plugins: [{ package: '@zincapp/znvault-plugin-payara' }],
+      };
+
+      await expect(packageLoader.loadPlugins(config as AgentConfig))
+        .rejects.toThrow(/payara import failed/);
+      expect(packageLoader.hasPlugins()).toBe(false);
+    });
+
+    it('fails startup when the configured Payara package factory throws', async () => {
+      const nodeModulesDir = path.join(testDir, 'factory-failure-node-modules');
+      writeTestPackage(
+        nodeModulesDir,
+        '@zincapp/znvault-plugin-payara',
+        '3.0.0',
+        `export default function createPayara() { throw new Error('payara factory failed'); }`
+      );
+      const packageLoader = new PluginLoader(mockInternals, { globalNodeModulesDir: nodeModulesDir });
+      const config = {
+        ...mockInternals.config,
+        plugins: [{ package: '@zincapp/znvault-plugin-payara' }],
+      };
+
+      await expect(packageLoader.loadPlugins(config as AgentConfig))
+        .rejects.toThrow(/payara factory failed/);
+      expect(packageLoader.hasPlugins()).toBe(false);
     });
   });
 
@@ -671,6 +883,170 @@ describe('PluginLoader', () => {
         error: undefined,
       });
     });
+  });
+});
+
+describe('Payara manifest-only recovery inspection', () => {
+  let root: string;
+  let nodeModulesDir: string;
+  const config = {
+    vaultUrl: 'https://vault.example.com',
+    targets: [],
+    secretTargets: [],
+    plugins: [{ package: '@zincapp/znvault-plugin-payara', enabled: true }],
+  } as unknown as AgentConfig;
+
+  beforeEach(() => {
+    root = createTestPluginDir();
+    nodeModulesDir = path.join(root, 'node_modules');
+  });
+
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  it('admits exact major 2 recovery without importing its factory', () => {
+    const marker = path.join(root, 'factory-ran');
+    writeTestPackage(
+      nodeModulesDir,
+      '@zincapp/znvault-plugin-payara',
+      '2.9.0',
+      `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'ran');`
+    );
+    expect(inspectConfiguredPayaraManifest(config, nodeModulesDir)).toEqual({
+      configured: true,
+      recoveryRequired: true,
+      version: '2.9.0',
+    });
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('infers exact major 2 recovery for config-from-Vault without a local declaration', () => {
+    const marker = path.join(root, 'inferred-factory-ran');
+    writeTestPackage(
+      nodeModulesDir,
+      '@zincapp/znvault-plugin-payara',
+      '2.7.2-lab.2',
+      `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'ran');`
+    );
+    const minimalVaultConfig = {
+      vaultUrl: 'https://vault.example.com',
+      auth: {},
+      targets: [],
+      configFromVault: true,
+    } as unknown as AgentConfig;
+
+    expect(inspectInstalledPayaraRecoveryManifest(nodeModulesDir)).toEqual({
+      configured: true,
+      recoveryRequired: true,
+      version: '2.7.2-lab.2',
+    });
+    expect(inspectPayaraStartupPreflight(minimalVaultConfig, nodeModulesDir)).toEqual({
+      configured: true,
+      recoveryRequired: true,
+      version: '2.7.2-lab.2',
+    });
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it.each([
+    { label: 'missing package', version: undefined },
+    { label: 'major 3 package', version: '3.0.0' },
+    { label: 'future package', version: '4.0.0' },
+  ])('does not infer recovery from $label', ({ version }) => {
+    if (version) {
+      writeTestPackage(
+        nodeModulesDir,
+        '@zincapp/znvault-plugin-payara',
+        version,
+        `export default { name: 'payara', version: ${JSON.stringify(version)} };`
+      );
+    }
+    const minimalVaultConfig = {
+      vaultUrl: 'https://vault.example.com',
+      auth: {},
+      targets: [],
+      configFromVault: true,
+    } as unknown as AgentConfig;
+
+    expect(inspectPayaraStartupPreflight(minimalVaultConfig, nodeModulesDir)).toEqual({
+      configured: false,
+      recoveryRequired: false,
+    });
+  });
+
+  it('does not infer recovery from a corrupt undeclared manifest', () => {
+    const packageDir = path.join(nodeModulesDir, '@zincapp/znvault-plugin-payara');
+    fs.mkdirSync(packageDir, { recursive: true });
+    fs.writeFileSync(path.join(packageDir, 'package.json'), '{');
+    const minimalVaultConfig = {
+      vaultUrl: 'https://vault.example.com',
+      auth: {},
+      targets: [],
+      configFromVault: true,
+    } as unknown as AgentConfig;
+
+    expect(inspectPayaraStartupPreflight(minimalVaultConfig, nodeModulesDir)).toEqual({
+      configured: false,
+      recoveryRequired: false,
+    });
+  });
+
+  it.each([
+    { label: 'corrupt', version: undefined },
+    { label: 'future major', version: '4.0.0' },
+  ])('does not inspect a stale configured Payara cache before Vault for a $label manifest', ({ version }) => {
+    const packageDir = path.join(nodeModulesDir, '@zincapp/znvault-plugin-payara');
+    if (version) {
+      writeTestPackage(
+        nodeModulesDir,
+        '@zincapp/znvault-plugin-payara',
+        version,
+        `export default { name: 'payara', version: ${JSON.stringify(version)} };`
+      );
+    } else {
+      fs.mkdirSync(packageDir, { recursive: true });
+      fs.writeFileSync(path.join(packageDir, 'package.json'), '{');
+    }
+    const staleVaultCache = {
+      ...config,
+      auth: { apiKey: 'test-only-api-key' },
+      configFromVault: true,
+      configVersion: 41,
+    } as AgentConfig;
+
+    expect(inspectPayaraStartupPreflight(staleVaultCache, nodeModulesDir)).toEqual({
+      configured: false,
+      recoveryRequired: false,
+    });
+  });
+
+  it('accepts major 3 as the normal loader path', () => {
+    writeTestPackage(
+      nodeModulesDir,
+      '@zincapp/znvault-plugin-payara',
+      '3.0.1',
+      `export default { name: 'payara', version: '3.0.1' };`
+    );
+    expect(inspectConfiguredPayaraManifest(config, nodeModulesDir)).toEqual({
+      configured: true,
+      recoveryRequired: false,
+      version: '3.0.1',
+    });
+  });
+
+  it.each(['latest', '4.0.0', '1.9.9'])('hard-fails invalid/future manifest %s', (version) => {
+    writeTestPackage(
+      nodeModulesDir,
+      '@zincapp/znvault-plugin-payara',
+      version,
+      `export default { name: 'payara', version: ${JSON.stringify(version)} };`
+    );
+    expect(() => inspectConfiguredPayaraManifest(config, nodeModulesDir))
+      .toThrow(PluginCompatibilityError);
+  });
+
+  it('hard-fails a missing configured package', () => {
+    expect(() => inspectConfiguredPayaraManifest(config, nodeModulesDir))
+      .toThrow(RequiredPluginLoadError);
   });
 });
 

@@ -16,19 +16,23 @@
  * - Previous version tracking for diagnostics
  */
 
-import { exec, spawn } from 'child_process';
+import { exec, execFile, spawn } from 'child_process';
+import { randomUUID } from 'node:crypto';
 import { promisify } from 'util';
 import {
+  fchmodSync,
   existsSync,
   unlinkSync,
   readFileSync,
-  statSync,
   openSync,
-  writeSync,
+  writeFileSync,
   closeSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  fstatSync,
   constants,
 } from 'fs';
-import { writeFile, rename } from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import semver from 'semver';
@@ -37,11 +41,12 @@ import type { UpdateConfig, NpmVersionInfo } from '../types/update.js';
 import { DEFAULT_UPDATE_CONFIG } from '../types/update.js';
 
 const execAsync = promisify(exec);
-const LOCK_FILE = '/var/run/zn-vault-agent.update.lock';
+const execFileAsync = promisify(execFile);
+const LOCK_FILE = '/run/zn-vault-agent/.self-update.lock';
 const PACKAGE_NAME = '@zincapp/zn-vault-agent';
 
-// Root-owned helper unit that performs the global npm install (and restarts the
-// agent via ExecStartPost) OUTSIDE the agent's mount namespace. The agent unit
+// Root-owned helper unit whose validated wrapper performs the exact global npm
+// install and argv-safe restart OUTSIDE the agent's mount namespace. The agent unit
 // runs as a non-root service user under ProtectSystem=strict, which makes /usr
 // read-only IN THE AGENT'S MOUNT NAMESPACE. An in-process `sudo npm install`
 // CANNOT escape that namespace (sudo changes uid, not the namespace), so it
@@ -60,22 +65,255 @@ const SYSTEMCTL_BIN = '/usr/bin/systemctl';
 // requires no sudo at all — the agent only needs to create a file.
 const UPDATER_PATH_UNIT = 'zn-vault-agent-updater.path';
 
-// Trigger file and temp-file paths.  The agent writes the tmp file and renames
-// it atomically so the .path unit sees a complete, never-partial value.
+// The trigger lives in the agent-owned state directory. Publication uses a
+// unique O_EXCL temporary inode followed by a hard-link no-replace operation;
+// the root wrapper is the only component allowed to consume the live trigger.
 const TRIGGER_FILE = '/var/lib/zn-vault-agent/.update-trigger';
-const TRIGGER_TMP_FILE = '/var/lib/zn-vault-agent/.update-trigger.tmp';
+const SELF_UPDATE_STATE_DIR = '/var/lib/zn-vault-agent-updater';
 
-// Lock file staleness threshold (10 minutes)
-const LOCK_STALE_MS = 10 * 60 * 1000;
+const SELF_UPDATE_CHANNELS = new Set(['latest', 'beta', 'next', 'dr-m4']);
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const EXACT_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+export interface SelfUpdateRailOptions {
+  triggerFile?: string;
+  stateDir?: string;
+  agentUid?: number;
+  rootUid?: number;
+}
+
+export interface SelfUpdateRequest {
+  requestId: string;
+  expectedCurrentVersion: string;
+  targetVersion: string;
+  force?: boolean;
+}
+
+export interface SelfUpdatePendingStatus {
+  status: 'pending';
+  requestId: string;
+  package: typeof PACKAGE_NAME;
+  channel: string;
+  previousVersion: string;
+  targetVersion: string;
+  requestedAt: string;
+  pollPath: string;
+  success?: undefined;
+  willRestart?: undefined;
+  newVersion?: undefined;
+  message?: undefined;
+}
+
+export interface SelfUpdateTerminalStatus {
+  status: 'succeeded' | 'failed';
+  requestId: string;
+  package: typeof PACKAGE_NAME;
+  channel: string;
+  previousVersion: string;
+  targetVersion: string;
+  installedVersion: string | null;
+  requestedAt: string;
+  startedAt: string;
+  finishedAt: string;
+  reason: string;
+}
+
+export type SelfUpdateStatus = SelfUpdatePendingStatus | SelfUpdateTerminalStatus;
+
+interface SelfUpdateRequestEvidence {
+  requestId: string;
+  currentVersion: string;
+  targetVersion: string;
+  channel: string;
+  requestedAt: string;
+}
+
+interface SelfUpdateReceiptEvidence {
+  terminal: SelfUpdateTerminalStatus;
+  committing: boolean;
+}
+
+export class SelfUpdateRailError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly httpStatus: number = 502
+  ) {
+    super(message);
+    this.name = 'SelfUpdateRailError';
+  }
+}
+
+function isExactIsoTimestamp(value: string): boolean {
+  return EXACT_ISO_RE.test(value)
+    && !Number.isNaN(Date.parse(value))
+    && new Date(value).toISOString() === value;
+}
+
+function pendingStatus(
+  requestId: string
+): Pick<SelfUpdatePendingStatus, 'status' | 'requestId' | 'package' | 'pollPath'> {
+  return {
+    status: 'pending',
+    requestId,
+    package: PACKAGE_NAME,
+    pollPath: `/agent/update/${requestId}`,
+  };
+}
+
+function pendingFromEvidence(evidence: SelfUpdateRequestEvidence): SelfUpdatePendingStatus {
+  return {
+    ...pendingStatus(evidence.requestId),
+    channel: evidence.channel,
+    previousVersion: evidence.currentVersion,
+    targetVersion: evidence.targetVersion,
+    requestedAt: evidence.requestedAt,
+  };
+}
+
+function sameRequestIdentity(
+  left: SelfUpdateRequestEvidence,
+  right: SelfUpdateRequestEvidence
+): boolean {
+  return left.requestId === right.requestId
+    && left.currentVersion === right.currentVersion
+    && left.targetVersion === right.targetVersion
+    && left.channel === right.channel
+    && left.requestedAt === right.requestedAt;
+}
+
+function fsyncDirectory(directory: string): void {
+  const directoryFlags = constants.O_RDONLY | (constants.O_DIRECTORY ?? 0);
+  const fd = openSync(directory, directoryFlags);
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Publish a complete self-update request without replacing an existing one.
+ *
+ * The hard-link is the commit point: two callers can create independent temp
+ * files, but only one can link its inode to `triggerFile`. The losing caller
+ * receives EEXIST and cannot overwrite the admitted request.
+ */
+export function publishSelfUpdateTriggerAtomically(
+  triggerFile: string,
+  content: string,
+  nonce: string = randomUUID(),
+  fault?: (point: 'after-link' | 'after-first-dir-fsync' | 'after-temp-unlink' | 'after-second-dir-fsync') => void
+): void {
+  const noFollow = constants.O_NOFOLLOW;
+  if (typeof noFollow !== 'number' || noFollow === 0) {
+    throw new Error('Secure self-update publication requires O_NOFOLLOW support');
+  }
+  if (!UUID_V4_RE.test(nonce)) {
+    throw new Error('Self-update temp nonce must be a lowercase UUID v4');
+  }
+
+  const directory = dirname(triggerFile);
+  const tempFile = `${triggerFile}.tmp.${process.pid}.${nonce}`;
+  let fd: number | undefined;
+  let linkCommitted = false;
+  let tempIdentity: { dev: number; ino: number; uid: number } | undefined;
+  try {
+    fd = openSync(
+      tempFile,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow,
+      0o600
+    );
+    writeFileSync(fd, content, { encoding: 'utf8' });
+    fchmodSync(fd, 0o600);
+    fsyncSync(fd);
+    const tempOpened = fstatSync(fd);
+    if (!tempOpened.isFile() || (tempOpened.mode & 0o777) !== 0o600
+      || tempOpened.nlink !== 1) {
+      throw new Error('Self-update temp inode changed before publication');
+    }
+    tempIdentity = { dev: tempOpened.dev, ino: tempOpened.ino, uid: tempOpened.uid };
+    closeSync(fd);
+    fd = undefined;
+    // link(2) is an atomic no-replace publication primitive. Unlike rename,
+    // it fails with EEXIST when another request is already pending.
+    linkSync(tempFile, triggerFile);
+    linkCommitted = true;
+    fault?.('after-link');
+    fsyncDirectory(directory);
+    fault?.('after-first-dir-fsync');
+    unlinkSync(tempFile);
+    fault?.('after-temp-unlink');
+    fsyncDirectory(directory);
+    fault?.('after-second-dir-fsync');
+  } catch (err) {
+    let committed = false;
+    if (linkCommitted && tempIdentity) {
+      try {
+        const before = lstatSync(triggerFile);
+        if (before.isFile() && !before.isSymbolicLink()
+          && before.dev === tempIdentity.dev && before.ino === tempIdentity.ino
+          && before.uid === tempIdentity.uid
+          && (before.mode & 0o777) === 0o600 && before.nlink >= 1 && before.nlink <= 2
+          && before.size === Buffer.byteLength(content) && constants.O_NOFOLLOW) {
+          const committedFd = openSync(triggerFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+          try {
+            const opened = fstatSync(committedFd);
+            committed = opened.isFile() && opened.dev === before.dev && opened.ino === before.ino
+              && (opened.mode & 0o777) === 0o600 && opened.nlink === before.nlink
+              && opened.size === before.size && readFileSync(committedFd, 'utf8') === content;
+          } finally {
+            closeSync(committedFd);
+          }
+        }
+      } catch {
+        committed = false;
+      }
+    }
+    if (!committed) throw err;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Preserve the original publication error.
+      }
+    }
+    try {
+      unlinkSync(tempFile);
+    } catch {
+      // The normal success path already removed it; failed O_EXCL creates no
+      // inode. Never unlink the committed trigger here.
+    }
+    // If a post-link fsync or temp unlink failed, exact inode+byte readback
+    // above proves admission. Best-effort directory sync narrows the remaining
+    // crash window without turning an already committed UUID into an error.
+    try {
+      fsyncDirectory(directory);
+    } catch {
+      // The exact live trigger remains observable and root-reconcilable.
+    }
+  }
+}
 
 export class NpmAutoUpdateService {
   private checkInterval: NodeJS.Timeout | null = null;
   private initialCheckTimeout: NodeJS.Timeout | null = null;
   private stagedRolloutTimeout: NodeJS.Timeout | null = null;
   private readonly config: UpdateConfig;
+  private readonly triggerFile: string;
+  private readonly stateDir: string;
+  private readonly activeFile: string;
+  private readonly agentUid: number;
+  private readonly rootUid: number;
 
-  constructor(config: Partial<UpdateConfig> = {}) {
+  constructor(config: Partial<UpdateConfig> = {}, rail: SelfUpdateRailOptions = {}) {
     this.config = { ...DEFAULT_UPDATE_CONFIG, ...config };
+    this.triggerFile = rail.triggerFile ?? TRIGGER_FILE;
+    this.stateDir = rail.stateDir ?? SELF_UPDATE_STATE_DIR;
+    this.activeFile = `${this.stateDir}/active.state`;
+    this.agentUid = rail.agentUid ?? process.getuid?.() ?? 0;
+    this.rootUid = rail.rootUid ?? 0;
   }
 
   /**
@@ -146,6 +384,200 @@ export class NpmAutoUpdateService {
   }
 
   /**
+   * Admit one manual self-update onto the durable root-owned rail.
+   *
+   * Admission is deliberately separate from the legacy synchronous
+   * `triggerUpdate()` result: publishing a trigger proves only that systemd
+   * accepted durable work, never that npm installed or that restart completed.
+   */
+  async requestUpdate(request: SelfUpdateRequest): Promise<SelfUpdateStatus> {
+    if (!UUID_V4_RE.test(request.requestId)) {
+      throw new SelfUpdateRailError('INVALID_REQUEST_ID', 'Invalid Agent update requestId', 400);
+    }
+    if (semver.valid(request.expectedCurrentVersion) !== request.expectedCurrentVersion
+      || semver.valid(request.targetVersion) !== request.targetVersion) {
+      throw new SelfUpdateRailError('INVALID_UPDATE_VERSION', 'Invalid exact Agent update version', 400);
+    }
+
+    const existing = this.exactReplayOrConflict(
+      request.requestId,
+      request.expectedCurrentVersion,
+      request.targetVersion
+    );
+    if (existing) return existing;
+
+    const force = request.force ?? false;
+    const info = await this.checkForUpdates();
+    if (info.current !== request.expectedCurrentVersion) {
+      throw new SelfUpdateRailError(
+        'SELF_UPDATE_CURRENT_VERSION_CONFLICT',
+        'Installed Agent version does not match expectedCurrentVersion',
+        409
+      );
+    }
+    if (info.latest !== request.targetVersion) {
+      throw new SelfUpdateRailError(
+        'SELF_UPDATE_TARGET_VERSION_CONFLICT',
+        'Configured Agent channel does not resolve to targetVersion',
+        409
+      );
+    }
+    if (!this.isNewer(request.targetVersion, request.expectedCurrentVersion) && !(
+      force && request.targetVersion === request.expectedCurrentVersion
+    )) {
+      throw new SelfUpdateRailError(
+        'NO_UPDATE_AVAILABLE',
+        'Exact target is not newer; equality requires force=true',
+        409
+      );
+    }
+    return await this.admitResolvedUpdate(
+      request.requestId,
+      request.expectedCurrentVersion,
+      request.targetVersion
+    );
+  }
+
+  private async admitResolvedUpdate(
+    requestId: string,
+    currentVersion: string,
+    targetVersion: string
+  ): Promise<SelfUpdateStatus> {
+    if (!this.acquireLock()) {
+      throw new SelfUpdateRailError('SELF_UPDATE_BUSY', 'Another Agent update is in progress', 409);
+    }
+
+    try {
+      const replay = this.exactReplayOrConflict(requestId, currentVersion, targetVersion);
+      if (replay) return replay;
+
+      // A merely installed .path unit is not an execution guarantee. Disabled,
+      // failed, and rate-limited units all fail this argv-safe active check, so
+      // no trigger is published when systemd cannot consume it.
+      if (!(await this.isUpdaterPathUnitActive())) {
+        throw new SelfUpdateRailError(
+          'SELF_UPDATE_RAIL_INACTIVE',
+          `Root-owned updater path is not active: ${UPDATER_PATH_UNIT}`,
+          503
+        );
+      }
+
+      try {
+        const request = await this.installViaTriggerFile(requestId, targetVersion, currentVersion);
+        return {
+          status: 'pending',
+          requestId: request.requestId,
+          package: PACKAGE_NAME,
+          channel: request.channel,
+          previousVersion: request.currentVersion,
+          targetVersion: request.targetVersion,
+          requestedAt: request.requestedAt,
+          pollPath: `/agent/update/${request.requestId}`,
+        };
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+          const replayAfterRace = this.exactReplayOrConflict(
+            requestId,
+            currentVersion,
+            targetVersion
+          );
+          if (replayAfterRace) return replayAfterRace;
+          throw new SelfUpdateRailError(
+            'SELF_UPDATE_BUSY',
+            'A durable Agent update request is already pending',
+            409
+          );
+        }
+        throw err;
+      }
+    } finally {
+      this.releaseLock();
+    }
+  }
+
+  private exactReplayOrConflict(
+    requestId: string,
+    expectedCurrentVersion: string,
+    targetVersion: string
+  ): SelfUpdateStatus | null {
+    const existing = this.getUpdateStatus(requestId);
+    if (!existing) return null;
+    if (existing.previousVersion !== expectedCurrentVersion
+      || existing.targetVersion !== targetVersion
+      || existing.channel !== this.config.channel) {
+      throw new SelfUpdateRailError(
+        'SELF_UPDATE_REQUEST_ID_CONFLICT',
+        'requestId is already bound to a different Agent update identity',
+        409
+      );
+    }
+    return existing;
+  }
+
+  /**
+   * Observe a durable self-update operation. A receipt is terminal only after
+   * the root helper has also removed both active and trigger evidence. This
+   * keeps the active->receipt->restart->cleanup race externally pending.
+   */
+  getUpdateStatus(requestId: string): SelfUpdateStatus | null {
+    if (!UUID_V4_RE.test(requestId)) {
+      throw new SelfUpdateRailError('INVALID_REQUEST_ID', 'Invalid Agent update requestId', 400);
+    }
+
+    const trigger = this.readTrustedRequestEvidence(
+      this.triggerFile,
+      this.agentUid,
+      0o600,
+      'trigger'
+    );
+    const active = this.readTrustedRequestEvidence(
+      this.activeFile,
+      this.rootUid,
+      0o644,
+      'active state'
+    );
+    const receiptPath = `${this.stateDir}/${requestId}.receipt`;
+    const receipt = this.readTrustedReceipt(receiptPath, requestId);
+    const matchingTrigger = trigger?.requestId === requestId ? trigger : null;
+    const matchingActive = active?.requestId === requestId ? active : null;
+    const requestEvidence = matchingTrigger ?? matchingActive;
+
+    if (matchingTrigger && matchingActive && !sameRequestIdentity(matchingTrigger, matchingActive)) {
+      throw new SelfUpdateRailError(
+        'SELF_UPDATE_EVIDENCE_CONFLICT',
+        'Agent update trigger and active state identities conflict'
+      );
+    }
+    if (receipt && requestEvidence) {
+      const receiptRequest: SelfUpdateRequestEvidence = {
+        requestId: receipt.terminal.requestId,
+        currentVersion: receipt.terminal.previousVersion,
+        targetVersion: receipt.terminal.targetVersion,
+        channel: receipt.terminal.channel,
+        requestedAt: receipt.terminal.requestedAt,
+      };
+      if (!sameRequestIdentity(requestEvidence, receiptRequest)) {
+        throw new SelfUpdateRailError(
+          'SELF_UPDATE_EVIDENCE_CONFLICT',
+          'Agent update request and receipt identities conflict'
+        );
+      }
+    }
+
+    if (receipt?.committing) {
+      return pendingFromEvidence({
+        requestId: receipt.terminal.requestId,
+        currentVersion: receipt.terminal.previousVersion,
+        targetVersion: receipt.terminal.targetVersion,
+        channel: receipt.terminal.channel,
+        requestedAt: receipt.terminal.requestedAt,
+      });
+    }
+    if (requestEvidence) return pendingFromEvidence(requestEvidence);
+    return receipt?.terminal ?? null;
+  }
+
+  /**
    * Trigger an immediate update (bypasses staged rollout).
    * Returns update result with version info.
    *
@@ -163,8 +595,18 @@ export class NpmAutoUpdateService {
     newVersion: string;
     willRestart: boolean;
     message: string;
-  }> {
+  } | SelfUpdatePendingStatus> {
+    // Every unprivileged/root-helper entry point uses the same durable rail.
+    // WebSocket callers receive admission/poll metadata, never a false install
+    // success before the helper receipt and cleanup exist.
     const force = opts?.force ?? false;
+    if (!this.isRoot()) {
+      throw new SelfUpdateRailError(
+        'EXACT_SELF_UPDATE_REQUEST_REQUIRED',
+        'Non-root Agent updates require caller-supplied requestId/current/target via requestUpdate()',
+        400
+      );
+    }
     const info = await this.checkForUpdates();
 
     // Without an available update we normally no-op. A forced trigger skips this
@@ -204,10 +646,10 @@ export class NpmAutoUpdateService {
       }
 
       try {
-        const restartHandledExternally = await this.performUpdate(targetVersion);
+        const restartHandledExternally = await this.performUpdate(targetVersion, info.current);
 
         // When the install was delegated to the root-owned updater unit, the
-        // unit installs AND restarts the agent (ExecStartPost try-restart). We
+        // validated wrapper installs AND restarts the agent. We
         // must NOT also verify (the agent is about to be restarted from under
         // us, so verify can't confirm) or self-restart (avoid a double restart).
         // Report willRestart and return.
@@ -291,6 +733,33 @@ export class NpmAutoUpdateService {
         }
       }
 
+      if (!this.isRoot()) {
+        const accepted = await this.admitResolvedUpdate(randomUUID(), info.current, info.latest);
+        if (accepted.status !== 'pending') {
+          logger.info(
+            {
+              status: accepted.status,
+              requestId: accepted.requestId,
+              previousVersion: accepted.previousVersion,
+              targetVersion: accepted.targetVersion,
+              finishedAt: accepted.finishedAt,
+            },
+            'Periodic Agent update replayed a durable terminal receipt'
+          );
+          return;
+        }
+        logger.info(
+          {
+            requestId: accepted.requestId,
+            previousVersion: accepted.previousVersion,
+            targetVersion: accepted.targetVersion,
+            pollPath: accepted.pollPath,
+          },
+          'Periodic Agent update accepted by durable root-owned rail'
+        );
+        return;
+      }
+
       // Acquire lock (prevents multiple agents updating simultaneously)
       if (!this.acquireLock()) {
         logger.info('Another agent is updating, skipping');
@@ -304,9 +773,9 @@ export class NpmAutoUpdateService {
         // Perform the update. Returns true when delegated to the root-owned
         // updater unit (non-root + unit present), false for the in-process
         // install paths (root, or the sudo-npm fallback).
-        const restartHandledExternally = await this.performUpdate(info.latest);
+        const restartHandledExternally = await this.performUpdate(info.latest, previousVersion);
 
-        // Delegated to the root-owned updater unit: it installs AND restarts
+        // Delegated to the root-owned updater unit: its wrapper installs AND restarts
         // the agent outside the sandbox. Skip our own verify/health-check/
         // rollback/restart — they would race the unit's restart, and a rollback
         // can't run as the unprivileged agent anyway.
@@ -432,28 +901,36 @@ export class NpmAutoUpdateService {
     try {
       // Check for existing lock file
       if (existsSync(LOCK_FILE)) {
-        // Check if lock is stale (> 10 minutes old)
-        const stat = statSync(LOCK_FILE);
-        const age = Date.now() - stat.mtimeMs;
-
-        if (age < LOCK_STALE_MS) {
-          const pid = readFileSync(LOCK_FILE, 'utf-8').trim();
-          logger.debug({ pid, age: Math.round(age / 1000) }, 'Lock file exists');
+        const pidText = readFileSync(LOCK_FILE, 'utf-8').trim();
+        if (!/^[1-9][0-9]*$/.test(pidText)) {
+          logger.error({ lockFile: LOCK_FILE }, 'Invalid self-update lock owner; failing closed');
           return false;
         }
-
-        logger.warn({ age: Math.round(age / 1000) }, 'Stale lock file detected, removing');
+        const ownerPid = Number(pidText);
         try {
-          unlinkSync(LOCK_FILE);
-        } catch {
-          // Race condition - another process may have removed it
+          process.kill(ownerPid, 0);
+          logger.debug({ ownerPid }, 'Self-update lock owner is alive');
+          return false;
+        } catch (err) {
+          const error = err as NodeJS.ErrnoException;
+          if (error.code !== 'ESRCH') {
+            logger.error({ err, ownerPid }, 'Could not prove self-update lock owner is dead');
+            return false;
+          }
         }
+        logger.warn({ ownerPid }, 'Dead self-update lock owner detected; recovering lock');
+        unlinkSync(LOCK_FILE);
       }
 
       // Atomic lock acquisition using O_EXCL (fails if file exists)
-      const fd = openSync(LOCK_FILE, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
+      const fd = openSync(
+        LOCK_FILE,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+        0o600
+      );
       try {
-        writeSync(fd, String(process.pid));
+        writeFileSync(fd, String(process.pid), { encoding: 'utf8' });
+        fsyncSync(fd);
       } finally {
         closeSync(fd);
       }
@@ -469,9 +946,11 @@ export class NpmAutoUpdateService {
         return false;
       }
 
-      // Can't write to /var/run - might not be running as root
-      logger.debug({ err }, 'Could not acquire lock file (non-root?)');
-      return true; // Allow update anyway
+      // The RuntimeDirectory is provisioned for the service user. Any other
+      // error (notably EACCES) means mutual exclusion cannot be proven, so the
+      // update must fail closed.
+      logger.error({ err, lockFile: LOCK_FILE }, 'Could not acquire self-update lock');
+      return false;
     }
   }
 
@@ -503,6 +982,184 @@ export class NpmAutoUpdateService {
     return process.getuid?.() === 0;
   }
 
+  private validateEvidenceParent(file: string, ownerUid: number): void {
+    const parent = lstatSync(dirname(file));
+    if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== ownerUid
+      || (parent.mode & 0o022) !== 0) {
+      throw new SelfUpdateRailError(
+        'UNTRUSTED_SELF_UPDATE_EVIDENCE',
+        `Untrusted Agent update evidence directory: ${dirname(file)}`
+      );
+    }
+  }
+
+  private readTrustedRequestEvidence(
+    file: string,
+    ownerUid: number,
+    mode: number,
+    label: string
+  ): SelfUpdateRequestEvidence | null {
+    try {
+      this.validateEvidenceParent(file, ownerUid);
+      const before = lstatSync(file);
+      if (!before.isFile() || before.isSymbolicLink() || before.uid !== ownerUid
+        || (before.mode & 0o777) !== mode || before.nlink < 1 || before.nlink > 2
+        || before.size < 1 || before.size > 512 || !constants.O_NOFOLLOW) {
+        throw new SelfUpdateRailError(
+          'UNTRUSTED_SELF_UPDATE_EVIDENCE',
+          `Untrusted Agent update ${label}: ${file}`
+        );
+      }
+      const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+      let content: string;
+      try {
+        const opened = fstatSync(fd);
+        if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino
+          || opened.uid !== before.uid || (opened.mode & 0o777) !== mode
+          || opened.nlink !== before.nlink || opened.size !== before.size) {
+          throw new SelfUpdateRailError(
+            'UNTRUSTED_SELF_UPDATE_EVIDENCE',
+            `Agent update ${label} changed during trusted read`
+          );
+        }
+        content = readFileSync(fd, 'utf8');
+      } finally {
+        closeSync(fd);
+      }
+      if (!content.endsWith('\n') || content.slice(0, -1).includes('\n') || content.includes('\r')) {
+        throw new SelfUpdateRailError(
+          'INVALID_SELF_UPDATE_EVIDENCE',
+          `Invalid Agent update ${label} framing`
+        );
+      }
+      const fields = content.slice(0, -1).split(' ');
+      if (fields.length !== 6) {
+        throw new SelfUpdateRailError(
+          'INVALID_SELF_UPDATE_EVIDENCE',
+          `Invalid Agent update ${label} schema`
+        );
+      }
+      const [schema, requestId, currentVersion, targetVersion, channel, requestedAt] = fields;
+      if (schema !== 'v1' || !UUID_V4_RE.test(requestId)
+        || semver.valid(currentVersion) !== currentVersion
+        || semver.valid(targetVersion) !== targetVersion
+        || !SELF_UPDATE_CHANNELS.has(channel) || !isExactIsoTimestamp(requestedAt)) {
+        throw new SelfUpdateRailError(
+          'INVALID_SELF_UPDATE_EVIDENCE',
+          `Invalid Agent update ${label} identity`
+        );
+      }
+      return { requestId, currentVersion, targetVersion, channel, requestedAt };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      if (err instanceof SelfUpdateRailError) throw err;
+      throw new SelfUpdateRailError(
+        'UNTRUSTED_SELF_UPDATE_EVIDENCE',
+        `Could not inspect Agent update ${label}: ${file}`
+      );
+    }
+  }
+
+  private readTrustedReceipt(
+    file: string,
+    requestId: string
+  ): SelfUpdateReceiptEvidence | null {
+    try {
+      this.validateEvidenceParent(file, this.rootUid);
+      const before = lstatSync(file);
+      if (!before.isFile() || before.isSymbolicLink() || before.uid !== this.rootUid
+        || (before.mode & 0o777) !== 0o644 || before.size < 1 || before.size > 2048
+        || before.nlink < 1 || before.nlink > 2) {
+        throw new SelfUpdateRailError(
+          'UNTRUSTED_SELF_UPDATE_RECEIPT',
+          'Untrusted Agent update receipt inode'
+        );
+      }
+      // The root helper may have committed the final hardlink but not yet
+      // removed its private temp name. The unprivileged Agent never repairs or
+      // unlinks root evidence; it reports this crash window as pending.
+      if (!constants.O_NOFOLLOW) {
+        throw new SelfUpdateRailError(
+          'UNTRUSTED_SELF_UPDATE_RECEIPT',
+          'Secure Agent update receipt reads require O_NOFOLLOW support'
+        );
+      }
+
+      const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+      let content: string;
+      try {
+        const opened = fstatSync(fd);
+        if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino
+          || opened.uid !== before.uid || (opened.mode & 0o777) !== 0o644
+          || opened.nlink !== before.nlink || opened.size !== before.size) {
+          throw new SelfUpdateRailError(
+            'UNTRUSTED_SELF_UPDATE_RECEIPT',
+            'Agent update receipt changed during trusted read'
+          );
+        }
+        content = readFileSync(fd, 'utf8');
+      } finally {
+        closeSync(fd);
+      }
+
+      if (!content.endsWith('\n') || content.slice(0, -1).includes('\n') || content.includes('\r')) {
+        throw new SelfUpdateRailError(
+          'INVALID_SELF_UPDATE_RECEIPT',
+          'Invalid Agent update receipt framing'
+        );
+      }
+      const fields = content.slice(0, -1).split(' ');
+      if (fields.length !== 12 || fields.some((field) => field.length === 0)) {
+        throw new SelfUpdateRailError(
+          'INVALID_SELF_UPDATE_RECEIPT',
+          'Invalid Agent update receipt schema'
+        );
+      }
+      const [schema, id, packageName, channel, previousVersion, targetVersion,
+        installed, terminal, requestedAt, startedAt, finishedAt, reason] = fields;
+      const installedValid = installed === 'none' || semver.valid(installed) === installed;
+      if (schema !== 'v1' || id !== requestId || packageName !== PACKAGE_NAME
+        || !SELF_UPDATE_CHANNELS.has(channel) || semver.valid(previousVersion) !== previousVersion
+        || semver.valid(targetVersion) !== targetVersion || !installedValid
+        || (terminal !== 'success' && terminal !== 'failure')
+        || (terminal === 'success' && installed !== targetVersion)
+        || !isExactIsoTimestamp(requestedAt) || !isExactIsoTimestamp(startedAt)
+        || !isExactIsoTimestamp(finishedAt)
+        || Date.parse(startedAt) < Date.parse(requestedAt)
+        || Date.parse(finishedAt) < Date.parse(startedAt)
+        || !/^[a-z][a-z0-9_]{1,63}$/.test(reason)) {
+        throw new SelfUpdateRailError(
+          'INVALID_SELF_UPDATE_RECEIPT',
+          'Agent update receipt identity or terminal data is invalid'
+        );
+      }
+
+      return {
+        committing: before.nlink === 2,
+        terminal: {
+          status: terminal === 'success' ? 'succeeded' : 'failed',
+          requestId,
+          package: PACKAGE_NAME,
+          channel,
+          previousVersion,
+          targetVersion,
+          installedVersion: installed === 'none' ? null : installed,
+          requestedAt,
+          startedAt,
+          finishedAt,
+          reason,
+        },
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      if (err instanceof SelfUpdateRailError) throw err;
+      throw new SelfUpdateRailError(
+        'UNTRUSTED_SELF_UPDATE_RECEIPT',
+        'Could not read trusted Agent update receipt'
+      );
+    }
+  }
+
   /**
    * Get the sudo prefix if running as non-root.
    * Returns 'sudo ' for non-root users, empty string for root.
@@ -511,13 +1168,14 @@ export class NpmAutoUpdateService {
     return this.isRoot() ? '' : 'sudo ';
   }
 
-  /**
-   * Detect whether the root-owned updater `.path` unit is installed (the
-   * sudo-free trigger mechanism). Mirrors hasUpdaterUnit().
-   */
-  private async hasUpdaterPathUnit(): Promise<boolean> {
+  /** Require the root-owned path watcher to be actively consuming triggers. */
+  private async isUpdaterPathUnitActive(): Promise<boolean> {
     try {
-      await execAsync(`systemctl cat ${UPDATER_PATH_UNIT}`, { timeout: 10_000 });
+      await execFileAsync(
+        SYSTEMCTL_BIN,
+        ['is-active', '--quiet', UPDATER_PATH_UNIT],
+        { timeout: 10_000 }
+      );
       return true;
     } catch {
       return false;
@@ -530,14 +1188,43 @@ export class NpmAutoUpdateService {
    * trigger and installs the target. The agent only ever CREATES the trigger;
    * the root wrapper is the sole deleter.
    */
-  private async installViaTriggerFile(targetVersion: string): Promise<void> {
+  private async installViaTriggerFile(
+    requestId: string,
+    targetVersion: string,
+    currentVersion: string
+  ): Promise<{
+    requestId: string;
+    currentVersion: string;
+    targetVersion: string;
+    channel: string;
+    requestedAt: string;
+  }> {
     const channel = this.config.channel;
-    const line = `${targetVersion} ${channel}\n`;
-    logger.info({ trigger: TRIGGER_FILE, targetVersion, channel }, 'Writing self-update trigger file');
-    // Atomic create: write tmp then rename, so .path sees a complete value.
-    await writeFile(TRIGGER_TMP_FILE, line, { mode: 0o644 });
-    await rename(TRIGGER_TMP_FILE, TRIGGER_FILE);
-    logger.info({ trigger: TRIGGER_FILE }, 'Trigger written; updater .path will install + restart the agent');
+    if (!SELF_UPDATE_CHANNELS.has(channel)) {
+      throw new Error(`Unsupported self-update channel: ${channel}`);
+    }
+    if (semver.valid(currentVersion) !== currentVersion) {
+      throw new Error(`Invalid current self-update version: ${currentVersion}`);
+    }
+    if (semver.valid(targetVersion) !== targetVersion) {
+      throw new Error(`Invalid target self-update version: ${targetVersion}`);
+    }
+
+    if (!UUID_V4_RE.test(requestId)) {
+      throw new Error('Invalid self-update requestId');
+    }
+    const requestedAt = new Date().toISOString();
+    const line = `v1 ${requestId} ${currentVersion} ${targetVersion} ${channel} ${requestedAt}\n`;
+    logger.info(
+      { trigger: this.triggerFile, requestId, currentVersion, targetVersion, channel },
+      'Publishing self-update trigger file'
+    );
+    publishSelfUpdateTriggerAtomically(this.triggerFile, line);
+    logger.info(
+      { trigger: this.triggerFile, requestId },
+      'Trigger published; updater .path will install + restart the agent'
+    );
+    return { requestId, currentVersion, targetVersion, channel, requestedAt };
   }
 
   /**
@@ -563,9 +1250,10 @@ export class NpmAutoUpdateService {
    * `systemctl start` is denied by polkit ("Interactive authentication
    * required"), but the provisioned sudoers rule permits exactly:
    *   `sudo /usr/bin/systemctl start zn-vault-agent-updater.service`
-   * (NOPASSWD). The oneshot unit runs `npm install -g <package>@latest` and
-   * then `systemctl try-restart zn-vault-agent` (ExecStartPost) as root, in its
-   * OWN namespace where /usr/bin is writable. Because the unit already restarts
+   * (NOPASSWD). The oneshot's root wrapper validates the durable trigger, runs
+   * `npm install -g -- <package>@<exact-target>`, verifies readback, persists a
+   * receipt, and invokes `systemctl try-restart zn-vault-agent` as root in its
+   * OWN namespace where /usr/bin is writable. Because the wrapper already restarts
    * the agent, callers MUST NOT also self-restart (see performUpdate's return
    * contract).
    *
@@ -573,10 +1261,8 @@ export class NpmAutoUpdateService {
    * non-root agent; this is the only privilege path used here. The absolute
    * systemctl path is required so it matches the sudoers rule exactly.
    *
-   * NOTE: the unit installs `@latest`, not the resolved target version. That is
-   * acceptable for operator-initiated updates today. Follow-up: parameterize
-   * the unit with the target version so forced/targeted versions are honored
-   * end-to-end.
+   * The exact target is carried only in the immutable trigger; it is never
+   * interpolated into this systemctl command.
    */
   private async installViaUpdaterUnit(): Promise<void> {
     const startCmd = `${this.getSudoPrefix()}${SYSTEMCTL_BIN} start ${UPDATER_UNIT}`;
@@ -615,11 +1301,12 @@ export class NpmAutoUpdateService {
    * root-owned updater unit, which runs in its OWN clean namespace.
    *
    * Strategy:
-   * - **root** → `npm install -g <package>@<tag>` directly (no sudo). Root is
+   * - **root** → `npm install -g <package>@<exact-target>` directly (no sudo). Root is
    *   not sandboxed the same way, and the caller still verifies + restarts.
    * - **non-root + updater unit present** → `sudo /usr/bin/systemctl start
-   *   <unit>` (permitted by the provisioned sudoers rule). The unit installs +
-   *   restarts the agent outside the sandbox, so this returns `true` (restart
+   *   <unit>` (permitted by the provisioned sudoers rule) after publishing the
+   *   exact trigger. The wrapper installs + restarts outside the sandbox, so
+   *   this returns `true` (restart
    *   handled externally) and the caller MUST NOT self-verify/self-restart
    *   (avoids a double restart, which would kill the agent mid-verify).
    * - **non-root + no updater unit** → best-effort `sudo npm install -g`. This
@@ -627,18 +1314,21 @@ export class NpmAutoUpdateService {
    *   hosts where there is no `ProtectSystem`. Caller keeps verify + restart.
    *
    * @returns `restartHandledExternally` — `true` when the updater unit was used
-   *   (the unit's ExecStartPost restarts the agent), `false` for the root and
+   *   (the unit's wrapper restarts the agent), `false` for the root and
    *   sudo-npm fallback paths (caller verifies the install and triggers restart).
    */
-  private async performUpdate(targetVersion: string): Promise<boolean> {
+  private async performUpdate(
+    targetVersion: string,
+    currentVersion: string = this.getCurrentVersion()
+  ): Promise<boolean> {
     // Non-root + .path unit present → sudo-free file trigger (preferred).
-    if (!this.isRoot() && (await this.hasUpdaterPathUnit())) {
+    if (!this.isRoot() && (await this.isUpdaterPathUnitActive())) {
       logger.info(
         { package: PACKAGE_NAME, targetVersion, strategy: 'trigger-file' },
         'Installing update via updater .path trigger file'
       );
       await this.clearNpmCache();
-      await this.installViaTriggerFile(targetVersion);
+      await this.installViaTriggerFile(randomUUID(), targetVersion, currentVersion);
       return true; // The oneshot restarts the agent; caller must not double-restart.
     }
 
@@ -649,6 +1339,7 @@ export class NpmAutoUpdateService {
         'Installing update via root-owned updater unit'
       );
       await this.clearNpmCache();
+      await this.installViaTriggerFile(randomUUID(), targetVersion, currentVersion);
       await this.installViaUpdaterUnit();
       return true;
     }
@@ -664,12 +1355,11 @@ export class NpmAutoUpdateService {
    * Used by the root path and the non-root/no-unit best-effort fallback.
    */
   private async performNpmInstall(targetVersion: string): Promise<void> {
-    const tag = this.config.channel;
     const maxRetries = 2;
     const sudoPrefix = this.getSudoPrefix();
 
     logger.info(
-      { package: PACKAGE_NAME, channel: tag, targetVersion, usingSudo: !this.isRoot() },
+      { package: PACKAGE_NAME, channel: this.config.channel, targetVersion, usingSudo: !this.isRoot() },
       'Installing update via npm'
     );
 
@@ -678,7 +1368,7 @@ export class NpmAutoUpdateService {
 
     // Step 2: Perform install with retries
     let lastError: Error | null = null;
-    const installCmd = `${sudoPrefix}npm install -g ${PACKAGE_NAME}@${tag}`;
+    const installCmd = `${sudoPrefix}npm install -g ${PACKAGE_NAME}@${targetVersion}`;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
@@ -917,7 +1607,10 @@ export function loadUpdateConfig(): UpdateConfig {
   const config: UpdateConfig = { ...DEFAULT_UPDATE_CONFIG };
 
   // Check for environment overrides
-  if (process.env.AUTO_UPDATE === 'false' || process.env.AUTO_UPDATE === '0') {
+  const autoUpdate = process.env.AUTO_UPDATE?.trim().toLowerCase();
+  if (autoUpdate === 'true' || autoUpdate === '1') {
+    config.enabled = true;
+  } else if (autoUpdate === 'false' || autoUpdate === '0') {
     config.enabled = false;
   }
 
@@ -930,7 +1623,7 @@ export function loadUpdateConfig(): UpdateConfig {
 
   if (process.env.AUTO_UPDATE_CHANNEL) {
     const channel = process.env.AUTO_UPDATE_CHANNEL.toLowerCase();
-    if (channel === 'latest' || channel === 'beta' || channel === 'next') {
+    if (channel === 'latest' || channel === 'beta' || channel === 'next' || channel === 'dr-m4') {
       config.channel = channel;
     }
   }

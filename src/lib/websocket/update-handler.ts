@@ -5,14 +5,15 @@
 // message when an operator triggers an update from the dashboard or CLI. The
 // dispatcher turns that into an AgentUpdateEvent and fires the registered
 // `update` handlers (see dispatcher.handleUpdateAvailable). This module is the
-// final connection: it drives the manual, gate-bypassing update path
-// (NpmAutoUpdateService.triggerUpdate), which works even when the automatic
+// final connection: it drives the durable manual update rail
+// (NpmAutoUpdateService.requestUpdate), which works even when the automatic
 // periodic checker is disabled (AUTO_UPDATE=false is the production default).
 //
 // Extracted into its own module so it can be unit-tested without standing up
 // the whole daemon (websocket.ts pulls in a large dependency graph).
 
 import { wsLogger as log } from '../logger.js';
+import { randomUUID } from 'node:crypto';
 import type { AgentUpdateEvent } from './types.js';
 import type { NpmAutoUpdateService } from '../../services/npm-auto-update.js';
 
@@ -20,9 +21,9 @@ import type { NpmAutoUpdateService } from '../../services/npm-auto-update.js';
  * Act on an operator-initiated update-available event.
  *
  * Logs receipt, then — if an npm auto-update service is available — invokes the
- * manual, gate-bypassing `triggerUpdate()` and logs the outcome. When no
+ * manual, gate-bypassing `requestUpdate()` and logs its pending operation. When no
  * service is wired (e.g. the daemon was started without one), logs a clear
- * warning instead. Never throws: errors from `triggerUpdate()` are caught and
+ * warning instead. Never throws: errors from `requestUpdate()` are caught and
  * logged so the WebSocket loop is not disrupted.
  *
  * @param event - The update-available event from the dispatcher.
@@ -51,16 +52,35 @@ export async function handleUpdateEvent(
     // work even when the automatic periodic checker is off (AUTO_UPDATE=false).
     // Thread the operator's `force` flag through so "force update" reinstalls an
     // agent already at latest instead of silently no-opping.
-    const result = await npmAutoUpdateService.triggerUpdate({ force: event.force ?? false });
+    const requestId = randomUUID();
+    const result = await npmAutoUpdateService.requestUpdate({
+      requestId,
+      expectedCurrentVersion: npmAutoUpdateService.getCurrentVersion(),
+      targetVersion: event.version,
+      force: event.force ?? false,
+    });
+    if (result.status !== 'pending') {
+      log.info(
+        {
+          status: result.status,
+          requestId: result.requestId,
+          previousVersion: result.previousVersion,
+          targetVersion: result.targetVersion,
+          finishedAt: result.finishedAt,
+        },
+        'Agent update request replayed a durable terminal receipt'
+      );
+      return;
+    }
     log.info(
       {
-        success: result.success,
+        status: result.status,
+        requestId: result.requestId,
         previousVersion: result.previousVersion,
-        newVersion: result.newVersion,
-        willRestart: result.willRestart,
-        message: result.message,
+        targetVersion: result.targetVersion,
+        pollPath: result.pollPath,
       },
-      'Update trigger completed'
+      'Agent update accepted by durable root-owned rail'
     );
   } catch (err) {
     log.error({ err, version: event.version }, 'Failed to trigger update from update-available event');

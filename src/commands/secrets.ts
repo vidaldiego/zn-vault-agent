@@ -7,7 +7,9 @@ import ora from 'ora';
 import chalk from 'chalk';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { chownSafeAsync } from '../utils/shell.js';
+import { runReloadCommand } from '../utils/reload-command.js';
+import { readTemplateFile } from '../utils/template-file.js';
 import {
   addSecretTarget,
   removeSecretTarget,
@@ -17,6 +19,10 @@ import {
   type SecretTarget,
 } from '../lib/config.js';
 import { listSecrets, getSecret, type DecryptedSecret } from '../lib/api.js';
+import {
+  SHARED_MUTATION_LOCK_PATH,
+  withSharedMutationLock,
+} from '../lib/shared-mutation-lock.js';
 import type {
   SecretsAddCommandOptions,
   SecretsAvailableCommandOptions,
@@ -28,11 +34,11 @@ import type {
 /**
  * Format secret data for output
  */
-function formatSecretData(
+async function formatSecretData(
   secret: DecryptedSecret,
   format: SecretTarget['format'],
   options: { key?: string; envPrefix?: string; templatePath?: string }
-): string {
+): Promise<string> {
   const data = secret.data;
 
   switch (format) {
@@ -87,10 +93,7 @@ function formatSecretData(
       if (!options.templatePath) {
         throw new Error('Template path must be specified for template format');
       }
-      if (!fs.existsSync(options.templatePath)) {
-        throw new Error(`Template file not found: ${options.templatePath}`);
-      }
-      let template = fs.readFileSync(options.templatePath, 'utf-8');
+      let template = await readTemplateFile(options.templatePath);
       // Replace {{ key }} placeholders
       for (const [k, v] of Object.entries(data)) {
         const value = typeof v === 'string' ? v : JSON.stringify(v);
@@ -107,12 +110,12 @@ function formatSecretData(
 /**
  * Write secret to file with proper permissions
  */
-function writeSecretFile(
+async function writeSecretFile(
   filePath: string,
   content: string,
   owner?: string,
   mode?: string
-): void {
+): Promise<void> {
   // Ensure directory exists
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
@@ -126,7 +129,7 @@ function writeSecretFile(
   // Set ownership if specified and running as root
   if (owner && process.getuid?.() === 0) {
     try {
-      execSync(`chown ${owner} "${tempPath}"`, { stdio: 'ignore' });
+      await chownSafeAsync(tempPath, owner);
     } catch {
       // Ignore chown errors
     }
@@ -139,39 +142,43 @@ function writeSecretFile(
 /**
  * Sync a single secret target
  */
-async function syncSecretTarget(target: SecretTarget): Promise<boolean> {
+export async function syncSecretTarget(
+  target: SecretTarget,
+  mutationLockPath = SHARED_MUTATION_LOCK_PATH
+): Promise<boolean> {
   try {
-    const secret = await getSecret(target.secretId);
+    return await withSharedMutationLock('secret-cli', async () => {
+      const secret = await getSecret(target.secretId);
 
-    // Skip file writing for 'none' format (subscribe-only mode)
-    if (target.format !== 'none') {
-      // Format the data
-      const content = formatSecretData(secret, target.format, {
-        key: target.key,
-        envPrefix: target.envPrefix,
-        templatePath: target.templatePath,
-      });
+      // Skip file writing for 'none' format (subscribe-only mode)
+      if (target.format !== 'none') {
+        // Format the data
+        const content = await formatSecretData(secret, target.format, {
+          key: target.key,
+          envPrefix: target.envPrefix,
+          templatePath: target.templatePath,
+        });
 
-      // Write to file
-      if (!target.output) {
-        throw new Error(`Output path required for format '${target.format}'`);
+        // Write to file
+        if (!target.output) {
+          throw new Error(`Output path required for format '${target.format}'`);
+        }
+        await writeSecretFile(target.output, content, target.owner, target.mode);
       }
-      writeSecretFile(target.output, content, target.owner, target.mode);
-    }
 
-    // Update config with new version
-    updateSecretTargetVersion(target.secretId, secret.version);
-
-    // Run reload command if specified
-    if (target.reloadCmd) {
-      try {
-        execSync(target.reloadCmd, { stdio: 'inherit' });
-      } catch (err) {
-        console.error(chalk.yellow(`Warning: Reload command failed: ${err instanceof Error ? err.message : String(err)}`));
+      // Run reload command if specified
+      if (target.reloadCmd) {
+        const reload = await runReloadCommand(target.reloadCmd);
+        if (!reload.success) {
+          throw new Error(`Reload command failed: ${reload.message}`);
+        }
       }
-    }
 
-    return true;
+      // Commit the observed version only after the consumer reload is terminal.
+      updateSecretTargetVersion(target.secretId, secret.version);
+
+      return true;
+    }, mutationLockPath);
   } catch (err) {
     console.error(chalk.red(`Failed to sync ${target.name}:`), err instanceof Error ? err.message : String(err));
     return false;

@@ -18,6 +18,7 @@ import { TEST_ENV, getVaultClient } from '../setup.js';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const testRunId = `${process.pid}-${Date.now()}`;
 
 // Mock plugin for testing
 const MOCK_PLUGIN_CODE = `
@@ -102,8 +103,8 @@ describe('Plugin System', () => {
 
     // Create test API key
     testApiKey = await vault.createApiKey({
-      name: 'plugin-test-key',
-      expiresInDays: 1,
+      name: `plugin-test-key-${testRunId}`,
+      expiresInDays: 90,
       permissions: [
         'certificate:read:metadata',
         'certificate:read:value',
@@ -170,10 +171,13 @@ describe('Plugin System', () => {
       });
 
       daemon = await agent.startDaemon({ healthPort: 0 });
+      await daemon.waitForReady();
       const healthPort = daemon.healthPort!;
 
       // Check plugin routes are registered
-      const response = await fetch(`http://localhost:${healthPort}/plugins/mock-plugin/status`);
+      const response = await fetch(`http://localhost:${healthPort}/plugins/mock-plugin/status`, {
+        headers: agent.getControlPlaneHeaders(),
+      });
       expect(response.status).toBe(200);
 
       const data = await response.json() as { initialized: boolean; started: boolean; config: { testValue: string } };
@@ -191,6 +195,7 @@ describe('Plugin System', () => {
       });
 
       daemon = await agent.startDaemon({ healthPort: 0 });
+      await daemon.waitForReady();
       const healthPort = daemon.healthPort!;
 
       const response = await fetch(`http://localhost:${healthPort}/health`);
@@ -213,16 +218,30 @@ describe('Plugin System', () => {
         }],
       });
 
-      // Agent should still start, but plugin should be in error state
+      // The listener must start, while health fails closed for a plugin init
+      // failure. Do not use waitForReady(): readiness is intentionally 503.
       daemon = await agent.startDaemon({ healthPort: 0 });
       const healthPort = daemon.healthPort!;
 
-      // Health endpoint should still work
-      const response = await fetch(`http://localhost:${healthPort}/health`);
-      expect(response.status).toBe(200);
+      let response: Response | undefined;
+      for (let attempt = 0; attempt < 120; attempt++) {
+        try {
+          const candidate = await fetch(`http://localhost:${healthPort}/health`);
+          if (candidate.status === 503) {
+            response = candidate;
+            break;
+          }
+        } catch {
+          // Listener is not accepting connections yet.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      expect(response?.status).toBe(503);
 
       // Plugin routes may not be registered due to init failure
-      const pluginResponse = await fetch(`http://localhost:${healthPort}/plugins/mock-plugin/status`);
+      const pluginResponse = await fetch(`http://localhost:${healthPort}/plugins/mock-plugin/status`, {
+        headers: agent.getControlPlaneHeaders(),
+      });
       // Could be 404 or error depending on implementation
       expect([200, 404, 500]).toContain(pluginResponse.status);
     });
@@ -245,9 +264,12 @@ describe('Plugin System', () => {
       });
 
       daemon = await agent.startDaemon({ healthPort: 0 });
+      await daemon.waitForReady();
       const healthPort = daemon.healthPort!;
 
-      const response = await fetch(`http://localhost:${healthPort}/plugins/payara/status`);
+      const response = await fetch(`http://localhost:${healthPort}/plugins/payara/status`, {
+        headers: agent.getControlPlaneHeaders(),
+      });
       expect(response.status).toBe(200);
     });
   });
@@ -268,9 +290,12 @@ describe('Plugin System', () => {
       });
 
       daemon = await agent.startDaemon({ healthPort: 0 });
+      await daemon.waitForReady();
       const healthPort = daemon.healthPort!;
 
-      const response = await fetch(`http://localhost:${healthPort}/plugins/mock-plugin/status`);
+      const response = await fetch(`http://localhost:${healthPort}/plugins/mock-plugin/status`, {
+        headers: agent.getControlPlaneHeaders(),
+      });
       expect(response.status).toBe(200);
     });
 
@@ -280,11 +305,15 @@ describe('Plugin System', () => {
       });
 
       daemon = await agent.startDaemon({ healthPort: 0 });
+      await daemon.waitForReady();
       const healthPort = daemon.healthPort!;
 
       const response = await fetch(`http://localhost:${healthPort}/plugins/mock-plugin/echo`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          ...agent.getControlPlaneHeaders(),
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({ message: 'hello' }),
       });
 
@@ -299,9 +328,12 @@ describe('Plugin System', () => {
       });
 
       daemon = await agent.startDaemon({ healthPort: 0 });
+      await daemon.waitForReady();
       const healthPort = daemon.healthPort!;
 
-      const response = await fetch(`http://localhost:${healthPort}/plugins/mock-plugin/context`);
+      const response = await fetch(`http://localhost:${healthPort}/plugins/mock-plugin/context`, {
+        headers: agent.getControlPlaneHeaders(),
+      });
       expect(response.status).toBe(200);
 
       const data = await response.json() as { vaultUrl: string; tenantId: string };

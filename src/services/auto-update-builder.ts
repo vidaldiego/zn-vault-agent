@@ -35,9 +35,13 @@ export interface AutoUpdateServiceBuildResult {
 export function buildAutoUpdateService(
   updateConfig: Partial<UpdateConfig>,
   enabled: boolean,
+  recoveryOnly = false,
 ): AutoUpdateServiceBuildResult {
   const service = new NpmAutoUpdateService(updateConfig);
-  if (enabled) {
+  // Legacy Payara recovery must expose only health and the exact Payara
+  // updater. Fence the Agent updater before its first timer is created so an
+  // already-detected recovery process can never race an npm mutation.
+  if (enabled && !recoveryOnly) {
     service.start();
     return { service, started: true };
   }

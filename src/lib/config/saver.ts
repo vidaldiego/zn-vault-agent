@@ -45,15 +45,17 @@ export function saveConfig(config: AgentConfig): void {
       log.debug({ path: configFile }, 'Config saved (system config)');
       return;
     } catch {
-      // File exists but not writable, fall through to user config.
-      // WARN (not debug): this creates a split-brain where saves land in the
-      // user config but loadConfig() keeps reading the read-only system
-      // config with precedence - saved values are silently ignored on the
-      // next load (INC-2026-06-12-01).
-      log.warn({
+      // A system installation must never fall back to a different per-user
+      // store: loadConfig() gives the system file precedence, so the command
+      // would report success while systemd keeps using stale values.
+      log.error({
         systemConfigPath: configFile,
         userConfigPath: userConfig.path,
-      }, 'System config not writable - saving to user config instead. The read-only system config will keep shadowing these values on load.');
+      }, 'System config is not writable by this user');
+      throw new Error(
+        `System config is not writable: ${configFile}. `
+        + 'Run the command as the zn-vault-agent service user.'
+      );
     }
   }
 

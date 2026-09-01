@@ -26,6 +26,9 @@ npm-debug.log*
 # Test coverage
 coverage/
 
+# Integration harness state (contains short-lived test credentials)
+/test/.test-config/
+
 # Temp files
 *.tmp
 *.temp

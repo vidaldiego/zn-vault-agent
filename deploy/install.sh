@@ -42,13 +42,12 @@ check_root() {
 check_node() {
     if ! command -v node &> /dev/null; then
         log_error "Node.js is required but not installed"
-        log_info "Install Node.js 18+ and try again"
+        log_info "Install Node.js 22.13.0+ and try again"
         exit 1
     fi
 
-    NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
-    if [ "$NODE_VERSION" -lt 18 ]; then
-        log_error "Node.js 18+ is required (found v$NODE_VERSION)"
+    if ! node -e 'const [a,b,c]=process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && (b > 13 || (b === 13 && c >= 0))) ? 0 : 1)'; then
+        log_error "Node.js 22.13.0+ is required (found $(node -v))"
         exit 1
     fi
 
@@ -65,7 +64,13 @@ uninstall() {
         # Manual cleanup
         systemctl stop zn-vault-agent.service 2>/dev/null || true
         systemctl disable zn-vault-agent.service 2>/dev/null || true
+        systemctl stop zn-vault-agent-plugin-updater.path 2>/dev/null || true
+        systemctl disable zn-vault-agent-plugin-updater.path 2>/dev/null || true
+        systemctl stop zn-vault-agent-plugin-updater.service 2>/dev/null || true
         rm -f /etc/systemd/system/zn-vault-agent.service
+        rm -f /etc/systemd/system/zn-vault-agent-plugin-updater.service
+        rm -f /etc/systemd/system/zn-vault-agent-plugin-updater.path
+        rm -f /usr/local/lib/zn-vault-agent/zn-vault-plugin-update.sh
         systemctl daemon-reload
     fi
 
@@ -141,7 +146,7 @@ log_info ""
 log_info "Installation complete!"
 log_info ""
 log_info "Next steps:"
-echo "  1. Configure: zn-vault-agent login"
-echo "  2. Add certs: zn-vault-agent certs add"
+echo "  1. Configure: sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent zn-vault-agent login"
+echo "  2. Add certs: sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent zn-vault-agent certs add"
 echo "  3. Start:     sudo systemctl start zn-vault-agent"
 echo "  4. Status:    sudo systemctl status zn-vault-agent"

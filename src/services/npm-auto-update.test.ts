@@ -6,6 +6,7 @@ import { NpmAutoUpdateService, loadUpdateConfig } from './npm-auto-update.js';
 // Mock child_process
 vi.mock('child_process', () => ({
   exec: vi.fn(),
+  execFile: vi.fn(),
   spawn: vi.fn(),
 }));
 
@@ -14,21 +15,23 @@ vi.mock('fs', () => ({
   existsSync: vi.fn(),
   unlinkSync: vi.fn(),
   readFileSync: vi.fn(),
-  statSync: vi.fn(),
   openSync: vi.fn(),
   writeSync: vi.fn(),
+  writeFileSync: vi.fn(),
+  fchmodSync: vi.fn(),
+  fsyncSync: vi.fn(),
+  linkSync: vi.fn(),
+  lstatSync: vi.fn(),
+  fstatSync: vi.fn(),
   closeSync: vi.fn(),
   constants: {
+    O_RDONLY: 0,
     O_WRONLY: 1,
     O_CREAT: 64,
     O_EXCL: 128,
+    O_DIRECTORY: 0x100000,
+    O_NOFOLLOW: 0x20000,
   },
-}));
-
-// Mock fs/promises (for trigger-file writes in the .path strategy)
-vi.mock('fs/promises', () => ({
-  writeFile: vi.fn().mockResolvedValue(undefined),
-  rename: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Mock logger
@@ -42,9 +45,18 @@ vi.mock('../lib/logger.js', () => ({
   flushLogs: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { exec, spawn } from 'child_process';
-import { existsSync, unlinkSync, readFileSync, statSync, openSync } from 'fs';
-import { writeFile as fspWriteFile, rename as fspRename } from 'fs/promises';
+import { exec, execFile, spawn } from 'child_process';
+import {
+  existsSync,
+  unlinkSync,
+  readFileSync,
+  openSync,
+  writeFileSync,
+  fsyncSync,
+  fstatSync,
+  linkSync,
+  lstatSync,
+} from 'fs';
 import type { ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 
@@ -85,6 +97,29 @@ describe('NpmAutoUpdateService', () => {
 
     // Default: openSync succeeds (returns fd)
     vi.mocked(openSync).mockReturnValue(10);
+    vi.mocked(fstatSync).mockReturnValue({
+      isFile: () => true,
+      dev: 1,
+      ino: 1,
+      uid: 0,
+      mode: 0o100600,
+      nlink: 1,
+      size: 0,
+    } as ReturnType<typeof fstatSync>);
+
+    // Default: the root-owned path watcher is not active. Focused rail tests
+    // opt into an active unit explicitly.
+    vi.mocked(execFile).mockImplementation((
+      _file: unknown,
+      _args: unknown,
+      opts: unknown,
+      callback?: unknown
+    ) => {
+      const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+      const error = Object.assign(new Error('inactive'), { code: 'ENOENT' });
+      cb(error, { stdout: '', stderr: '' });
+      return {} as ReturnType<typeof execFile>;
+    });
 
     // Default: spawn returns a mock child that exits successfully
     vi.mocked(spawn).mockImplementation(() => {
@@ -329,7 +364,9 @@ describe('NpmAutoUpdateService', () => {
 
       // Mock existsSync to return true for binary path check
       vi.mocked(existsSync).mockImplementation((path: unknown) => {
-        return String(path).includes('zn-vault-agent');
+        const value = String(path);
+        if (value.includes('.self-update.lock')) return false;
+        return value.includes('zn-vault-agent');
       });
 
       const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
@@ -381,7 +418,9 @@ describe('NpmAutoUpdateService', () => {
       });
 
       vi.mocked(existsSync).mockImplementation((path: unknown) => {
-        return String(path).includes('zn-vault-agent');
+        const value = String(path);
+        if (value.includes('.self-update.lock')) return false;
+        return value.includes('zn-vault-agent');
       });
 
       const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
@@ -441,26 +480,24 @@ describe('NpmAutoUpdateService', () => {
 
       // Should have used openSync with O_EXCL flags for atomic lock
       expect(openSync).toHaveBeenCalledWith(
-        '/var/run/zn-vault-agent.update.lock',
+        '/run/zn-vault-agent/.self-update.lock',
         expect.any(Number), // O_WRONLY | O_CREAT | O_EXCL
-        0o644
+        0o600
       );
       expect(npmInstallCalled).toBe(true);
 
       killSpy.mockRestore();
     });
 
-    it('should skip update if lock file exists and is fresh', async () => {
+    it('should skip update while the recorded lock owner PID is alive', async () => {
       vi.mocked(existsSync).mockReturnValue(true);
-      vi.mocked(statSync).mockReturnValue({
-        mtimeMs: Date.now() - 5 * 60 * 1000, // 5 minutes old
-      } as ReturnType<typeof statSync>);
       vi.mocked(readFileSync).mockImplementation((path: unknown) => {
         if (String(path).includes('package.json')) {
           return JSON.stringify({ version: '1.3.0' });
         }
         return '12345'; // PID in lock file
       });
+      const ownerAliveSpy = vi.spyOn(process, 'kill').mockReturnValue(true);
 
       let npmInstallCalled = false;
       vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
@@ -485,13 +522,17 @@ describe('NpmAutoUpdateService', () => {
 
       // Should NOT have called npm install (lock exists)
       expect(npmInstallCalled).toBe(false);
+      ownerAliveSpy.mockRestore();
     });
 
-    it('should remove stale lock file (>10 minutes old)', async () => {
+    it('should recover a lock whose recorded owner PID is dead', async () => {
       vi.mocked(existsSync).mockReturnValue(true);
-      vi.mocked(statSync).mockReturnValue({
-        mtimeMs: Date.now() - 15 * 60 * 1000, // 15 minutes old (stale)
-      } as ReturnType<typeof statSync>);
+      vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+        if (String(path).includes('package.json')) {
+          return JSON.stringify({ version: '1.3.0' });
+        }
+        return '12345';
+      });
 
       let npmInstallCalled = false;
       vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
@@ -511,7 +552,14 @@ describe('NpmAutoUpdateService', () => {
         return {} as ReturnType<typeof exec>;
       });
 
-      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+        if (pid === 12345 && signal === 0) {
+          const gone = new Error('ESRCH') as NodeJS.ErrnoException;
+          gone.code = 'ESRCH';
+          throw gone;
+        }
+        return true;
+      });
 
       const service = new NpmAutoUpdateService({ enabled: true, stagedRolloutMaxDelayMs: 0 });
       service.start();
@@ -526,7 +574,7 @@ describe('NpmAutoUpdateService', () => {
       await vi.advanceTimersByTimeAsync(2_000);
 
       // Should have removed stale lock and created new one
-      expect(unlinkSync).toHaveBeenCalledWith('/var/run/zn-vault-agent.update.lock');
+      expect(unlinkSync).toHaveBeenCalledWith('/run/zn-vault-agent/.self-update.lock');
       expect(openSync).toHaveBeenCalled();
       expect(npmInstallCalled).toBe(true);
 
@@ -559,6 +607,28 @@ describe('NpmAutoUpdateService', () => {
 
       // Should NOT have called npm install (lock acquired by another process)
       expect(npmInstallCalled).toBe(false);
+    });
+
+    it('fails closed on EACCES instead of delegating or installing without a lock', async () => {
+      vi.mocked(existsSync).mockReturnValue(false);
+      const denied = new Error('EACCES') as NodeJS.ErrnoException;
+      denied.code = 'EACCES';
+      vi.mocked(openSync).mockImplementation(() => { throw denied; });
+      const commands: string[] = [];
+      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
+        commands.push(String(cmd));
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        cb(null, { stdout: '1.4.0\n', stderr: '' });
+        return {} as ReturnType<typeof exec>;
+      });
+
+      const service = new NpmAutoUpdateService({ enabled: false });
+      const result = await service.triggerUpdate();
+
+      expect(result.success).toBe(false);
+      expect(commands.some(command => command.includes('npm install'))).toBe(false);
+      expect(commands.some(command => command.includes('systemctl start'))).toBe(false);
+      expect(linkSync).not.toHaveBeenCalled();
     });
   });
 
@@ -656,7 +726,7 @@ describe('NpmAutoUpdateService', () => {
 
       // Should have called npm install twice (original + rollback)
       expect(installCalls.length).toBe(2);
-      expect(installCalls[0]).toContain('@latest'); // Original update
+      expect(installCalls[0]).toContain('@1.4.0'); // Exact resolved update
       expect(installCalls[1]).toContain('@1.3.0'); // Rollback to previous version
 
       // Should NOT restart due to verification failure
@@ -801,7 +871,8 @@ describe('NpmAutoUpdateService', () => {
   describe('real health check', () => {
     it('should run binary with --version and --help', async () => {
       vi.mocked(existsSync).mockImplementation((path: unknown) => {
-        return String(path).includes('zn-vault-agent');
+        const value = String(path);
+        return !value.includes('.self-update.lock') && value.includes('zn-vault-agent');
       });
 
       vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
@@ -846,7 +917,8 @@ describe('NpmAutoUpdateService', () => {
 
     it('should rollback if health check fails', async () => {
       vi.mocked(existsSync).mockImplementation((path: unknown) => {
-        return String(path).includes('zn-vault-agent');
+        const value = String(path);
+        return !value.includes('.self-update.lock') && value.includes('zn-vault-agent');
       });
 
       const installCalls: string[] = [];
@@ -903,7 +975,8 @@ describe('NpmAutoUpdateService', () => {
 
     it('should timeout health check if binary hangs', async () => {
       vi.mocked(existsSync).mockImplementation((path: unknown) => {
-        return String(path).includes('zn-vault-agent');
+        const value = String(path);
+        return !value.includes('.self-update.lock') && value.includes('zn-vault-agent');
       });
 
       const installCalls: string[] = [];
@@ -961,7 +1034,8 @@ describe('NpmAutoUpdateService', () => {
 
     it('should skip rollback if rollbackOnFailure is false', async () => {
       vi.mocked(existsSync).mockImplementation((path: unknown) => {
-        return String(path).includes('zn-vault-agent');
+        const value = String(path);
+        return !value.includes('.self-update.lock') && value.includes('zn-vault-agent');
       });
 
       const installCalls: string[] = [];
@@ -1078,7 +1152,7 @@ describe('NpmAutoUpdateService', () => {
       // It must NOT run npm install in-process (would EROFS under the sandbox).
       expect(commands.some((c) => /(^|\s)npm install -g/.test(c))).toBe(false);
       expect(commands.some((c) => c.includes('sudo npm install -g'))).toBe(false);
-      // The unit's ExecStartPost restarts the agent, so the caller must not.
+      // The unit's validated wrapper restarts the agent, so the caller must not.
       expect(restartHandledExternally).toBe(true);
     });
 
@@ -1137,12 +1211,21 @@ describe('NpmAutoUpdateService', () => {
     it('non-root + .path unit present: writes trigger file, no sudo, no npm install', async () => {
       mockUid(1000); // non-root
 
-      // Capture trigger-file writes via the module-level mock.
-      const writes: Array<{ path: string; data: string }> = [];
-      vi.mocked(fspWriteFile).mockImplementation(async (p: unknown, d: unknown) => {
-        writes.push({ path: String(p), data: String(d) });
+      vi.mocked(execFile).mockImplementation((
+        _file: unknown,
+        _args: unknown,
+        opts: unknown,
+        callback?: unknown
+      ) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        cb(null, { stdout: '', stderr: '' });
+        return {} as ReturnType<typeof execFile>;
       });
-      vi.mocked(fspRename).mockResolvedValue(undefined);
+
+      const writes: string[] = [];
+      vi.mocked(writeFileSync).mockImplementation((_fd: unknown, data: unknown) => {
+        writes.push(String(data));
+      });
 
       const commands: string[] = [];
       vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
@@ -1160,10 +1243,16 @@ describe('NpmAutoUpdateService', () => {
       const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0, channel: 'latest' });
       const restartHandledExternally = await (service as unknown as PerformUpdateAccessor).performUpdate('1.21.0');
 
-      // Wrote a trigger with "<version> <channel>".
-      const tmpWrite = writes.find((w) => w.path.includes('.update-trigger'));
-      expect(tmpWrite).toBeDefined();
-      expect(tmpWrite?.data.trim()).toBe('1.21.0 latest');
+      // Published an immutable v1 trigger binding current + target + channel.
+      const triggerWrite = writes.find((value) => value.startsWith('v1 '));
+      expect(triggerWrite).toMatch(
+        /^v1 [0-9a-f-]{36} 1\.3\.0 1\.21\.0 latest \d{4}-\d{2}-\d{2}T.*Z\n$/
+      );
+      expect(linkSync).toHaveBeenCalledWith(
+        expect.stringContaining('.update-trigger.tmp.'),
+        '/var/lib/zn-vault-agent/.update-trigger'
+      );
+      expect(fsyncSync).toHaveBeenCalled();
       // No sudo, no npm install, no systemctl start.
       expect(commands.some((c) => c.includes('sudo '))).toBe(false);
       expect(commands.some((c) => /(^|\s)npm install -g/.test(c))).toBe(false);
@@ -1242,7 +1331,7 @@ describe('NpmAutoUpdateService', () => {
       expect(result.willRestart).toBe(true);
       // Message must reflect a (re)install, not "Already at latest version".
       expect(result.message).not.toBe('Already at latest version');
-      expect(result.message.toLowerCase()).toContain('1.3.0');
+      expect(result.message?.toLowerCase()).toContain('1.3.0');
 
       killSpy.mockRestore();
     });
@@ -1275,10 +1364,7 @@ describe('NpmAutoUpdateService', () => {
       expect(result.message).toBe('Already at latest version');
     });
 
-    it('force:true reinstalls via the updater unit (non-root) without double-restart', async () => {
-      // Non-root + updater unit present delegates to the root-owned unit, which
-      // installs AND restarts. Force must not change the install mechanism, and
-      // the agent must NOT self-verify (npm list) or self-restart (SIGTERM).
+    it('non-root legacy force trigger fails closed without an exact caller request', async () => {
       vi.spyOn(process, 'getuid').mockReturnValue(1000); // non-root
       vi.mocked(existsSync).mockReturnValue(false); // no lock file
 
@@ -1302,25 +1388,61 @@ describe('NpmAutoUpdateService', () => {
       const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
 
       const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
-      const result = await service.triggerUpdate({ force: true });
+      await expect(service.triggerUpdate({ force: true })).rejects.toMatchObject({
+        code: 'EXACT_SELF_UPDATE_REQUEST_REQUIRED',
+        httpStatus: 400,
+      });
 
-      // Delegated to the unit even though updateAvailable:false.
-      expect(commands.some((c) => c.includes('sudo /usr/bin/systemctl start zn-vault-agent-updater.service'))).toBe(true);
-      expect(result.success).toBe(true);
-      expect(result.willRestart).toBe(true);
-      // Did not self-verify or self-restart (unit owns the restart).
-      expect(commands.some((c) => c.includes('npm list'))).toBe(false);
+      expect(commands).toEqual([]);
+      expect(linkSync).not.toHaveBeenCalled();
       expect(killSpy).not.toHaveBeenCalled();
 
       killSpy.mockRestore();
     });
   });
 
-  describe('triggerUpdate restart delegation (updater unit)', () => {
-    interface HasUpdaterAccessor {
-      hasUpdaterUnit(): Promise<boolean>;
-    }
+  describe('durable HTTP update admission', () => {
+    it('fails closed with zero trigger when the installed path unit is inactive', async () => {
+      vi.spyOn(process, 'getuid').mockReturnValue(1000);
+      vi.mocked(existsSync).mockReturnValue(false);
+      vi.mocked(lstatSync).mockImplementation(() => {
+        throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+      });
+      vi.mocked(exec).mockImplementation((cmd: unknown, opts: unknown, callback?: unknown) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        if (String(cmd).includes('npm view')) {
+          cb(null, { stdout: '2.0.1\n', stderr: '' });
+        } else {
+          cb(null, { stdout: '', stderr: '' });
+        }
+        return {} as ReturnType<typeof exec>;
+      });
 
+      const service = new NpmAutoUpdateService({
+        enabled: false,
+        channel: 'dr-m4',
+        stagedRolloutMaxDelayMs: 0,
+      });
+
+      await expect(service.requestUpdate({
+        requestId: '33333333-3333-4333-8333-333333333333',
+        expectedCurrentVersion: '1.3.0',
+        targetVersion: '2.0.1',
+      })).rejects.toMatchObject({
+        code: 'SELF_UPDATE_RAIL_INACTIVE',
+        httpStatus: 503,
+      });
+      expect(execFile).toHaveBeenCalledWith(
+        '/usr/bin/systemctl',
+        ['is-active', '--quiet', 'zn-vault-agent-updater.path'],
+        { timeout: 10_000 },
+        expect.any(Function)
+      );
+      expect(linkSync).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('legacy triggerUpdate non-root fence', () => {
     let getuidSpy: ReturnType<typeof vi.spyOn> | undefined;
 
     function mockUid(uid: number): void {
@@ -1335,7 +1457,7 @@ describe('NpmAutoUpdateService', () => {
       getuidSpy = undefined;
     });
 
-    it('non-root + updater unit: reports willRestart and skips self verify+restart', async () => {
+    it('requires requestUpdate identity before any registry, unit, install, or restart side effect', async () => {
       mockUid(1000); // non-root
       vi.mocked(existsSync).mockReturnValue(false); // no lock file
 
@@ -1359,18 +1481,13 @@ describe('NpmAutoUpdateService', () => {
       const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
 
       const service = new NpmAutoUpdateService({ enabled: false, stagedRolloutMaxDelayMs: 0 });
-      // Sanity: the unit-detection helper exists and resolves true.
-      await expect((service as unknown as HasUpdaterAccessor).hasUpdaterUnit()).resolves.toBe(true);
+      await expect(service.triggerUpdate()).rejects.toMatchObject({
+        code: 'EXACT_SELF_UPDATE_REQUEST_REQUIRED',
+        httpStatus: 400,
+      });
 
-      const result = await service.triggerUpdate();
-
-      expect(result.success).toBe(true);
-      expect(result.willRestart).toBe(true);
-      // Delegated to the unit via sudo + the absolute systemctl path.
-      expect(commands.some((c) => c.includes('sudo /usr/bin/systemctl start zn-vault-agent-updater.service'))).toBe(true);
-      // The agent must NOT self-verify (npm list) or self-restart (SIGTERM) —
-      // the unit's ExecStartPost handles the restart.
-      expect(commands.some((c) => c.includes('npm list'))).toBe(false);
+      expect(commands).toEqual([]);
+      expect(linkSync).not.toHaveBeenCalled();
       expect(killSpy).not.toHaveBeenCalled();
 
       killSpy.mockRestore();
@@ -1404,7 +1521,7 @@ describe('loadUpdateConfig', () => {
     // file once an upstream signing/gating process is in place.
     expect(config.enabled).toBe(false);
     expect(config.checkIntervalMs).toBe(5 * 60 * 1000);
-    expect(config.channel).toBe('latest');
+    expect(config.channel).toBe('dr-m4');
     expect(config.stagedRolloutMaxDelayMs).toBe(30 * 60 * 1000);
     expect(config.rollbackOnFailure).toBe(true);
   });
@@ -1423,6 +1540,14 @@ describe('loadUpdateConfig', () => {
     const config = loadUpdateConfig();
 
     expect(config.enabled).toBe(false);
+  });
+
+  it.each(['true', '1'])('should enable when AUTO_UPDATE=%s', (value) => {
+    process.env.AUTO_UPDATE = value;
+
+    const config = loadUpdateConfig();
+
+    expect(config.enabled).toBe(true);
   });
 
   it('should use custom interval from env', () => {
@@ -1449,12 +1574,20 @@ describe('loadUpdateConfig', () => {
     expect(config.channel).toBe('next');
   });
 
+  it('should use the fenced dr-m4 channel from env', () => {
+    process.env.AUTO_UPDATE_CHANNEL = 'dr-m4';
+
+    const config = loadUpdateConfig();
+
+    expect(config.channel).toBe('dr-m4');
+  });
+
   it('should ignore invalid channel', () => {
     process.env.AUTO_UPDATE_CHANNEL = 'invalid';
 
     const config = loadUpdateConfig();
 
-    expect(config.channel).toBe('latest');
+    expect(config.channel).toBe('dr-m4');
   });
 
   it('should use custom staged delay from env', () => {

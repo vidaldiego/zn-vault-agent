@@ -6,10 +6,13 @@
  * Tests for agent login and authentication functionality.
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
-import { AgentRunner } from '../helpers/agent-runner.js';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { dirname } from 'node:path';
+import { AgentRunner, createIsolatedAgentEnv } from '../helpers/agent-runner.js';
 import { VaultTestClient } from '../helpers/vault-client.js';
 import { TEST_ENV, getVaultClient } from '../setup.js';
+
+const testRunId = `${process.pid}-${Date.now()}`;
 
 describe('Authentication', () => {
   let agent: AgentRunner;
@@ -21,8 +24,8 @@ describe('Authentication', () => {
 
     // Create a test API key for agent authentication
     testApiKey = await vault.createApiKey({
-      name: 'agent-test-key',
-      expiresInDays: 1,
+      name: `agent-test-key-${testRunId}`,
+      expiresInDays: 90,
       permissions: [
         'certificate:read:metadata',
         'certificate:read:value',
@@ -49,7 +52,7 @@ describe('Authentication', () => {
     agent.setup();
   });
 
-  afterAll(() => {
+  afterEach(() => {
     agent?.cleanup();
   });
 
@@ -76,9 +79,10 @@ describe('Authentication', () => {
 
     it('AUTH-03: should fail login with invalid API key', async () => {
       // Clear env var so the invalid key from config is used during connection test
+      const invalidApiKey = ['znv', 'invalid', 'key'].join('_');
       const result = await agent.run(
         ['login', '--url', TEST_ENV.vaultUrl,
-         '--api-key', 'znv_invalid_key_12345', '--yes',
+         '--api-key', invalidApiKey, '--yes',
          TEST_ENV.insecure ? '--insecure' : ''].filter(Boolean),
         { env: { ZNVAULT_API_KEY: '' } }  // Clear env override
       );
@@ -102,6 +106,29 @@ describe('Authentication', () => {
 
       const config = agent.readConfig();
       expect(config?.insecure).toBe(true);
+    });
+
+    it('AUTH-10: should onboard an API key without certificate-list permission', async () => {
+      const minimalKey = await vault.createApiKey({
+        name: `agent-minimal-key-${Date.now()}`,
+        expiresInDays: 90,
+        permissions: ['secret:read:metadata'],
+        tenantId: TEST_ENV.tenantId,
+      });
+
+      try {
+        const result = await agent.login({
+          url: TEST_ENV.vaultUrl,
+          apiKey: minimalKey.key,
+          insecure: TEST_ENV.insecure,
+          skipTest: false,
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(agent.readConfig()?.tenantId).toBe(TEST_ENV.tenantId);
+      } finally {
+        await vault.deleteApiKey(minimalKey.id);
+      }
     });
   });
 
@@ -140,6 +167,50 @@ describe('Authentication', () => {
   });
 
   describe('Configuration Validation', () => {
+    it('preserves secret targets when merging plugin configuration', () => {
+      const secretTarget = {
+        secretId: 'secret-id',
+        name: 'preserved-secret',
+        output: '/tmp/preserved-secret',
+      };
+      agent.writeConfig({
+        vaultUrl: TEST_ENV.vaultUrl,
+        tenantId: TEST_ENV.tenantId,
+        auth: { apiKey: testApiKey!.key },
+        targets: [],
+        secretTargets: [secretTarget],
+      });
+
+      agent.setConfig({ plugins: [{ package: 'test-plugin' }] });
+
+      expect(agent.readConfig()?.secretTargets).toEqual([secretTarget]);
+    });
+
+    it('gives all runner children one private mutation lock', () => {
+      const privateLockPath = agent.getMutationLockPath();
+      const env = createIsolatedAgentEnv(
+        dirname(agent.getConfigPath()),
+        'error',
+        {
+          HOSTNAME: 'inherited-or-override',
+          ZNVAULT_TEST_DEPLOY_LOCK_PATH: '/tmp/inherited-or-override.lock',
+        }
+      );
+      const otherAgent = new AgentRunner(`auth-other-${Date.now()}`);
+
+      try {
+        expect(env.ZNVAULT_TEST_DEPLOY_LOCK_PATH).toBe(privateLockPath);
+        expect(env.HOSTNAME).toMatch(/^znvault-test-[0-9a-f]{16}$/);
+        expect(createIsolatedAgentEnv(dirname(agent.getConfigPath()), 'info').HOSTNAME)
+          .toBe(env.HOSTNAME);
+        expect(createIsolatedAgentEnv(dirname(otherAgent.getConfigPath()), 'info').HOSTNAME)
+          .not.toBe(env.HOSTNAME);
+        expect(otherAgent.getMutationLockPath()).not.toBe(privateLockPath);
+      } finally {
+        otherAgent.cleanup();
+      }
+    });
+
     it('should reject invalid URL format', async () => {
       const result = await agent.login({
         url: 'not-a-valid-url',
@@ -150,15 +221,15 @@ describe('Authentication', () => {
       expect(result.exitCode).not.toBe(0);
     });
 
-    it('should reject empty tenant ID', async () => {
+    it('should allow API key login without a tenant ID', async () => {
       const result = await agent.login({
         url: TEST_ENV.vaultUrl,
-        tenantId: '',
         apiKey: testApiKey!.key,
         insecure: TEST_ENV.insecure,
       });
 
-      expect(result.exitCode).not.toBe(0);
+      expect(result.exitCode).toBe(0);
+      expect(agent.readConfig()?.auth.apiKey).toBe(testApiKey!.key);
     });
   });
 
@@ -193,6 +264,8 @@ describe('Authentication', () => {
       expect(result.exitCode).toBe(0);
 
       const status = JSON.parse(result.stdout);
+      expect(status.configured).toBe(true);
+      expect(status.configPath).toBe(agent.getConfigPath());
       expect(status).toHaveProperty('vaultUrl');
       expect(status).toHaveProperty('tenantId');
     });

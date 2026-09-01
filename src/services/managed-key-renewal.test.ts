@@ -8,6 +8,13 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+const loggerSpies = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
 // Mock the dependencies before importing the module
 vi.mock('../lib/config.js', () => ({
   loadConfig: vi.fn(),
@@ -20,12 +27,7 @@ vi.mock('../lib/api.js', () => ({
 }));
 
 vi.mock('../lib/logger.js', () => ({
-  createLogger: vi.fn(() => ({
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  })),
+  createLogger: vi.fn(() => loggerSpies),
 }));
 
 // Import mocked modules
@@ -181,8 +183,32 @@ describe('Managed Key Renewal Service', () => {
 
       expect(status.isRunning).toBe(true);
       expect(status.isManagedMode).toBe(true);
-      expect(status.currentKeyPrefix).toBe('znv_new_...');
+      expect(status).not.toHaveProperty('currentKeyPrefix');
     });
+  });
+
+  it('never writes credential values or server prefixes to logs', async () => {
+    await startManagedKeyRenewal();
+
+    vi.mocked(bindManagedApiKey).mockResolvedValue({
+      ...mockBindResponse,
+      key: 'znv_rotated_key_99999',
+      prefix: 'znv_rot',
+    });
+    await forceRefresh();
+
+    const serializedLogs = JSON.stringify(
+      Object.values(loggerSpies).map((spy) => spy.mock.calls)
+    );
+    for (const fragment of [
+      mockConfig.auth.apiKey,
+      mockBindResponse.key,
+      mockBindResponse.prefix,
+      'znv_rotated_key_99999',
+      'znv_rot',
+    ]) {
+      expect(serializedLogs).not.toContain(fragment);
+    }
   });
 
   describe('onKeyChanged callback', () => {

@@ -9,6 +9,8 @@ import {
   fetchConfigFromVault,
   type ExecConfig,
   type AgentConfig,
+  type CertTarget,
+  type SecretTarget,
   type TLSConfig,
 } from './config.js';
 import { deployCertificate, deployAllCertificates } from './deployer.js';
@@ -24,11 +26,19 @@ import {
   updateCertStatus,
   updateSecretStatus,
   setChildProcessManager,
+  setPluginLoader,
   setPluginAutoUpdateService,
   setNpmAutoUpdateService,
+  setPendingMutationRetries,
+  setPluginRecoveryRequired,
 } from './health.js';
 import {
+  reconcilePolledMutation,
+  RestartRequiredMutationQueue,
+} from './coalescing-retry-queue.js';
+import {
   isTLSEnabled,
+  getTLSConfig,
   onCertificateUpdated,
   ensureCertificateReady,
   stopTLSCertificateManager,
@@ -51,11 +61,15 @@ import {
   parseSecretMappingFromConfig,
   type SecretMapping,
 } from './secret-env.js';
-import { bindManagedApiKey } from './api.js';
+import { bindManagedApiKey, getSecretMetadata } from './api.js';
 import { createKeyRotationPropagator } from './key-rotation-propagation.js';
 import {
   createPluginLoader,
   clearPluginLoader,
+  PluginCompatibilityError,
+  RequiredPluginLoadError,
+  inspectConfiguredPayaraManifest,
+  type PayaraManifestInspection,
   type PluginLoader,
 } from '../plugins/loader.js';
 import type {
@@ -79,7 +93,16 @@ import {
 import {
   cleanupOrphanedFiles,
   extractTargetDirectories,
+  type CleanupStats,
 } from '../utils/startup-cleanup.js';
+import {
+  getDeferredShutdownSequence,
+  getLastDeferredShutdownSignal,
+  isSharedMutationSignalDeferralActive,
+  SHARED_MUTATION_LOCK_PATH,
+  withSharedMutationLock,
+} from './shared-mutation-lock.js';
+import { loadControlPlaneAuthenticator } from './control-plane-auth.js';
 
 // Re-export types and client from websocket module
 export type {
@@ -118,22 +141,475 @@ import { handleUpdateEvent } from './websocket/update-handler.js';
 // Track active deployments for graceful shutdown
 let activeDeployments = 0;
 
-// Signal handler references for proper cleanup (prevents memory leak on restart)
-let sigintHandler: (() => void) | null = null;
-let sigtermHandler: (() => void) | null = null;
+/**
+ * Account for any daemon mutation so shutdown cannot exit while it is active.
+ * WebSocket handlers historically did this inline; polling must use the same
+ * accounting because it reaches the same certificate/secret deployers.
+ */
+export async function withActiveDeployment<T>(
+  operation: () => Promise<T>
+): Promise<T> {
+  activeDeployments++;
+  try {
+    return await operation();
+  } finally {
+    activeDeployments--;
+  }
+}
+
+/** Wait until every already-admitted daemon mutation has fully unwound. */
+export async function drainActiveDeployments(
+  timeoutMs = 14 * 60_000,
+  pollIntervalMs = 1_000
+): Promise<number> {
+  const startedAt = Date.now();
+  while (activeDeployments > 0 && Date.now() - startedAt < timeoutMs) {
+    log.info({ active: activeDeployments }, 'Waiting for active deployments');
+    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+  }
+  return activeDeployments;
+}
+
+/** Admit and account for one child restart without borrowing another lease. */
+export async function runAdmittedChildRestart(
+  reason: string,
+  isShutdownRequested: () => boolean,
+  restart: (reason: string) => Promise<void>
+): Promise<void> {
+  if (isShutdownRequested()) {
+    throw new Error('Rejecting child restart after daemon shutdown admission closed');
+  }
+  await withActiveDeployment(async () => restart(reason));
+}
+
+export type InitialChildRestartDisposition =
+  | 'covered-by-initial-start'
+  | 'restart-required';
+
+/**
+ * Hold mutation acknowledgements until the post-sync initial child start has
+ * actually succeeded. Mutations that reached this barrier before initial
+ * start are already reflected in the files/environment consumed by that
+ * start; later mutations must use the serialized restart rail.
+ */
+export class InitialChildStartBarrier {
+  private state: 'closed' | 'starting' | 'started' | 'failed' = 'closed';
+  private readonly completion: Promise<void>;
+  private resolveCompletion!: () => void;
+  private rejectCompletion!: (error: Error) => void;
+
+  constructor() {
+    this.completion = new Promise<void>((resolve, reject) => {
+      this.resolveCompletion = resolve;
+      this.rejectCompletion = reject;
+    });
+    // A daemon with no early mutation waiter must not emit an unhandled
+    // rejection if its initial child start fails.
+    void this.completion.catch(() => undefined);
+  }
+
+  open(): void {
+    if (this.state === 'closed') this.state = 'starting';
+  }
+
+  complete(): void {
+    if (this.state !== 'starting') return;
+    this.state = 'started';
+    this.resolveCompletion();
+  }
+
+  fail(error: unknown): void {
+    if (this.state === 'started' || this.state === 'failed') return;
+    this.state = 'failed';
+    this.rejectCompletion(error instanceof Error ? error : new Error(String(error)));
+  }
+
+  async beforeRestart(): Promise<InitialChildRestartDisposition> {
+    if (this.state !== 'closed') return 'restart-required';
+    await this.completion;
+    return 'covered-by-initial-start';
+  }
+
+  /** Plugin startup may await this callback, so it cannot wait on itself. */
+  async beforePluginRestart(): Promise<InitialChildRestartDisposition> {
+    if (this.state === 'closed') return 'covered-by-initial-start';
+    return this.beforeRestart();
+  }
+}
+
+/** Prevent timer callbacks from overlapping one asynchronous polling cycle. */
+export function createSingleFlightOperation(
+  operation: () => Promise<void>
+): () => Promise<void> {
+  let running = false;
+  return async (): Promise<void> => {
+    if (running) return;
+    running = true;
+    try {
+      await operation();
+    } finally {
+      running = false;
+    }
+  };
+}
+
+/** Monotonic generation guard used immediately before secret queue admission. */
+export function isSecretVersionConsumed(
+  consumedVersion: number | undefined,
+  eventVersion: number,
+  pendingGeneration: number | undefined
+): boolean {
+  const highestKnownGeneration = Math.max(
+    consumedVersion ?? Number.NEGATIVE_INFINITY,
+    pendingGeneration ?? Number.NEGATIVE_INFINITY
+  );
+  return eventVersion <= highestKnownGeneration;
+}
+
+/** Recheck a secret watermark after plugin work that may yield to another event. */
+export async function admitSecretMutationAfterAwait(options: {
+  isAlreadyConsumed: () => boolean;
+  beforeEnqueue: () => Promise<void>;
+  enqueue: () => void;
+}): Promise<boolean> {
+  if (options.isAlreadyConsumed()) return false;
+  await options.beforeEnqueue();
+  if (options.isAlreadyConsumed()) return false;
+  // No await is allowed between this revalidation and queue admission.
+  options.enqueue();
+  return true;
+}
+
+export interface ExecSecretPollMetadata {
+  id: string;
+  alias: string;
+  version: number;
+}
+
+export interface ExecSecretPollMutation {
+  reference: string;
+  identity: string;
+  metadata: ExecSecretPollMetadata;
+}
+
+export interface SecretRetryItem {
+  event: SecretEvent;
+  target?: SecretTarget;
+  restartReason: string;
+  execIdentity?: string;
+  execPollReference?: string;
+}
+
+export interface SecretMutationEvidence {
+  version: number;
+}
+
+export type SecretEventAdmissionResult =
+  | { status: 'consumed' }
+  | { status: 'untracked' }
+  | { status: 'queued'; queuedKey: string; execIdentity: string };
+
+function secretReferenceVariants(reference: string): string[] {
+  if (!reference) return [];
+  if (reference.startsWith('alias:')) {
+    return [reference, reference.slice('alias:'.length)];
+  }
+  return [reference, `alias:${reference}`];
+}
+
+function findSecretIdentity(
+  identityByReference: Map<string, string>,
+  ...references: string[]
+): string | undefined {
+  for (const reference of references) {
+    for (const variant of secretReferenceVariants(reference)) {
+      const identity = identityByReference.get(variant);
+      if (identity) return identity;
+    }
+  }
+  return undefined;
+}
+
+function bindSecretIdentity(
+  identityByReference: Map<string, string>,
+  identity: string,
+  ...references: string[]
+): void {
+  for (const reference of references) {
+    for (const variant of secretReferenceVariants(reference)) {
+      identityByReference.set(variant, identity);
+    }
+  }
+}
+
+function hasSecretReference(
+  references: Set<string>,
+  ...candidates: string[]
+): boolean {
+  return candidates.some(candidate =>
+    secretReferenceVariants(candidate).some(variant => references.has(variant))
+  );
+}
+
+/** Build the exact alias/UUID identity seed used by the production handler. */
+export function initializeExecSecretIdentity(
+  references: string[],
+  identityByReference: Map<string, string>
+): Set<string> {
+  const trackedReferences = new Set(references.flatMap(secretReferenceVariants));
+  for (const reference of references) {
+    bindSecretIdentity(identityByReference, reference, reference);
+  }
+  return trackedReferences;
+}
+
+/**
+ * Resolve and admit one real WebSocket secret event to the restart-required
+ * queue. Alias binding, the final watermark recheck, queue key selection and
+ * immediate retry are shared verbatim by production and focal wiring tests.
+ */
+export async function admitSecretEventToRetryQueue(options: {
+  event: SecretEvent;
+  execSecretReferences: Set<string>;
+  execSecretIdentityByReference: Map<string, string>;
+  consumedSecretVersions: Map<string, number>;
+  consumedExecSecretVersions: Map<string, number>;
+  queue: RestartRequiredMutationQueue<SecretRetryItem, SecretMutationEvidence>;
+  findTarget: (reference: string) => SecretTarget | undefined;
+  beforeEnqueue?: () => Promise<void>;
+}): Promise<SecretEventAdmissionResult> {
+  const { event } = options;
+  const resolveMutationContext = (): {
+    isExecSecret: boolean;
+    target: SecretTarget | undefined;
+    execIdentity: string;
+    execKey: string;
+    alreadyConsumed: boolean;
+  } => {
+    const isExecSecret = hasSecretReference(
+      options.execSecretReferences,
+      event.secretId,
+      event.alias
+    );
+    const target = options.findTarget(event.secretId)
+      ?? options.findTarget(event.alias);
+    const execIdentity = isExecSecret
+      ? findSecretIdentity(
+        options.execSecretIdentityByReference,
+        event.secretId,
+        event.alias
+      ) ?? event.secretId
+      : event.secretId;
+    if (isExecSecret) {
+      bindSecretIdentity(
+        options.execSecretIdentityByReference,
+        execIdentity,
+        event.secretId,
+        event.alias
+      );
+    }
+    const execKey = `exec:${execIdentity}`;
+    const alreadyConsumed = target
+      ? isSecretVersionConsumed(
+        options.consumedSecretVersions.get(target.secretId),
+        event.version,
+        options.queue.getPendingGeneration(target.secretId)
+      )
+      : isExecSecret && isSecretVersionConsumed(
+        options.consumedExecSecretVersions.get(execIdentity),
+        event.version,
+        options.queue.getPendingGeneration(execKey)
+      );
+    return { isExecSecret, target, execIdentity, execKey, alreadyConsumed };
+  };
+
+  let queuedKey: string | undefined;
+  let queuedExecIdentity = event.secretId;
+  const admitted = await admitSecretMutationAfterAwait({
+    isAlreadyConsumed: () => resolveMutationContext().alreadyConsumed,
+    beforeEnqueue: options.beforeEnqueue ?? (async () => undefined),
+    enqueue: () => {
+      const { isExecSecret, target, execIdentity, execKey } = resolveMutationContext();
+      queuedExecIdentity = execIdentity;
+      if (target) {
+        options.queue.enqueue(target.secretId, event.version, {
+          event,
+          target,
+          restartReason: isExecSecret
+            ? 'secret file and exec value updated'
+            : 'secret file updated',
+        });
+        queuedKey = target.secretId;
+      } else if (isExecSecret) {
+        options.queue.enqueuePrepared(execKey, event.version, {
+          event,
+          restartReason: 'exec secret updated',
+          execIdentity,
+        }, {
+          version: event.version,
+        });
+        queuedKey = execKey;
+      }
+    },
+  });
+
+  if (!admitted) return { status: 'consumed' };
+  if (!queuedKey) return { status: 'untracked' };
+
+  await options.queue.retryNow(queuedKey);
+  return {
+    status: 'queued',
+    queuedKey,
+    execIdentity: queuedExecIdentity,
+  };
+}
+
+/** Advance only the canonical consumer watermark after notify+restart pass. */
+export function acknowledgeSecretMutation(
+  item: SecretRetryItem,
+  evidence: SecretMutationEvidence,
+  state: {
+    consumedSecretVersions: Map<string, number>;
+    consumedExecSecretVersions: Map<string, number>;
+    execSecretIdentityByReference: Map<string, string>;
+  }
+): string {
+  if (item.target) {
+    state.consumedSecretVersions.set(item.target.secretId, evidence.version);
+    return item.target.secretId;
+  }
+
+  const identity = item.execIdentity
+    ?? findSecretIdentity(
+      state.execSecretIdentityByReference,
+      item.event.secretId,
+      item.event.alias
+    )
+    ?? item.event.secretId;
+  bindSecretIdentity(
+    state.execSecretIdentityByReference,
+    identity,
+    item.event.secretId,
+    item.event.alias
+  );
+  state.consumedExecSecretVersions.set(identity, evidence.version);
+  return identity;
+}
+
+/**
+ * Poll metadata for exec-only secrets and report versions not yet consumed.
+ * Identity bindings coalesce an alias and UUID for the same secret after the
+ * first metadata response, while exact file targets are skipped without an
+ * extra HTTP request.
+ */
+export async function pollExecOnlySecretVersions(options: {
+  references: string[];
+  fileTargetReferences: string[];
+  identityByReference: Map<string, string>;
+  consumedVersions: Map<string, number>;
+  fetchMetadata: (reference: string) => Promise<ExecSecretPollMetadata>;
+  onMutation: (mutation: ExecSecretPollMutation) => Promise<void>;
+  onFetchFailure?: (reference: string, identity: string, error: unknown) => void;
+  onFetchSuccess?: (
+    reference: string,
+    identity: string,
+    metadata: ExecSecretPollMetadata
+  ) => void;
+}): Promise<void> {
+  const fileTargetReferences = new Set(
+    options.fileTargetReferences.flatMap(secretReferenceVariants)
+  );
+  const seenIdentities = new Set<string>();
+
+  for (const reference of new Set(options.references)) {
+    if (hasSecretReference(fileTargetReferences, reference)) continue;
+
+    const knownIdentity = findSecretIdentity(options.identityByReference, reference);
+    if (knownIdentity && seenIdentities.has(knownIdentity)) continue;
+
+    let metadata: ExecSecretPollMetadata;
+    try {
+      metadata = await options.fetchMetadata(reference);
+    } catch (error) {
+      const identity = knownIdentity ?? reference;
+      bindSecretIdentity(options.identityByReference, identity, reference);
+      options.onFetchFailure?.(reference, identity, error);
+      continue;
+    }
+
+    const identity = knownIdentity
+      ?? findSecretIdentity(
+        options.identityByReference,
+        metadata.id,
+        metadata.alias
+      )
+      ?? reference;
+    bindSecretIdentity(
+      options.identityByReference,
+      identity,
+      reference,
+      metadata.id,
+      metadata.alias
+    );
+    options.onFetchSuccess?.(reference, identity, metadata);
+
+    if (seenIdentities.has(identity)) continue;
+    seenIdentities.add(identity);
+    if (hasSecretReference(
+      fileTargetReferences,
+      reference,
+      metadata.id,
+      metadata.alias
+    )) {
+      continue;
+    }
+    const consumedVersion = options.consumedVersions.get(identity);
+    if (consumedVersion !== undefined && metadata.version <= consumedVersion) continue;
+
+    await options.onMutation({ reference, identity, metadata });
+  }
+}
+
+/**
+ * Startup cleanup mutates the same target directories as certificate/secret
+ * deployment, so it participates in the host-wide Payara mutation fence.
+ */
+export async function runStartupCleanup(
+  directories: string[],
+  mutationLockPath = SHARED_MUTATION_LOCK_PATH
+): Promise<CleanupStats> {
+  return withActiveDeployment(
+    async () => withSharedMutationLock(
+      'startup-cleanup',
+      async () => cleanupOrphanedFiles(directories),
+      mutationLockPath
+    )
+  );
+}
+
+// Keep one stable pair for the daemon lifetime. SharedMutationLock temporarily
+// removes and later restores these exact functions. Replacing their identities
+// during an overlapping mutation can otherwise restore the obsolete startup
+// callback alongside the runtime callback, so one signal reaches two owners.
+let activeShutdownHandler: ((signal: string) => Promise<void>) | null = null;
+const ownedSigintHandler = (): void => {
+  activeShutdownHandler?.('SIGINT').catch((e: unknown) => {
+    log.error({ err: e }, 'Shutdown error');
+  });
+};
+const ownedSigtermHandler = (): void => {
+  activeShutdownHandler?.('SIGTERM').catch((e: unknown) => {
+    log.error({ err: e }, 'Shutdown error');
+  });
+};
 
 /**
  * Remove signal handlers to prevent memory leak on daemon restart.
  */
 function cleanupSignalHandlers(): void {
-  if (sigintHandler) {
-    process.off('SIGINT', sigintHandler);
-    sigintHandler = null;
-  }
-  if (sigtermHandler) {
-    process.off('SIGTERM', sigtermHandler);
-    sigtermHandler = null;
-  }
+  activeShutdownHandler = null;
+  process.off('SIGINT', ownedSigintHandler);
+  process.off('SIGTERM', ownedSigtermHandler);
 }
 
 /**
@@ -141,24 +617,201 @@ function cleanupSignalHandlers(): void {
  * Removes any existing handlers first to prevent accumulation.
  */
 function setupSignalHandlers(shutdownFn: (signal: string) => Promise<void>): void {
-  // Clean up any existing handlers first
-  cleanupSignalHandlers();
+  activeShutdownHandler = shutdownFn;
 
-  // Create new handlers
-  sigintHandler = () => {
-    shutdownFn('SIGINT').catch((e: unknown) => {
-      log.error({ err: e }, 'Shutdown error');
-    });
-  };
-  sigtermHandler = () => {
-    shutdownFn('SIGTERM').catch((e: unknown) => {
-      log.error({ err: e }, 'Shutdown error');
-    });
+  // When the shared mutation rail currently owns deferral, it has captured and
+  // removed the stable handlers. It will restore those exact identities on
+  // release; adding a second listener here would bypass the mutation fence.
+  if (isSharedMutationSignalDeferralActive()) return;
+
+  // This CLI daemon is the sole SIGINT/SIGTERM lifecycle owner. In particular,
+  // transitive config-storage hooks may re-raise the signal synchronously,
+  // killing the daemon before its async child/deployment drain. Their normal
+  // process `exit` hooks remain installed and still perform temp cleanup after
+  // our orderly process.exit(0).
+  for (const listener of process.listeners('SIGINT')) {
+    if (listener !== ownedSigintHandler) process.off('SIGINT', listener);
+  }
+  for (const listener of process.listeners('SIGTERM')) {
+    if (listener !== ownedSigtermHandler) process.off('SIGTERM', listener);
+  }
+
+  // Close daemon/child admission before any subsequently installed listener.
+  if (!process.listeners('SIGINT').includes(ownedSigintHandler)) {
+    process.prependListener('SIGINT', ownedSigintHandler);
+  }
+  if (!process.listeners('SIGTERM').includes(ownedSigtermHandler)) {
+    process.prependListener('SIGTERM', ownedSigtermHandler);
+  }
+}
+
+/** @internal Signal lifecycle seam used by regression tests. */
+export const daemonSignalLifecycleForTest = {
+  setup: setupSignalHandlers,
+  cleanup: cleanupSignalHandlers,
+};
+
+interface RecoveryPluginUpdaterLifecycle {
+  disablePeriodicPolling(): void;
+  stop(): void;
+}
+
+interface RecoveryNpmUpdaterLifecycle {
+  stop(): void;
+}
+
+export interface RecoveryControlPlaneStartupOptions {
+  pluginVersion: string;
+  recoveryCode?: 'UPDATE_REQUIRED' | 'STARTUP_CONFIRMATION_PENDING';
+  pluginAutoUpdateService: RecoveryPluginUpdaterLifecycle;
+  npmAutoUpdateService?: RecoveryNpmUpdaterLifecycle | null;
+  startHttp?: () => Promise<unknown>;
+  startHttps?: () => Promise<unknown>;
+  stopHttp?: () => Promise<void>;
+  stopHttps?: () => Promise<void>;
+  isShutdownRequested?: () => boolean;
+}
+
+/**
+ * Start the manifest-only recovery listeners as one transaction. Any exit
+ * before the complete listener set is live fences both background updaters,
+ * closes partial listeners, and clears the health-module registrations so an
+ * abandoned receipt monitor cannot schedule a later restart.
+ */
+export async function startRecoveryControlPlaneTransaction(
+  options: RecoveryControlPlaneStartupOptions
+): Promise<void> {
+  const stopHttp = options.stopHttp ?? stopHealthServer;
+  const stopHttps = options.stopHttps ?? stopHTTPSHealthServer;
+  const rollback = async (): Promise<void> => {
+    options.pluginAutoUpdateService.stop();
+    options.npmAutoUpdateService?.stop();
+    await stopHttps().catch(() => undefined);
+    await stopHttp().catch(() => undefined);
+    setNpmAutoUpdateService(null);
+    setPluginAutoUpdateService(null);
+    setPluginRecoveryRequired(null);
   };
 
-  // Register handlers
-  process.on('SIGINT', sigintHandler);
-  process.on('SIGTERM', sigtermHandler);
+  // Recovery never retains the Agent self-updater. The Payara updater keeps
+  // only its durable manual endpoint/receipt monitor while startup succeeds.
+  options.npmAutoUpdateService?.stop();
+  setNpmAutoUpdateService(null);
+  options.pluginAutoUpdateService.disablePeriodicPolling();
+  setPluginAutoUpdateService(options.pluginAutoUpdateService as PluginAutoUpdateService);
+  setPluginRecoveryRequired(options.pluginVersion, options.recoveryCode);
+
+  if (!options.startHttp && !options.startHttps) {
+    await rollback();
+    throw new Error('UPDATE_REQUIRED recovery has no configured control-plane listener');
+  }
+
+  try {
+    if (options.startHttp) {
+      await options.startHttp();
+      if (options.isShutdownRequested?.()) {
+        throw new Error('Recovery startup cancelled by signal');
+      }
+    }
+    if (options.startHttps) {
+      await options.startHttps();
+      if (options.isShutdownRequested?.()) {
+        throw new Error('Recovery startup cancelled by signal');
+      }
+    }
+  } catch (err) {
+    await rollback();
+    throw err;
+  }
+}
+
+export type PayaraRecoveryStartup =
+  | { phase: 'legacy'; version: string }
+  | { phase: 'post-update'; version: string }
+  | null;
+
+/** Resolve and validate the immutable manifest/recovery handoff. */
+export function resolvePayaraRecoveryStartup(
+  manifest: PayaraManifestInspection,
+  expectedLegacyVersion?: string,
+  expectedPostUpdateVersion?: string
+): PayaraRecoveryStartup {
+  if (expectedLegacyVersion && expectedPostUpdateVersion) {
+    throw new Error('Conflicting Payara recovery startup modes');
+  }
+  if (expectedLegacyVersion) {
+    if (!manifest.recoveryRequired || manifest.version !== expectedLegacyVersion) {
+      throw new Error('Installed Payara recovery manifest changed during startup');
+    }
+    return { phase: 'legacy', version: expectedLegacyVersion };
+  }
+  if (expectedPostUpdateVersion) {
+    if (
+      !manifest.configured
+      || manifest.recoveryRequired
+      || manifest.version !== expectedPostUpdateVersion
+    ) {
+      throw new Error('Installed Payara post-update manifest changed during startup');
+    }
+    return { phase: 'post-update', version: expectedPostUpdateVersion };
+  }
+  if (!manifest.recoveryRequired) return null;
+  if (!manifest.version) {
+    throw new Error('Installed Payara recovery manifest has no exact version');
+  }
+  return { phase: 'legacy', version: manifest.version };
+}
+
+export const POST_UPDATE_AUTHORITY_RETRY_MS = 30_000;
+
+/**
+ * Probe remote config authority without transitioning the synthetic recovery
+ * process in-place. A successful full fetch requests one clean restart; failed
+ * probes remain in the live status plane and cannot consume systemd's burst.
+ */
+export function startPostUpdateAuthorityRetry(options: {
+  probe: () => Promise<boolean>;
+  requestRestart: () => void;
+  retryMs?: number;
+}): () => void {
+  const retryMs = options.retryMs ?? POST_UPDATE_AUTHORITY_RETRY_MS;
+  let stopped = false;
+  let timeout: NodeJS.Timeout | null = null;
+
+  const schedule = (): void => {
+    if (stopped) return;
+    timeout = setTimeout(() => {
+      timeout = null;
+      void attempt();
+    }, retryMs);
+  };
+  const attempt = async (): Promise<void> => {
+    let authoritative = false;
+    try {
+      authoritative = await options.probe();
+    } catch (err) {
+      log.warn({ err }, 'Payara post-update authority probe failed');
+    }
+    if (stopped) return;
+    if (authoritative) {
+      stopped = true;
+      try {
+        options.requestRestart();
+        return;
+      } catch (err) {
+        stopped = false;
+        log.error({ err }, 'Could not restart after Payara config authority recovered');
+      }
+    }
+    schedule();
+  };
+
+  schedule();
+  return () => {
+    stopped = true;
+    if (timeout) clearTimeout(timeout);
+    timeout = null;
+  };
 }
 
 /**
@@ -170,19 +823,173 @@ export async function startDaemon(options: {
   /**
    * Bind host for the agent's health/metrics/plugin HTTP server.
    * Default '127.0.0.1' (loopback only). Operators who genuinely need
-   * network exposure must set this to '0.0.0.0' explicitly via config
-   * and accept that the endpoints (including plugin routes and update
-   * triggers) are not authenticated today.
+   * network exposure must set this to '0.0.0.0' explicitly via config;
+   * monitoring routes are public while control and plugin routes require the
+   * dedicated local Bearer credential.
    */
   healthHost?: string;
+  /** Path only; the control-plane secret itself must never enter argv or env. */
+  controlPlaneTokenFile?: string;
   exec?: ExecConfig;
   pluginAutoUpdateService?: PluginAutoUpdateService | null;
   npmAutoUpdateService?: NpmAutoUpdateService | null;
   configFromVault?: boolean;
+  /** Exact manifest observed before any remote bootstrap/config request. */
+  expectedPayaraRecoveryVersion?: string;
+  /** Exact root-attested Payara 3 target awaiting startup confirmation. */
+  expectedPayaraPostUpdateRecoveryVersion?: string;
+  /** Returns true only after a complete remote config response (never 304). */
+  postUpdateAuthorityProbe?: () => Promise<boolean>;
   tls?: TLSConfig;
 } = {}): Promise<void> {
+  // Refuse startup before plugin or child mutations if the local control plane
+  // cannot authenticate callers. The optional environment value is only a
+  // file path for isolated install/test roots, never the credential itself.
+  const controlPlaneAuth = loadControlPlaneAuthenticator(
+    options.controlPlaneTokenFile ?? process.env.ZNVAULT_CONTROL_TOKEN_FILE
+  );
+  const startupShutdownSequence = getDeferredShutdownSequence();
+  let startupShutdownSignal: string | null = null;
+  const deferredStartupShutdownSignal = (): string | null =>
+    getDeferredShutdownSequence() > startupShutdownSequence
+      ? getLastDeferredShutdownSignal()
+      : null;
+  const isStartupShutdownRequested = (): boolean =>
+    startupShutdownSignal !== null || deferredStartupShutdownSignal() !== null;
+  const isShutdownRequested = (): boolean =>
+    getIsShuttingDown() || isStartupShutdownRequested();
+  let childManager: ChildProcessManager | null = null;
+  const initialChildStartBarrier = new InitialChildStartBarrier();
+
+  // Install a remembering handler before the first asynchronous startup
+  // mutation. SharedMutationLock temporarily replaces it while holding the
+  // fence, then replays into it only after the mutation has fully unwound.
+  setupSignalHandlers(async (signal) => {
+    childManager?.beginShutdown();
+    initialChildStartBarrier.fail(
+      new Error(`Initial child start cancelled by ${signal}`)
+    );
+    startupShutdownSignal ??= signal;
+  });
+
   const config = loadConfig();
+  // Compatibility inspection is the first action after authenticated config
+  // load. Exact Payara 2.x enters a read-only recovery daemon; missing,
+  // corrupt, legacy-non-2 or future manifests still throw before any cleanup,
+  // dynamic-secret, key, child, WebSocket or plugin mutation.
+  const payaraManifest = inspectConfiguredPayaraManifest(config);
+  let payaraRecovery: PayaraRecoveryStartup;
+  try {
+    payaraRecovery = resolvePayaraRecoveryStartup(
+      payaraManifest,
+      options.expectedPayaraRecoveryVersion,
+      options.expectedPayaraPostUpdateRecoveryVersion
+    );
+  } catch (err) {
+    options.pluginAutoUpdateService?.stop();
+    options.npmAutoUpdateService?.stop();
+    setNpmAutoUpdateService(null);
+    setPluginAutoUpdateService(null);
+    setPluginRecoveryRequired(null);
+    throw err;
+  }
+  if (payaraRecovery) {
+    if (
+      !options.pluginAutoUpdateService
+      || (payaraRecovery.phase === 'post-update' && !options.postUpdateAuthorityProbe)
+    ) {
+      options.pluginAutoUpdateService?.stop();
+      options.npmAutoUpdateService?.stop();
+      setNpmAutoUpdateService(null);
+      setPluginAutoUpdateService(null);
+      setPluginRecoveryRequired(null);
+      throw new Error('Payara recovery cannot start without its exact updater and authority probe');
+    }
+    const configuredTls = getTLSConfig();
+    const recoveryTlsEnabled = options.tls?.enabled ?? configuredTls.enabled ?? false;
+    const keepRecoveryHttp = options.tls?.keepHttpServer ?? configuredTls.keepHttpServer;
+    const recoveryCertPath = options.tls?.certPath ?? configuredTls.certPath;
+    const recoveryKeyPath = options.tls?.keyPath ?? configuredTls.keyPath;
+    const recoveryHttpsPort = options.tls?.httpsPort ?? configuredTls.httpsPort;
+    const recoveryHost = options.healthHost ?? '127.0.0.1';
+    const startRecoveryHttp = options.healthPort !== undefined
+      && (!recoveryTlsEnabled || keepRecoveryHttp);
+    await startRecoveryControlPlaneTransaction({
+      pluginVersion: payaraRecovery.version,
+      recoveryCode: payaraRecovery.phase === 'post-update'
+        ? 'STARTUP_CONFIRMATION_PENDING'
+        : 'UPDATE_REQUIRED',
+      pluginAutoUpdateService: options.pluginAutoUpdateService,
+      npmAutoUpdateService: options.npmAutoUpdateService,
+      isShutdownRequested: isStartupShutdownRequested,
+      startHttp: startRecoveryHttp
+        ? () => startHealthServer(
+          options.healthPort,
+          undefined,
+          recoveryHost,
+          controlPlaneAuth,
+          true
+        )
+        : undefined,
+      startHttps: recoveryTlsEnabled
+        ? () => startHTTPSHealthServer(
+          recoveryHttpsPort,
+          recoveryCertPath,
+          recoveryKeyPath,
+          undefined,
+          recoveryHost,
+          controlPlaneAuth,
+          true
+        )
+        : undefined,
+    });
+    let stopPostUpdateAuthorityRetry: (() => void) | undefined;
+    setupSignalHandlers(async () => {
+      stopPostUpdateAuthorityRetry?.();
+      options.pluginAutoUpdateService?.stop();
+      options.npmAutoUpdateService?.stop();
+      setNpmAutoUpdateService(null);
+      setPluginAutoUpdateService(null);
+      setPluginRecoveryRequired(null);
+      await stopHTTPSHealthServer();
+      await stopHealthServer();
+    });
+    if (payaraRecovery.phase === 'post-update') {
+      stopPostUpdateAuthorityRetry = startPostUpdateAuthorityRetry({
+        probe: options.postUpdateAuthorityProbe!,
+        requestRestart: () => {
+          log.info('Remote config authority recovered; restarting for Payara startup confirmation');
+          process.kill(process.pid, 'SIGTERM');
+        },
+      });
+      log.error(
+        { package: '@zincapp/znvault-plugin-payara', version: payaraRecovery.version },
+        'STARTUP_CONFIRMATION_PENDING: root-attested Payara recovery daemon active'
+      );
+    } else {
+      log.error(
+        { package: '@zincapp/znvault-plugin-payara', version: payaraRecovery.version },
+        'UPDATE_REQUIRED: legacy Payara plugin recovery daemon active'
+      );
+    }
+    return;
+  }
+  setPluginRecoveryRequired(null);
   const secretTargets = config.secretTargets ?? [];
+  // Runtime acknowledgements represent the version the child/plugin consumer
+  // has actually crossed, not merely the fingerprint/version persisted by a
+  // deployer before a restart. They are advanced only after the full pipeline.
+  const consumedCertificateFingerprints = new Map(
+    config.targets.map(target => [target.certId, target.lastFingerprint])
+  );
+  const consumedCertificateVersions = new Map<string, number>();
+  const consumedSecretVersions = new Map<string, number>(
+    secretTargets.flatMap(target => target.lastVersion === undefined
+      ? []
+      : [[target.secretId, target.lastVersion]])
+  );
+  const execSecretIdentityByReference = new Map<string, string>();
+  const consumedExecSecretVersions = new Map<string, number>();
 
   // Initialize plugin loader
   let pluginLoader: PluginLoader | null = null;
@@ -199,8 +1006,8 @@ export async function startDaemon(options: {
     config.targets.map(t => ({ outputs: t.outputs })),
     secretTargets
   );
-  if (targetDirectories.length > 0) {
-    const cleanupStats = cleanupOrphanedFiles(targetDirectories);
+  if (targetDirectories.length > 0 && !isStartupShutdownRequested()) {
+    const cleanupStats = await runStartupCleanup(targetDirectories);
     if (cleanupStats.tempFilesRemoved > 0 || cleanupStats.backupFilesRemoved > 0) {
       log.info({
         tempFilesRemoved: cleanupStats.tempFilesRemoved,
@@ -210,7 +1017,7 @@ export async function startDaemon(options: {
   }
 
   // Initialize dynamic secrets service if enabled
-  if (isDynamicSecretsEnabled()) {
+  if (isDynamicSecretsEnabled() && !isStartupShutdownRequested()) {
     initializeDynamicSecrets();
     log.info('Dynamic secrets capability enabled');
   }
@@ -220,7 +1027,7 @@ export async function startDaemon(options: {
   // By default, sync failure blocks startup (MANAGED_KEY_SYNC_REQUIRED=true)
   const managedKeySyncRequired = process.env.MANAGED_KEY_SYNC_REQUIRED !== 'false';
 
-  if (config.managedKey?.filePath) {
+  if (config.managedKey?.filePath && !isStartupShutdownRequested()) {
     const syncResult = await syncManagedKeyFile();
     if (syncResult.wasOutOfSync) {
       if (syncResult.keptExistingFile) {
@@ -252,6 +1059,7 @@ export async function startDaemon(options: {
 
   // Extract exec secret IDs and managed API key names for WebSocket subscription
   let execSecretIds: string[] = [];
+  let execSecretReferences = new Set<string>();
   let execManagedKeyNames: string[] = [];
   let execSecretMappings: (SecretMapping & { literal?: string })[] = [];
   const execOutputFile = options.exec?.envFile; // Output file path for env file mode
@@ -259,6 +1067,10 @@ export async function startDaemon(options: {
   if (options.exec) {
     execSecretMappings = options.exec.secrets.map(parseSecretMappingFromConfig);
     execSecretIds = extractSecretIds(execSecretMappings);
+    execSecretReferences = initializeExecSecretIdentity(
+      execSecretIds,
+      execSecretIdentityByReference
+    );
     execManagedKeyNames = extractApiKeyNames(execSecretMappings);
   }
 
@@ -281,19 +1093,15 @@ export async function startDaemon(options: {
   }, 'Starting ZnVault Agent');
 
   // Initialize child process manager if exec config provided
-  let childManager: ChildProcessManager | null = null;
-  // Guards key-rotation-triggered restarts: a rotation detected during the
-  // awaited initial bind must not restart a child that has not started yet
-  // (the upcoming start() reads the already-updated config anyway).
-  let childProcessStarted = false;
   if (options.exec) {
-    childManager = new ChildProcessManager(options.exec);
+    childManager = new ChildProcessManager(options.exec, {
+      forwardTerminationSignals: false,
+    });
 
     // Register with health module for status reporting
     setChildProcessManager(childManager);
 
     childManager.on('started', (pid) => {
-      childProcessStarted = true;
       log.info({ pid }, 'Child process started');
     });
 
@@ -314,16 +1122,48 @@ export async function startDaemon(options: {
     });
   }
 
+  const restartChildAfterMutation = childManager && options.exec?.restartOnChange !== false
+    ? async (reason: string): Promise<void> => {
+        try {
+          if (isShutdownRequested()) {
+            throw new Error('Rejecting child restart after daemon shutdown admission closed');
+          }
+          const disposition = await initialChildStartBarrier.beforeRestart();
+          if (disposition === 'covered-by-initial-start') return;
+          // Count from admission, including time queued behind another restart,
+          // so shutdown cannot observe a false zero between serialized jobs.
+          await runAdmittedChildRestart(
+            reason,
+            isShutdownRequested,
+            async admittedReason => childManager.restart(admittedReason)
+          );
+        } catch (err) {
+          log.error(
+            { err, reason },
+            'Child restart failed after mutation; keeping the target pending'
+          );
+          throw err;
+        }
+      }
+    : undefined;
+  const restartChildForPlugin = restartChildAfterMutation
+    ? async (reason: string): Promise<void> => {
+        const disposition = await initialChildStartBarrier.beforePluginRestart();
+        if (disposition === 'covered-by-initial-start') return;
+        await restartChildAfterMutation(reason);
+      }
+    : undefined;
+
   // Initialize plugin system if plugins are configured
   const pluginConfigs = (config as AgentConfig & { plugins?: unknown[] }).plugins;
-  if (pluginConfigs && pluginConfigs.length > 0) {
+  if (pluginConfigs && pluginConfigs.length > 0 && !isStartupShutdownRequested()) {
     log.info({ pluginCount: pluginConfigs.length }, 'Initializing plugin system');
 
     pluginLoader = createPluginLoader(
       {
         config,
         childProcessManager: childManager,
-        restartChild: childManager ? (reason: string) => childManager.restart(reason) : undefined,
+        restartChild: restartChildForPlugin,
       },
       {
         pluginDir: process.env.ZNVAULT_AGENT_PLUGIN_DIR,
@@ -334,10 +1174,15 @@ export async function startDaemon(options: {
       // Load plugins from config
       await pluginLoader.loadPlugins(config);
 
-      // Initialize plugins
-      await pluginLoader.initializePlugins();
+      // A signal received while loading is sticky: do not admit the next
+      // plugin lifecycle phase after the await boundary.
+      if (!isShutdownRequested()) {
+        await pluginLoader.initializePlugins();
+      }
 
-      log.info({ plugins: pluginLoader.getAllPluginStatuses() }, 'Plugins initialized');
+      if (!isShutdownRequested()) {
+        log.info({ plugins: pluginLoader.getAllPluginStatuses() }, 'Plugins initialized');
+      }
 
       // Extract managed key names from plugin configs (e.g., "api-key:my-key" in secrets)
       // This ensures we subscribe to rotation events for keys used by plugins
@@ -366,6 +1211,12 @@ export async function startDaemon(options: {
       }
     } catch (err) {
       log.error({ err }, 'Failed to initialize plugins');
+      if (
+        err instanceof PluginCompatibilityError
+        || err instanceof RequiredPluginLoadError
+      ) {
+        throw err;
+      }
       // Continue running agent without plugins
     }
 
@@ -416,16 +1267,10 @@ export async function startDaemon(options: {
     getPluginLoader: () => pluginLoader,
     execOutputFile,
     execSecretMappings,
-    isShuttingDown: getIsShuttingDown,
-    restartChild: childManagerForRestart && options.exec?.restartOnChange
+    isShuttingDown: isShutdownRequested,
+    restartChild: childManagerForRestart && options.exec?.restartOnChange !== false
       ? async (reason: string) => {
-          // Skip restarts before the child ever started: start() (which runs
-          // after the initial sync) builds its env from the updated config.
-          if (!childProcessStarted) {
-            log.debug({ reason }, 'Skipping child restart - child process not started yet');
-            return;
-          }
-          await childManagerForRestart.restart(reason);
+          await restartChildAfterMutation?.(reason);
         }
       : undefined,
   });
@@ -439,7 +1284,7 @@ export async function startDaemon(options: {
   const trackedKeyPoller = new TrackedKeyPoller({
     keyNames: allManagedKeyNames.filter((name) => name !== config.managedKey?.name),
     propagate: (newKey, meta, opts) => keyRotationPropagator.propagate(newKey, meta, opts),
-    isShuttingDown: getIsShuttingDown,
+    isShuttingDown: isShutdownRequested,
   });
 
   // Register plugin auto-update service with health module for HTTP endpoints
@@ -452,29 +1297,81 @@ export async function startDaemon(options: {
     setNpmAutoUpdateService(options.npmAutoUpdateService);
   }
 
-  // Start health server if port specified (pass plugin loader for routes and health aggregation)
-  // Skip HTTP server if TLS is enabled and keepHttpServer is false
-  const tlsEnabledForSkipCheck = options.tls?.enabled || isTLSEnabled();
-  const skipHttpServer = tlsEnabledForSkipCheck && options.tls?.keepHttpServer === false;
-  if (options.healthPort && !skipHttpServer) {
-    try {
+  /**
+   * Listener startup is a transaction. No background service may survive a
+   * requested HTTP/HTTPS listener failing to bind or initialize: startDaemon()
+   * rejects and its caller exits instead of leaving a headless partial daemon.
+   */
+  const rollbackControlPlaneStartup = async (startupError: unknown): Promise<never> => {
+    const cleanupErrors: unknown[] = [];
+    const cleanup = async (operation: () => void | Promise<void>): Promise<void> => {
+      try {
+        await operation();
+      } catch (err) {
+        cleanupErrors.push(err);
+      }
+    };
+
+    childManager?.beginShutdown();
+    await cleanup(stopHTTPSHealthServer);
+    await cleanup(stopHealthServer);
+    await cleanup(() => stopTLSCertificateManager());
+    await cleanup(() => options.pluginAutoUpdateService?.stop());
+    await cleanup(() => options.npmAutoUpdateService?.stop());
+    setPluginAutoUpdateService(null);
+    setNpmAutoUpdateService(null);
+
+    if (pluginLoader) {
+      await cleanup(() => pluginLoader?.stopPlugins());
+    }
+    clearPluginLoader();
+    setPluginLoader(null);
+
+    // Listener startup precedes initial child admission. Closing admission is
+    // sufficient here and avoids treating pre-existing secret files as
+    // artifacts of a child which this daemon never spawned.
+    setChildProcessManager(null);
+
+    if (isDynamicSecretsEnabled()) {
+      await cleanup(cleanupDynamicSecrets);
+    }
+
+    const primaryError = startupError instanceof Error
+      ? startupError
+      : new Error(String(startupError));
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [primaryError, ...cleanupErrors],
+        'Control-plane listener startup failed and cleanup was incomplete'
+      );
+    }
+    throw primaryError;
+  };
+
+  try {
+    // Start health server if port specified (pass plugin loader for routes and health aggregation)
+    // Skip HTTP server if TLS is enabled and keepHttpServer is false
+    const tlsEnabledForSkipCheck = options.tls?.enabled || isTLSEnabled();
+    const skipHttpServer = tlsEnabledForSkipCheck && options.tls?.keepHttpServer === false;
+    if (options.healthPort && !skipHttpServer && !isShutdownRequested()) {
       await startHealthServer(
         options.healthPort,
         pluginLoader ?? undefined,
-        options.healthHost ?? '127.0.0.1'
+        options.healthHost ?? '127.0.0.1',
+        controlPlaneAuth
       );
-    } catch (err) {
-      log.error({ err }, 'Failed to start health server');
+      if (isShutdownRequested()) {
+        await stopHealthServer();
+      }
     }
-  }
 
-  // Start HTTPS health server if TLS is enabled
-  // TLS can be enabled via CLI options (options.tls) or config file (isTLSEnabled())
-  const tlsEnabled = options.tls?.enabled || isTLSEnabled();
-  if (tlsEnabled) {
-    try {
+    // Start HTTPS health server if TLS is enabled
+    // TLS can be enabled via CLI options (options.tls) or config file (isTLSEnabled())
+    const tlsEnabled = options.tls?.enabled || isTLSEnabled();
+    if (tlsEnabled && !isShutdownRequested()) {
       // Set up certificate update callback for hot-reload BEFORE starting manager
       onCertificateUpdated((certPath, keyPath) => {
+        if (isShutdownRequested()) return;
         reloadHTTPSCertificate(certPath, keyPath).then(success => {
           if (success) {
             log.info({ certPath, keyPath }, 'HTTPS certificate hot-reloaded');
@@ -487,34 +1384,42 @@ export async function startDaemon(options: {
       // Ensure certificate is ready (auto-fetch from vault if needed)
       // This starts the TLS manager which will request a cert if none exists
       log.info('TLS enabled - ensuring certificate is ready');
-      const tlsReady = await ensureCertificateReady();
+      const tlsReady = await withActiveDeployment(
+        async () => ensureCertificateReady()
+      );
 
-      if (tlsReady) {
+      if (isShutdownRequested()) {
+        stopTLSCertificateManager();
+      } else if (tlsReady) {
         // Use CLI-provided paths if available, otherwise use auto-detected paths
         const certPath = options.tls?.certPath ?? tlsReady.certPath;
         const keyPath = options.tls?.keyPath ?? tlsReady.keyPath;
         const httpsPort = options.tls?.httpsPort ?? tlsReady.httpsPort;
 
-        const httpsServer = await startHTTPSHealthServer(
+        await startHTTPSHealthServer(
           httpsPort,
           certPath,
           keyPath,
           pluginLoader ?? undefined,
-          options.healthHost ?? '127.0.0.1'
+          options.healthHost ?? '127.0.0.1',
+          controlPlaneAuth
         );
 
-        if (httpsServer) {
-          log.info({ httpsPort, certPath }, 'HTTPS health server started with TLS');
+        if (isShutdownRequested()) {
+          await stopHTTPSHealthServer();
+          stopTLSCertificateManager();
         } else {
-          log.warn('HTTPS health server could not be started - check certificate paths');
+          log.info({ httpsPort, certPath }, 'HTTPS health server started with TLS');
         }
       } else {
-        log.warn('TLS certificate not available - HTTPS server not started');
-        log.warn('Ensure agent has API key and is registered with vault to auto-fetch certificates');
+        throw new Error(
+          'TLS is enabled but no certificate is available; refusing partial daemon startup'
+        );
       }
-    } catch (err) {
-      log.error({ err }, 'Failed to start HTTPS health server');
     }
+  } catch (err) {
+    log.error({ err }, 'Control-plane listener startup failed; rolling back daemon startup');
+    await rollbackControlPlaneStartup(err);
   }
 
   // Update tracked metrics
@@ -525,12 +1430,13 @@ export async function startDaemon(options: {
 
   // Initialize degraded mode handler
   initDegradedModeHandler({
-    onCredentialsUpdated: (newKey) => {
-      log.info({ keyPrefix: newKey.substring(0, 8) }, 'Credentials updated via reprovision, reconnecting');
+    onCredentialsUpdated: (_newKey) => {
+      if (isShutdownRequested()) return;
+      log.info('Credentials updated via reprovision, reconnecting');
       // Reconnect with new credentials
       unifiedClient.disconnect();
       setTimeout(() => {
-        if (!getIsShuttingDown()) {
+        if (!isShutdownRequested()) {
           unifiedClient.connect();
         }
       }, 500);
@@ -546,62 +1452,144 @@ export async function startDaemon(options: {
 
   // Handle degraded connection notifications
   unifiedClient.onDegradedConnection((info) => {
+    if (isShutdownRequested()) return;
     handleDegradedConnection(info);
   });
 
   // Handle reprovision available notifications
   unifiedClient.onReprovisionAvailable((expiresAt) => {
+    if (isShutdownRequested()) return;
     handleReprovisionAvailable(expiresAt);
+  });
+
+  interface CertificateRetryItem {
+    event: CertificateEvent;
+    target: CertTarget;
+  }
+
+  interface CertificateMutationEvidence {
+    fingerprint: string;
+    version: number;
+  }
+
+  let pendingSecretQueueCount = 0;
+  const execMetadataUnknown = new Set<string>();
+  const publishPendingSecretHealth = (): void => {
+    setPendingMutationRetries(
+      'secret',
+      pendingSecretQueueCount + execMetadataUnknown.size
+    );
+  };
+  const dispatchSecretChanged = async (
+    event: SecretEvent,
+    version: number
+  ): Promise<void> => {
+    if (!pluginLoader) return;
+    const valueChanged = event.event === 'secret.updated'
+      || event.event === 'secret.rotated';
+    const secretChangedEvent: SecretChangedEvent = {
+      secretId: event.secretId,
+      alias: event.alias,
+      version,
+      valueChanged,
+      changedAt: event.timestamp,
+    };
+    try {
+      await pluginLoader.dispatchEvent('secretChanged', secretChangedEvent);
+    } catch (pluginErr) {
+      log.error(
+        { err: pluginErr, secretId: event.secretId },
+        'Plugin failed to handle secretChanged event'
+      );
+    }
+  };
+
+  const isLockContention = (errorCode?: string): boolean =>
+    errorCode === 'SHARED_MUTATION_LOCK_CONTENDED';
+
+  const certificateRetryQueue = new RestartRequiredMutationQueue<
+    CertificateRetryItem,
+    CertificateMutationEvidence
+  >({
+    account: withActiveDeployment,
+    prepare: async ({ event, target }) => {
+      log.info({ name: target.name, event: event.event }, 'Processing certificate event');
+      const result = await deployCertificate(target, true);
+
+      if (!result.success) {
+        if (isLockContention(result.errorCode)) return { decision: 'retry' };
+        log.error({ name: target.name, error: result.message }, 'Certificate deployment failed');
+        return { decision: 'failed' };
+      }
+
+      log.info({ name: target.name, fingerprint: result.fingerprint }, 'Certificate deployed');
+      return {
+        decision: 'resolved',
+        evidence: {
+          fingerprint: result.fingerprint ?? event.fingerprint,
+          version: result.version ?? event.version,
+        },
+      };
+    },
+    notify: async ({ target }, evidence) => {
+      if (pluginLoader) {
+        const certEvent: CertificateDeployedEvent = {
+          certId: target.certId,
+          name: target.name,
+          paths: target.outputs,
+          fingerprint: evidence.fingerprint,
+          expiresAt: '',
+          commonName: '',
+          isUpdate: true,
+        };
+        try {
+          await pluginLoader.dispatchEvent('certificateDeployed', certEvent);
+        } catch (pluginErr) {
+          log.error({ err: pluginErr, certId: target.certId }, 'Plugin failed to handle certificateDeployed event');
+        }
+      }
+    },
+    restart: async () => {
+      await restartChildAfterMutation?.('certificate rotated');
+    },
+    acknowledge: ({ target }, evidence) => {
+      consumedCertificateFingerprints.set(target.certId, evidence.fingerprint);
+      consumedCertificateVersions.set(target.certId, evidence.version);
+    },
+    onPendingChange: count => setPendingMutationRetries('certificate', count),
+    onExhausted: (key, item, generation) => {
+      log.error(
+        { certId: key, name: item.target.name, generation },
+        'Certificate mutation retry exhausted; polling recovery required'
+      );
+    },
   });
 
   // Handle certificate events
   async function handleCertificateEvent(event: CertificateEvent): Promise<void> {
-    if (getIsShuttingDown()) {
+    if (isShutdownRequested()) {
       log.debug({ event: event.event }, 'Ignoring certificate event during shutdown');
       return;
     }
 
-    const target = config.targets.find(t => t.certId === event.certificateId);
-    if (target) {
-      activeDeployments++;
-      try {
-        log.info({ name: target.name, event: event.event }, 'Processing certificate event');
-        const result = await deployCertificate(target, true);
-
-        if (result.success) {
-          log.info({ name: target.name, fingerprint: result.fingerprint }, 'Certificate deployed');
-
-          // Dispatch plugin event - await with error handling
-          if (pluginLoader) {
-            const certEvent: CertificateDeployedEvent = {
-              certId: target.certId,
-              name: target.name,
-              paths: target.outputs,
-              fingerprint: result.fingerprint ?? '',
-              expiresAt: '', // Would need cert parsing for this
-              commonName: '', // Would need cert parsing for this
-              isUpdate: true,
-            };
-            try {
-              await pluginLoader.dispatchEvent('certificateDeployed', certEvent);
-            } catch (pluginErr) {
-              log.error({ err: pluginErr, certId: target.certId }, 'Plugin failed to handle certificateDeployed event');
-            }
-          }
-
-          // Restart child process if configured
-          if (childManager && options.exec?.restartOnChange) {
-            await childManager.restart('certificate rotated');
-          }
-        } else {
-          log.error({ name: target.name, error: result.message }, 'Certificate deployment failed');
+    await withActiveDeployment(async () => {
+      const target = config.targets.find(t => t.certId === event.certificateId);
+      if (target) {
+        if (consumedCertificateFingerprints.get(target.certId) === event.fingerprint
+            && !certificateRetryQueue.isPending(target.certId)) {
+          log.debug(
+            { certId: target.certId, version: event.version },
+            'Ignoring already-consumed certificate event'
+          );
+          return;
         }
-      } finally {
-        activeDeployments--;
+        const item = { event, target };
+        certificateRetryQueue.enqueue(target.certId, event.version, item);
+        await certificateRetryQueue.retryNow(target.certId);
+      } else {
+        log.debug({ certId: event.certificateId }, 'Received event for untracked certificate');
       }
-    } else {
-      log.debug({ certId: event.certificateId }, 'Received event for untracked certificate');
-    }
+    });
   }
 
   unifiedClient.onCertificateEvent((event) => {
@@ -610,88 +1598,142 @@ export async function startDaemon(options: {
     });
   });
 
+  const secretRetryQueue = new RestartRequiredMutationQueue<
+    SecretRetryItem,
+    SecretMutationEvidence
+  >({
+    account: withActiveDeployment,
+    prepare: async (item) => {
+      const { event, target } = item;
+      if (!target) {
+        if (item.execPollReference) {
+          try {
+            const metadata = await getSecretMetadata(item.execPollReference);
+            const identity = item.execIdentity
+              ?? findSecretIdentity(
+                execSecretIdentityByReference,
+                metadata.id,
+                metadata.alias,
+                item.execPollReference
+              )
+              ?? item.execPollReference;
+            bindSecretIdentity(
+              execSecretIdentityByReference,
+              identity,
+              item.execPollReference,
+              metadata.id,
+              metadata.alias
+            );
+            item.execIdentity = identity;
+            event.secretId = metadata.id;
+            event.alias = metadata.alias;
+            event.version = metadata.version;
+            return {
+              decision: 'resolved',
+              evidence: { version: metadata.version },
+            };
+          } catch (err) {
+            log.error(
+              { err, secretId: item.execPollReference },
+              'Exec-only secret metadata retry failed'
+            );
+            return { decision: 'failed' };
+          }
+        }
+        return { decision: 'resolved', evidence: { version: event.version } };
+      }
+      log.info({ name: target.name, event: event.event, version: event.version }, 'Processing secret event');
+      const result = await deploySecret(target, true);
+
+      if (!result.success) {
+        if (isLockContention(result.errorCode)) return { decision: 'retry' };
+        log.error({ name: target.name, error: result.message }, 'Secret deployment failed');
+        return { decision: 'failed' };
+      }
+
+      log.info({ name: target.name, version: result.version }, 'Secret deployed');
+      return {
+        decision: 'resolved',
+        evidence: { version: result.version ?? event.version },
+      };
+    },
+    notify: async ({ event, target }, evidence) => {
+      if (pluginLoader) {
+        await dispatchSecretChanged(event, evidence.version);
+
+        if (target) {
+          const secretEvent: SecretDeployedEvent = {
+            secretId: target.secretId,
+            alias: event.alias,
+            name: target.name,
+            path: target.output,
+            format: target.format,
+            version: evidence.version,
+            isUpdate: true,
+          };
+          try {
+            await pluginLoader.dispatchEvent('secretDeployed', secretEvent);
+          } catch (pluginErr) {
+            log.error({ err: pluginErr, secretId: target.secretId }, 'Plugin failed to handle secretDeployed event');
+          }
+        }
+      }
+    },
+    restart: async ({ restartReason }) => {
+      await restartChildAfterMutation?.(restartReason);
+    },
+    acknowledge: (item, evidence) => {
+      acknowledgeSecretMutation(item, evidence, {
+        consumedSecretVersions,
+        consumedExecSecretVersions,
+        execSecretIdentityByReference,
+      });
+    },
+    onPendingChange: count => {
+      pendingSecretQueueCount = count;
+      publishPendingSecretHealth();
+    },
+    onExhausted: (key, item, generation) => {
+      log.error(
+        { secretId: key, name: item.target?.name, generation },
+        'Secret mutation retry exhausted; polling recovery required'
+      );
+    },
+  });
+
   // Handle secret events
   async function handleSecretEvent(event: SecretEvent): Promise<void> {
-    if (getIsShuttingDown()) {
+    if (isShutdownRequested()) {
       log.debug({ event: event.event }, 'Ignoring secret event during shutdown');
       return;
     }
 
-    // Dispatch secretChanged event to plugins (before deployment)
-    if (pluginLoader) {
-      const valueChanged = event.event === 'secret.updated' || event.event === 'secret.rotated';
-      const secretChangedEvent: SecretChangedEvent = {
-        secretId: event.secretId,
-        alias: event.alias,
-        version: event.version,
-        valueChanged,
-        changedAt: event.timestamp,
-      };
-      try {
-        await pluginLoader.dispatchEvent('secretChanged', secretChangedEvent);
-      } catch (pluginErr) {
-        log.error({ err: pluginErr, secretId: event.secretId }, 'Plugin failed to handle secretChanged event');
+    await withActiveDeployment(async () => {
+      const admission = await admitSecretEventToRetryQueue({
+        event,
+        execSecretReferences,
+        execSecretIdentityByReference,
+        consumedSecretVersions,
+        consumedExecSecretVersions,
+        queue: secretRetryQueue,
+        findTarget: reference => findSecretTarget(reference),
+      });
+      if (admission.status === 'consumed') {
+        log.debug(
+          { secretId: event.secretId, version: event.version },
+          'Ignoring already-consumed secret event'
+        );
+        return;
       }
-    }
 
-    let deployedSecretTarget = false;
-    let isExecSecret = false;
-
-    // Check if this is a secret target (file deployment)
-    const target = findSecretTarget(event.secretId) ?? findSecretTarget(event.alias);
-    if (target) {
-      activeDeployments++;
-      try {
-        log.info({ name: target.name, event: event.event, version: event.version }, 'Processing secret event');
-        const result = await deploySecret(target, true);
-
-        if (result.success) {
-          log.info({ name: target.name, version: result.version }, 'Secret deployed');
-          deployedSecretTarget = true;
-
-          // Dispatch plugin event - await with error handling
-          if (pluginLoader) {
-            const secretEvent: SecretDeployedEvent = {
-              secretId: target.secretId,
-              alias: event.alias,
-              name: target.name,
-              path: target.output,
-              format: target.format,
-              version: result.version ?? event.version,
-              isUpdate: true,
-            };
-            try {
-              await pluginLoader.dispatchEvent('secretDeployed', secretEvent);
-            } catch (pluginErr) {
-              log.error({ err: pluginErr, secretId: target.secretId }, 'Plugin failed to handle secretDeployed event');
-            }
-          }
-        } else {
-          log.error({ name: target.name, error: result.message }, 'Secret deployment failed');
-        }
-      } finally {
-        activeDeployments--;
+      if (admission.status === 'untracked') {
+        // Plugins may subscribe to secrets that the core agent neither writes
+        // to a file nor injects into exec. Preserve that generic event path.
+        await dispatchSecretChanged(event, event.version);
+        log.debug({ secretId: event.secretId, alias: event.alias }, 'Received event for untracked secret');
       }
-    }
+    });
 
-    // Check if this is an exec secret (for child process)
-    if (execSecretIds.includes(event.secretId) || execSecretIds.includes(event.alias)) {
-      isExecSecret = true;
-    }
-
-    // Restart child process if:
-    // 1. A secret target was deployed and restartOnChange is true, OR
-    // 2. An exec secret was updated
-    if (childManager && options.exec?.restartOnChange) {
-      if (deployedSecretTarget || isExecSecret) {
-        const reason = isExecSecret ? 'exec secret updated' : 'secret file updated';
-        await childManager.restart(reason);
-      }
-    }
-
-    if (!target && !isExecSecret) {
-      log.debug({ secretId: event.secretId, alias: event.alias }, 'Received event for untracked secret');
-    }
   }
 
   unifiedClient.onSecretEvent((event) => {
@@ -707,6 +1749,7 @@ export async function startDaemon(options: {
   // checker is off (AUTO_UPDATE=false default). Fire-and-handle like the other
   // async handlers - handleUpdateEvent never throws, but .catch() defensively.
   unifiedClient.onUpdateEvent((event) => {
+    if (isShutdownRequested()) return;
     handleUpdateEvent(event, options.npmAutoUpdateService).catch((err: unknown) => {
       log.error({ err }, 'Error handling update event');
     });
@@ -714,7 +1757,7 @@ export async function startDaemon(options: {
 
   // Handle API key rotation events
   async function handleApiKeyRotationEvent(event: ApiKeyRotationEvent): Promise<void> {
-    if (getIsShuttingDown()) {
+    if (isShutdownRequested()) {
       log.debug({ event: event.event }, 'Ignoring API key rotation event during shutdown');
       return;
     }
@@ -727,20 +1770,18 @@ export async function startDaemon(options: {
 
     log.info({
       keyName: event.apiKeyName,
-      newPrefix: event.newPrefix,
       graceExpiresAt: event.graceExpiresAt,
       reason: event.reason,
     }, 'Processing managed API key rotation event');
 
-    activeDeployments++;
-    try {
+    await withActiveDeployment(async () => {
+      try {
       // Fetch the new key via bind
       const bindResponse = await bindManagedApiKey(event.apiKeyName);
       const newKey = bindResponse.key;
 
       log.info({
         keyName: event.apiKeyName,
-        keyPrefix: newKey.substring(0, 8),
       }, 'Fetched new API key value');
 
       // Propagate to ALL consumers: live config mutation (plugins read
@@ -758,14 +1799,13 @@ export async function startDaemon(options: {
         rotationMode: bindResponse.rotationMode ?? event.rotationMode,
         source: 'ws_event',
       }, { persist: true, detectedAt: Date.now() });
-    } catch (err) {
-      log.error({
-        err,
-        keyName: event.apiKeyName,
-      }, 'Failed to process API key rotation event');
-    } finally {
-      activeDeployments--;
-    }
+      } catch (err) {
+        log.error({
+          err,
+          keyName: event.apiKeyName,
+        }, 'Failed to process API key rotation event');
+      }
+    });
   }
 
   unifiedClient.onApiKeyRotationEvent((event) => {
@@ -776,7 +1816,7 @@ export async function startDaemon(options: {
 
   // Handle host config update events (config-from-vault mode)
   async function handleHostConfigEvent(event: HostConfigEvent): Promise<void> {
-    if (getIsShuttingDown()) {
+    if (isShutdownRequested()) {
       log.debug({ event: event.event }, 'Ignoring host config event during shutdown');
       return;
     }
@@ -871,7 +1911,7 @@ export async function startDaemon(options: {
   });
 
   // Start API key renewal service (managed or standard)
-  if (isManagedKeyMode()) {
+  if (isManagedKeyMode() && !isShutdownRequested()) {
     log.info('Using managed API key mode');
 
     // Set up callback for when managed key changes.
@@ -886,7 +1926,7 @@ export async function startDaemon(options: {
     // The renewal service has already persisted the key (updateManagedKey),
     // so the propagator is invoked without the persist option.
     onManagedKeyChanged((newKey, meta) => {
-      if (getIsShuttingDown()) {
+      if (isShutdownRequested()) {
         log.debug({ keyName: meta.keyName }, 'Ignoring managed key change during shutdown');
         return;
       }
@@ -895,21 +1935,20 @@ export async function startDaemon(options: {
       void (async () => {
         // Count as an active deployment so graceful shutdown waits for the
         // consumer updates (same invariant as the WebSocket rotation handler).
-        activeDeployments++;
-        try {
+        await withActiveDeployment(async () => {
+          try {
           await keyRotationPropagator.propagate(newKey, meta, { detectedAt });
-        } catch (err) {
-          log.error({ err, keyName: meta.keyName }, 'Failed to propagate rail-detected key rotation');
-        } finally {
-          activeDeployments--;
-        }
+          } catch (err) {
+            log.error({ err, keyName: meta.keyName }, 'Failed to propagate rail-detected key rotation');
+          }
+        });
 
-        log.info({ newKeyPrefix: newKey.substring(0, 8), source: meta.source }, 'Managed key changed, reconnecting WebSocket');
+        log.info({ source: meta.source }, 'Managed key changed, reconnecting WebSocket');
         // Reconnect WebSocket with new key
         unifiedClient.disconnect();
         // Small delay to allow config to be saved
         setTimeout(() => {
-          if (!getIsShuttingDown()) {
+          if (!isShutdownRequested()) {
             unifiedClient.connect();
           }
         }, 500);
@@ -923,7 +1962,7 @@ export async function startDaemon(options: {
     } catch (err) {
       log.error({ err }, 'Failed to start managed key renewal service');
     }
-  } else {
+  } else if (!isShutdownRequested()) {
     // Use standard API key renewal
     const allowStaticKey = process.env.ALLOW_STATIC_KEY === 'true';
     if (!allowStaticKey) {
@@ -937,48 +1976,83 @@ export async function startDaemon(options: {
   }
 
   // Connect unified WebSocket
-  unifiedClient.connect();
+  if (!isShutdownRequested()) {
+    unifiedClient.connect();
+  }
 
   // Start plugins (after WebSocket is connecting but before initial sync)
-  if (pluginLoader) {
+  if (pluginLoader && !isShutdownRequested()) {
     try {
       await pluginLoader.startPlugins();
       log.info({ plugins: pluginLoader.getAllPluginStatuses() }, 'Plugins started');
+      const payara = pluginLoader.getPlugin('payara');
+      options.pluginAutoUpdateService?.confirmPluginStartup(
+        payara?.version ?? '',
+        pluginLoader.getPluginStatus('payara') === 'running'
+      );
     } catch (err) {
       log.error({ err }, 'Failed to start plugins');
+      options.pluginAutoUpdateService?.confirmPluginStartup('', false);
     }
   }
 
   // Start the polling rail for non-own tracked keys AFTER plugins are running
   // so their keyRotated handlers receive the dispatches.
-  trackedKeyPoller.start();
+  if (!isShutdownRequested()) {
+    trackedKeyPoller.start();
+  }
 
   // Initial sync - certificates
-  if (config.targets.length > 0) {
+  if (config.targets.length > 0 && !isStartupShutdownRequested()) {
     log.info('Performing initial certificate sync');
-    const certResults = await deployAllCertificates(false);
+    const certResults = await withActiveDeployment(
+      async () => deployAllCertificates(false, () => !isStartupShutdownRequested())
+    );
     const certSuccess = certResults.filter(r => r.success).length;
     const certErrors = certResults.filter(r => !r.success).length;
+    for (const result of certResults) {
+      if (result.success && result.fingerprint) {
+        consumedCertificateFingerprints.set(result.certId, result.fingerprint);
+        if (result.version !== undefined) {
+          consumedCertificateVersions.set(result.certId, result.version);
+        }
+      }
+    }
     updateCertStatus(certSuccess, certErrors);
     log.info({ total: certResults.length, success: certSuccess, errors: certErrors }, 'Certificate sync complete');
   }
 
   // Initial sync - secrets
-  if (secretTargets.length > 0) {
+  if (secretTargets.length > 0 && !isStartupShutdownRequested()) {
     log.info('Performing initial secret sync');
-    const secretResults = await deployAllSecrets(false);
+    const secretResults = await withActiveDeployment(
+      async () => deployAllSecrets(false, () => !isStartupShutdownRequested())
+    );
     const secretSuccess = secretResults.filter(r => r.success).length;
     const secretErrors = secretResults.filter(r => !r.success).length;
+    for (const result of secretResults) {
+      if (result.success && result.version !== undefined) {
+        consumedSecretVersions.set(result.secretId, result.version);
+      }
+    }
     updateSecretStatus(secretSuccess, secretErrors);
     log.info({ total: secretResults.length, success: secretSuccess, errors: secretErrors }, 'Secret sync complete');
   }
 
   // Start child process after initial sync (if exec mode)
-  if (childManager) {
+  if (childManager && !isShutdownRequested()) {
+    // From this point, mutation restarts queue behind the serialized initial
+    // start instead of starting a child before initial sync has completed.
+    initialChildStartBarrier.open();
     log.info('Starting child process');
     try {
       await childManager.start();
+      if (!childManager.isHealthy()) {
+        throw new Error('Initial child start did not reach running state');
+      }
+      initialChildStartBarrier.complete();
     } catch (err) {
+      initialChildStartBarrier.fail(err);
       log.error({ err }, 'Failed to start child process');
       // Continue running daemon even if child fails to start
     }
@@ -987,20 +2061,69 @@ export async function startDaemon(options: {
   // Set up polling interval as fallback
   const pollInterval = (config.pollInterval ?? 3600) * 1000;
 
-  const poll = async (): Promise<void> => {
-    if (getIsShuttingDown()) return;
+  const runPoll = async (): Promise<void> => {
+    if (isShutdownRequested()) return;
 
     log.debug('Starting periodic poll');
 
     // Poll certificates
     for (const target of config.targets) {
-      if (getIsShuttingDown()) break;
+      if (isShutdownRequested()) break;
 
       try {
-        const result = await deployCertificate(target, false);
-        if (result.fingerprint !== target.lastFingerprint) {
-          log.info({ name: target.name, message: result.message }, 'Certificate updated during poll');
+        if (certificateRetryQueue.isPending(target.certId)) {
+          await certificateRetryQueue.retryNow(target.certId);
+          continue;
         }
+        await withActiveDeployment(async () => {
+          const consumedFingerprint = consumedCertificateFingerprints.get(target.certId);
+          const result = await deployCertificate({
+            ...target,
+            lastFingerprint: consumedFingerprint,
+          }, false);
+          if (!result.success || !result.fingerprint) {
+            const generation = result.version
+              ?? ((consumedCertificateVersions.get(target.certId) ?? 0) + 1);
+            const event: CertificateEvent = {
+              event: 'certificate.rotated',
+              certificateId: target.certId,
+              fingerprint: result.fingerprint ?? consumedFingerprint ?? '',
+              version: generation,
+              timestamp: new Date().toISOString(),
+            };
+            certificateRetryQueue.enqueue(target.certId, generation, { event, target });
+            log.error(
+              { name: target.name, generation, error: result.message },
+              'Certificate poll deployment failed; mutation remains pending'
+            );
+            return;
+          }
+
+          const generation = result.version ?? 0;
+          const event: CertificateEvent = {
+            event: 'certificate.rotated',
+            certificateId: target.certId,
+            fingerprint: result.fingerprint,
+            version: generation,
+            timestamp: new Date().toISOString(),
+          };
+          const reconciliation = await reconcilePolledMutation({
+            queue: certificateRetryQueue,
+            key: target.certId,
+            generation,
+            value: { event, target },
+            evidence: { fingerprint: result.fingerprint, version: generation },
+            consumedMarker: consumedFingerprint,
+            observedMarker: result.fingerprint,
+          });
+          if (reconciliation === 'resolved') {
+            log.info({ name: target.name, message: result.message }, 'Certificate updated and consumer restarted during poll');
+          } else if (reconciliation === 'pending') {
+            log.error({ name: target.name, generation }, 'Certificate poll mutation remains pending consumer restart');
+          } else if (result.version !== undefined) {
+            consumedCertificateVersions.set(target.certId, result.version);
+          }
+        });
       } catch (err) {
         log.error({ name: target.name, err }, 'Error polling certificate');
       }
@@ -1008,18 +2131,138 @@ export async function startDaemon(options: {
 
     // Poll secrets
     for (const target of secretTargets) {
-      if (getIsShuttingDown()) break;
+      if (isShutdownRequested()) break;
 
       try {
-        const result = await deploySecret(target, false);
-        if (result.version !== target.lastVersion) {
-          log.info({ name: target.name, message: result.message }, 'Secret updated during poll');
+        if (secretRetryQueue.isPending(target.secretId)) {
+          await secretRetryQueue.retryNow(target.secretId);
+          continue;
         }
+        await withActiveDeployment(async () => {
+          const consumedVersion = consumedSecretVersions.get(target.secretId);
+          const result = await deploySecret({
+            ...target,
+            lastVersion: consumedVersion,
+          }, false);
+          if (!result.success || result.version === undefined) {
+            const generation = result.version ?? ((consumedVersion ?? 0) + 1);
+            const event: SecretEvent = {
+              event: 'secret.updated',
+              secretId: target.secretId,
+              alias: target.secretId,
+              version: generation,
+              timestamp: new Date().toISOString(),
+              tenantId: config.tenantId ?? '',
+            };
+            secretRetryQueue.enqueue(target.secretId, generation, {
+              event,
+              target,
+              restartReason: 'secret file updated during poll',
+            });
+            log.error(
+              { name: target.name, generation, error: result.message },
+              'Secret poll deployment failed; mutation remains pending'
+            );
+            return;
+          }
+
+          const event: SecretEvent = {
+            event: 'secret.updated',
+            secretId: target.secretId,
+            alias: target.secretId,
+            version: result.version,
+            timestamp: new Date().toISOString(),
+            tenantId: config.tenantId ?? '',
+          };
+          const item: SecretRetryItem = {
+            event,
+            target,
+            restartReason: 'secret file updated during poll',
+          };
+          const reconciliation = await reconcilePolledMutation({
+            queue: secretRetryQueue,
+            key: target.secretId,
+            generation: result.version,
+            value: item,
+            evidence: { version: result.version },
+            consumedMarker: consumedVersion,
+            observedMarker: result.version,
+          });
+          if (reconciliation === 'resolved') {
+            log.info({ name: target.name, message: result.message }, 'Secret updated and consumer restarted during poll');
+          } else if (reconciliation === 'pending') {
+            log.error({ name: target.name, version: result.version }, 'Secret poll mutation remains pending consumer restart');
+          }
+        });
       } catch (err) {
         log.error({ name: target.name, err }, 'Error polling secret');
       }
     }
+
+    if (!isShutdownRequested() && execSecretIds.length > 0) {
+      await withActiveDeployment(async () => pollExecOnlySecretVersions({
+        references: execSecretIds,
+        fileTargetReferences: secretTargets.map(target => target.secretId),
+        identityByReference: execSecretIdentityByReference,
+        consumedVersions: consumedExecSecretVersions,
+        fetchMetadata: getSecretMetadata,
+        onMutation: async ({ reference, identity, metadata }) => {
+          const key = `exec:${identity}`;
+          const event: SecretEvent = {
+            event: 'secret.updated',
+            secretId: metadata.id,
+            alias: metadata.alias,
+            version: metadata.version,
+            timestamp: new Date().toISOString(),
+            tenantId: config.tenantId ?? '',
+          };
+          const item: SecretRetryItem = {
+            event,
+            restartReason: 'exec secret updated during poll',
+            execIdentity: identity,
+            execPollReference: reference,
+          };
+          secretRetryQueue.enqueuePrepared(key, metadata.version, item, {
+            version: metadata.version,
+          });
+          const resolved = await secretRetryQueue.retryNow(key);
+          if (!resolved) {
+            log.error(
+              { secretId: reference, version: metadata.version },
+              'Exec-only secret poll mutation remains pending consumer restart'
+            );
+          }
+        },
+        onFetchFailure: (reference, identity, err) => {
+          execMetadataUnknown.add(identity);
+          publishPendingSecretHealth();
+          log.error(
+            { err, secretId: reference },
+            'Exec-only secret metadata poll failed; observation state is unknown'
+          );
+        },
+        onFetchSuccess: (reference, identity, metadata) => {
+          let changed = false;
+          for (const candidate of [
+            reference,
+            identity,
+            metadata.id,
+            metadata.alias,
+          ]) {
+            for (const variant of secretReferenceVariants(candidate)) {
+              changed = execMetadataUnknown.delete(variant) || changed;
+            }
+          }
+          if (changed) publishPendingSecretHealth();
+        },
+      }));
+    }
   };
+
+  // setInterval does not await its callback. Keep the entire poll rail
+  // single-flight so two cycles cannot both deploy and enqueue the same lost
+  // mutation before either one publishes pending state.
+  const poll = createSingleFlightOperation(runPoll);
 
   const pollTimer = setInterval(() => {
     poll().catch((e: unknown) => { log.error({ err: e }, 'Poll error'); });
@@ -1033,7 +2276,7 @@ export async function startDaemon(options: {
     const managedKeyFilePath = config.managedKey.filePath;
 
     keySyncTimer = setInterval(() => {
-      if (getIsShuttingDown()) return;
+      if (isShutdownRequested()) return;
 
       void (async () => {
         const syncResult = await syncManagedKeyFile();
@@ -1063,6 +2306,10 @@ export async function startDaemon(options: {
   }
 
   // Graceful shutdown handler
+  let markShutdownStarted!: () => void;
+  const shutdownStarted = new Promise<void>(resolve => {
+    markShutdownStarted = resolve;
+  });
   const shutdown = async (signal: string): Promise<void> => {
     if (getIsShuttingDown()) {
       log.warn('Shutdown already in progress');
@@ -1070,6 +2317,11 @@ export async function startDaemon(options: {
     }
 
     setShuttingDown(true);
+    markShutdownStarted();
+    childManager?.beginShutdown();
+    initialChildStartBarrier.fail(
+      new Error(`Initial child start cancelled by ${signal}`)
+    );
     log.info({ signal }, 'Shutting down');
 
     // Clean up signal handlers to prevent memory leak
@@ -1080,13 +2332,27 @@ export async function startDaemon(options: {
     if (keySyncTimer) clearInterval(keySyncTimer);
     trackedKeyPoller.stop();
     keyRotationPropagator.stop();
+    certificateRetryQueue.stop();
+    secretRetryQueue.stop();
     unifiedClient.disconnect();
 
-    // Stop API key renewal service (managed or standard)
+    // Cancel every source of new mutation work before draining operations
+    // that were already admitted.
     if (isManagedKeyMode()) {
       stopManagedKeyRenewal();
     } else {
       stopApiKeyRenewal();
+    }
+
+    // Leave one minute of the systemd 900s stop budget for final teardown.
+    // Plugin dispatch and child restart remain available until the mutation
+    // that admitted them has completed; only then may those consumers stop.
+    const remainingDeployments = await drainActiveDeployments();
+    if (remainingDeployments > 0) {
+      log.warn(
+        { active: remainingDeployments },
+        'Forcing shutdown with active deployments'
+      );
     }
 
     // Cleanup degraded mode handler
@@ -1109,7 +2375,7 @@ export async function startDaemon(options: {
       }
     }
 
-    // Stop child process first (it needs to exit before we can)
+    // Stop the child only after mutation-triggered restarts have drained.
     if (childManager) {
       log.info('Stopping child process');
       try {
@@ -1117,18 +2383,8 @@ export async function startDaemon(options: {
         log.info('Child process stopped');
       } catch (err) {
         log.error({ err }, 'Error stopping child process');
+        throw err;
       }
-    }
-
-    // Wait for active deployments to complete (max 30 seconds)
-    const startTime = Date.now();
-    while (activeDeployments > 0 && Date.now() - startTime < 30000) {
-      log.info({ active: activeDeployments }, 'Waiting for active deployments');
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-
-    if (activeDeployments > 0) {
-      log.warn({ active: activeDeployments }, 'Forcing shutdown with active deployments');
     }
 
     // Stop TLS certificate manager
@@ -1147,6 +2403,33 @@ export async function startDaemon(options: {
 
   // Handle shutdown signals (using tracked handlers to prevent memory leak)
   setupSignalHandlers(shutdown);
+
+  if (startupShutdownSignal) {
+    await shutdown(startupShutdownSignal);
+    return;
+  }
+
+  const deferredStartupSignal = deferredStartupShutdownSignal();
+  if (deferredStartupSignal) {
+    // SharedMutationLock owns delivery of a signal observed while its mutation
+    // fence was active. Keep the stable runtime handler installed and wait for
+    // that replay; starting shutdown directly here would remove the handler
+    // before the already-scheduled signal arrives and restore OS default exit.
+    log.info(
+      { signal: deferredStartupSignal },
+      'Waiting for deferred startup shutdown replay'
+    );
+    await shutdownStarted;
+    return;
+  }
+
+  // A runtime signal can arrive after handler installation but immediately
+  // before the pending-startup probes above. Do not publish a running state
+  // while its asynchronous shutdown is already in progress.
+  if (getIsShuttingDown()) {
+    await shutdownStarted;
+    return;
+  }
 
   log.info({ pollInterval: config.pollInterval ?? 3600 }, 'Agent running. Press Ctrl+C to stop.');
 }

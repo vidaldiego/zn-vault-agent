@@ -253,9 +253,8 @@ The `syncManagedKeyFile()` function auto-fixes mismatches on restart. This is go
 ## Commands Used for Diagnosis
 
 ```bash
-# Compare key file vs config
-echo "File: $(sudo head -c 16 /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY)"
-echo "Config: $(sudo grep -o 'znv_[a-f0-9]*' /etc/zn-vault-agent/config.json | head -1 | head -c 16)"
+# Compare exact values without printing either credential or a fragment
+sudo sh -c '[ "$(cat /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY)" = "$(jq -r .auth.apiKey /etc/zn-vault-agent/config.json)" ]'
 
 # Check rotation logs
 sudo grep -E 'rotat|keyFile|mismatch' /var/log/zn-vault-agent/agent.log | tail -50

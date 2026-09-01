@@ -93,8 +93,8 @@ export type PluginFactory<TConfig = Record<string, unknown>> = (
 export interface PluginAutoUpdateConfig {
   /** Enable auto-update for this plugin (default: inherits from agent config) */
   enabled?: boolean;
-  /** Release channel: 'latest', 'beta', 'next' (default: 'latest') */
-  channel?: 'latest' | 'beta' | 'next';
+  /** Release channel. Exact Payara recovery uses the isolated 'dr-m4' tag. */
+  channel?: 'latest' | 'beta' | 'next' | 'dr-m4';
 }
 
 /**
@@ -123,12 +123,18 @@ export interface PluginConfig {
 export interface PluginVersionInfo {
   /** Plugin package name */
   package: string;
+  /** Exact registry channel used for this package. */
+  channel?: 'latest' | 'beta' | 'next' | 'dr-m4';
   /** Currently installed version */
   current: string;
   /** Latest available version */
   latest: string;
+  /** Exact target version (alias of latest for explicit update contracts). */
+  targetVersion?: string;
   /** Whether an update is available */
   updateAvailable: boolean;
+  /** Whether the root-owned mutation rail is active. */
+  updaterReady?: boolean;
 }
 
 /**
@@ -354,7 +360,7 @@ export interface SecretDeployedEvent {
 export interface KeyRotatedEvent {
   /** Managed key name */
   keyName: string;
-  /** New key prefix (first 10 chars + ...) for logging */
+  /** Legacy server field for compatibility; consumers must never log it */
   newPrefix: string;
   /** When grace period expires (ISO timestamp) */
   graceExpiresAt?: string;
@@ -404,6 +410,8 @@ export interface SecretChangedEvent {
 export interface PluginHealthStatus {
   /** Plugin name */
   name: string;
+  /** Exact loaded plugin manifest/runtime version. */
+  version?: string;
   /** Health status */
   status: 'healthy' | 'degraded' | 'unhealthy';
   /** Human-readable message */

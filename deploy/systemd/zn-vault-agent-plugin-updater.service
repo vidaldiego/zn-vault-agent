@@ -1,0 +1,28 @@
+[Unit]
+Description=Install one exact ZnVault Payara plugin artifact
+Documentation=https://github.com/zincapp/zn-vault
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=10min
+StartLimitBurst=6
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0022
+StateDirectory=zn-vault-agent-plugin-updater
+StateDirectoryMode=0755
+TimeoutStartSec=10min
+KillMode=control-group
+ExecStart=/usr/local/lib/zn-vault-agent/zn-vault-plugin-update.sh /var/lib/zn-vault-agent/.plugin-update-trigger /var/lib/zn-vault-agent/.plugin-update-active /var/lib/zn-vault-agent-plugin-updater /usr/bin/npm /usr/bin/node
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

@@ -11,6 +11,9 @@ Group=zn-vault-agent
 
 # Working directory
 WorkingDirectory=/var/lib/zn-vault-agent
+RuntimeDirectory=zn-vault-agent
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
 
 # Main executable
 ExecStart=/usr/local/bin/zn-vault-agent start --health-port 9100
@@ -26,6 +29,7 @@ EnvironmentFile=/etc/zn-vault-agent/agent.env
 EnvironmentFile=-/etc/zn-vault-agent/secrets.env
 # Set HOME to data directory (required for conf package and Node.js)
 Environment=HOME=/var/lib/zn-vault-agent
+Environment=NODE_ENV=production
 
 # Logging
 StandardOutput=journal
@@ -33,7 +37,7 @@ StandardError=journal
 SyslogIdentifier=zn-vault-agent
 
 # Shutdown
-TimeoutStopSec=30
+TimeoutStopSec=900
 KillMode=mixed
 KillSignal=SIGTERM
 

@@ -41,7 +41,18 @@ vi.mock('../logger.js', () => ({
 }));
 
 import { configLogger } from '../logger.js';
-import { loadConfig, resetShadowWarningForTesting } from './loader.js';
+import {
+  clearConfigInMemory,
+  getConfigPath,
+  isConfigInMemory,
+  isConfigured,
+  loadConfig,
+  loadPersistedConfig,
+  resetShadowWarningForTesting,
+  setConfigInMemory,
+} from './loader.js';
+
+const realAccessSync = fs.accessSync.bind(fs);
 
 const ENV_VARS = [
   'ZNVAULT_AGENT_CONFIG_DIR',
@@ -84,6 +95,7 @@ describe('loadConfig system-config shadowing warning', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetShadowWarningForTesting();
+    clearConfigInMemory();
 
     for (const key of ENV_VARS) {
       savedEnv[key] = process.env[key];
@@ -96,9 +108,23 @@ describe('loadConfig system-config shadowing warning', () => {
     fs.mkdirSync(path.dirname(hoisted.systemConfigPath), { recursive: true });
     fs.mkdirSync(path.dirname(hoisted.userConfigPath), { recursive: true });
     hoisted.userStore = {};
+
+    // Model the non-root service user's permission check even when the test
+    // runner itself is root (for example inside a Docker release gate).
+    vi.spyOn(fs, 'accessSync').mockImplementation((target, mode) => {
+      if (
+        String(target) === hoisted.systemConfigPath
+        && mode === fs.constants.W_OK
+        && (fs.statSync(hoisted.systemConfigPath).mode & 0o222) === 0
+      ) {
+        throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      }
+      return realAccessSync(target, mode);
+    });
   });
 
   afterEach(() => {
+    clearConfigInMemory();
     for (const key of ENV_VARS) {
       if (savedEnv[key] === undefined) {
         delete process.env[key];
@@ -109,6 +135,7 @@ describe('loadConfig system-config shadowing warning', () => {
     // Make everything writable again so cleanup succeeds
     try { fs.chmodSync(hoisted.systemConfigPath, 0o644); } catch { /* may not exist */ }
     fs.rmSync(tmpDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
   });
 
   it('test_should_warn_when_readonly_system_config_differs_from_user_config', () => {
@@ -181,5 +208,88 @@ describe('loadConfig system-config shadowing warning', () => {
     setUserConfig({ vaultUrl: '', tenantId: '', auth: {} });
     loadConfig();
     expect(shadowWarnings().length).toBe(0);
+  });
+
+  it('test_should_allow_api_key_to_discover_tenant_on_first_request', () => {
+    writeSystemConfig({
+      vaultUrl: 'https://vault.test',
+      tenantId: '',
+      auth: { apiKey: 'znv_test_key' },
+    });
+
+    expect(isConfigured()).toBe(true);
+  });
+
+  it('test_should_allow_bootstrap_token_to_obtain_tenant_during_registration', () => {
+    writeSystemConfig({
+      vaultUrl: 'https://vault.test',
+      tenantId: '',
+      auth: { bootstrapToken: `zrt_${'a'.repeat(64)}` },
+    });
+
+    expect(isConfigured()).toBe(true);
+  });
+
+  it('test_should_still_require_tenant_for_password_auth', () => {
+    writeSystemConfig({
+      vaultUrl: 'https://vault.test',
+      tenantId: '',
+      auth: { username: 'operator', password: 'test-only' },
+    });
+
+    expect(isConfigured()).toBe(false);
+  });
+
+  it('test_should_reject_incomplete_password_auth_even_with_tenant', () => {
+    writeSystemConfig({
+      vaultUrl: 'https://vault.test',
+      tenantId: 'tenant',
+      auth: { username: 'operator' },
+    });
+
+    expect(isConfigured()).toBe(false);
+  });
+
+  it('test_should_accept_complete_password_auth_with_tenant', () => {
+    writeSystemConfig({
+      vaultUrl: 'https://vault.test',
+      tenantId: 'tenant',
+      auth: { username: 'operator', password: 'test-only' },
+    });
+
+    expect(isConfigured()).toBe(true);
+  });
+
+  it('test_should_report_explicit_config_path_even_before_file_exists', () => {
+    process.env.ZNVAULT_AGENT_CONFIG_DIR = path.dirname(hoisted.systemConfigPath);
+
+    expect(fs.existsSync(hoisted.systemConfigPath)).toBe(false);
+    expect(getConfigPath()).toBe(hoisted.systemConfigPath);
+  });
+
+  it('reads repaired persisted auth without replacing the active runtime config', () => {
+    writeSystemConfig({
+      vaultUrl: 'https://vault.persisted.test',
+      tenantId: 'persisted-tenant',
+      auth: { apiKey: 'persisted-test-key' },
+    });
+    setConfigInMemory({
+      vaultUrl: 'https://vault.runtime.test',
+      tenantId: 'runtime-tenant',
+      auth: { apiKey: 'runtime-test-key' },
+      targets: [],
+      secretTargets: [],
+      configFromVault: true,
+    });
+
+    expect(loadPersistedConfig()).toMatchObject({
+      vaultUrl: 'https://vault.persisted.test',
+      auth: { apiKey: 'persisted-test-key' },
+    });
+    expect(isConfigInMemory()).toBe(true);
+    expect(loadConfig()).toMatchObject({
+      vaultUrl: 'https://vault.runtime.test',
+      auth: { apiKey: 'runtime-test-key' },
+    });
   });
 });

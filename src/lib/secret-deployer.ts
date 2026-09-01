@@ -3,14 +3,21 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
 import type { SecretTarget } from './config.js';
-import { chownSafe } from '../utils/shell.js';
+import { chownSafeAsync } from '../utils/shell.js';
+import { runReloadCommand } from '../utils/reload-command.js';
+import { readTemplateFile } from '../utils/template-file.js';
 import { validateOutputPath } from '../utils/path.js';
 import { getSecret } from './api.js';
 import { updateSecretTargetVersion, getSecretTargets, loadConfig } from './config.js';
 import { deployLogger as log } from './logger.js';
 import { metrics } from './metrics.js';
+import {
+  SHARED_MUTATION_LOCK_PATH,
+  SharedMutationLockError,
+  type SharedMutationLockErrorCode,
+  withSharedMutationLock,
+} from './shared-mutation-lock.js';
 
 export interface SecretDeployResult {
   success: boolean;
@@ -19,16 +26,17 @@ export interface SecretDeployResult {
   message: string;
   version?: number;
   durationMs?: number;
+  errorCode?: SharedMutationLockErrorCode;
 }
 
 /**
  * Format secret data according to target format
  */
-function formatSecretData(
+async function formatSecretData(
   data: Record<string, unknown>,
   format: string,
   options: { key?: string; envPrefix?: string; templatePath?: string }
-): string {
+): Promise<string> {
   switch (format) {
     case 'env': {
       const prefix = options.envPrefix ?? '';
@@ -75,10 +83,7 @@ function formatSecretData(
       if (!options.templatePath) {
         throw new Error('Template path must be specified for template format');
       }
-      if (!fs.existsSync(options.templatePath)) {
-        throw new Error(`Template file not found: ${options.templatePath}`);
-      }
-      let template = fs.readFileSync(options.templatePath, 'utf-8');
+      let template = await readTemplateFile(options.templatePath);
       // Replace {{ key }} placeholders
       for (const [k, v] of Object.entries(data)) {
         const value = typeof v === 'string' ? v : JSON.stringify(v);
@@ -95,12 +100,12 @@ function formatSecretData(
 /**
  * Write secret to file with proper permissions (atomic)
  */
-function writeSecretFile(
+async function writeSecretFile(
   filePath: string,
   content: string,
   owner?: string,
   mode?: string
-): void {
+): Promise<void> {
   // Validate path to prevent traversal attacks
   validateOutputPath(filePath);
 
@@ -116,7 +121,7 @@ function writeSecretFile(
   // Set ownership if specified and running as root (using safe chown)
   if (owner && process.getuid?.() === 0) {
     try {
-      chownSafe(tempPath, owner);
+      await chownSafeAsync(tempPath, owner);
     } catch {
       // Ignore chown errors
     }
@@ -150,7 +155,7 @@ export function shouldSkipDeploy(
 /**
  * Deploy a single secret target
  */
-export async function deploySecret(
+async function deploySecretWithLockHeld(
   target: SecretTarget,
   force = false
 ): Promise<SecretDeployResult> {
@@ -177,7 +182,7 @@ export async function deploySecret(
     // Skip file writing for 'none' format (subscribe-only mode)
     if (target.format !== 'none') {
       // Format the data
-      const content = formatSecretData(secret.data, target.format, {
+      const content = await formatSecretData(secret.data, target.format, {
         key: target.key,
         envPrefix: target.envPrefix,
         templatePath: target.templatePath,
@@ -187,21 +192,20 @@ export async function deploySecret(
       if (!target.output) {
         throw new Error(`Output path required for format '${target.format}'`);
       }
-      writeSecretFile(target.output, content, target.owner, target.mode);
+      await writeSecretFile(target.output, content, target.owner, target.mode);
     }
-
-    // Update config with new version
-    updateSecretTargetVersion(target.secretId, secret.version);
 
     // Run reload command if specified
     if (target.reloadCmd) {
-      try {
-        log.debug({ cmd: target.reloadCmd }, 'Running reload command');
-        execSync(target.reloadCmd, { stdio: 'pipe' });
-      } catch (err) {
-        log.warn({ err, cmd: target.reloadCmd }, 'Reload command failed');
+      log.debug({ cmd: target.reloadCmd }, 'Running reload command');
+      const reload = await runReloadCommand(target.reloadCmd);
+      if (!reload.success) {
+        throw new Error(`Reload command failed: ${reload.message}`);
       }
     }
+
+    // Commit the observed version only after the consumer reload is terminal.
+    updateSecretTargetVersion(target.secretId, secret.version);
 
     const durationMs = Date.now() - startTime;
     metrics.secretDeployed(target.name, true, durationMs);
@@ -247,9 +251,53 @@ export async function deploySecret(
 }
 
 /**
+ * Deploy a secret while excluding Payara lifecycle/deployment mutations
+ * performed by the plugin or another agent/CLI process.
+ */
+export async function deploySecret(
+  target: SecretTarget,
+  force = false,
+  mutationLockPath = SHARED_MUTATION_LOCK_PATH
+): Promise<SecretDeployResult> {
+  const startTime = Date.now();
+  try {
+    return await withSharedMutationLock(
+      'secret',
+      async () => deploySecretWithLockHeld(target, force),
+      mutationLockPath
+    );
+  } catch (err) {
+    const durationMs = Date.now() - startTime;
+    const message = err instanceof Error ? err.message : String(err);
+    metrics.secretDeployed(target.name, false, durationMs);
+    log.error(
+      {
+        name: target.name,
+        secretId: target.secretId,
+        err,
+        durationMs,
+      },
+      'Secret deployment blocked by shared mutation fence'
+    );
+    return {
+      success: false,
+      secretId: target.secretId,
+      name: target.name,
+      message,
+      durationMs,
+      errorCode: err instanceof SharedMutationLockError ? err.code : undefined,
+    };
+  }
+}
+
+/**
  * Deploy all configured secret targets
  */
-export async function deployAllSecrets(force = false): Promise<SecretDeployResult[]> {
+export async function deployAllSecrets(
+  force = false,
+  shouldContinue: () => boolean = () => true,
+  mutationLockPath = SHARED_MUTATION_LOCK_PATH
+): Promise<SecretDeployResult[]> {
   const config = loadConfig();
   const targets = config.secretTargets ?? [];
 
@@ -263,7 +311,8 @@ export async function deployAllSecrets(force = false): Promise<SecretDeployResul
   const results: SecretDeployResult[] = [];
 
   for (const target of targets) {
-    const result = await deploySecret(target, force);
+    if (!shouldContinue()) break;
+    const result = await deploySecret(target, force, mutationLockPath);
     results.push(result);
   }
 

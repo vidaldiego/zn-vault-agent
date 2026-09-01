@@ -42,6 +42,14 @@ const hoisted = vi.hoisted(() => {
       (this.listeners[event] ??= []).push(fn);
     }
 
+    once(event: string, fn: Listener): void {
+      const onceListener: Listener = (...args) => {
+        this.off(event, onceListener);
+        fn(...args);
+      };
+      this.on(event, onceListener);
+    }
+
     off(event: string, fn: Listener): void {
       const arr = this.listeners[event];
       if (!arr) return;
@@ -54,7 +62,17 @@ const hoisted = vi.hoisted(() => {
     }
 
     close(): void {
+      if (this.readyState === FakeWebSocket.CONNECTING) {
+        this.readyState = FakeWebSocket.CLOSING;
+        queueMicrotask(() => {
+          this.emit('error', new Error('WebSocket was closed before the connection was established'));
+          this.readyState = FakeWebSocket.CLOSED;
+          this.emit('close', 1006, Buffer.alloc(0));
+        });
+        return;
+      }
       this.readyState = FakeWebSocket.CLOSED;
+      this.emit('close', 1000, Buffer.alloc(0));
     }
 
     terminate(): void {
@@ -62,7 +80,11 @@ const hoisted = vi.hoisted(() => {
     }
 
     emit(event: string, ...args: unknown[]): void {
-      (this.listeners[event] ?? []).slice().forEach((fn) => { fn(...args); });
+      const listeners = (this.listeners[event] ?? []).slice();
+      if (event === 'error' && listeners.length === 0) {
+        throw args[0] instanceof Error ? args[0] : new Error(String(args[0]));
+      }
+      listeners.forEach((fn) => { fn(...args); });
     }
 
     // -- test helpers --------------------------------------------------------
@@ -169,6 +191,9 @@ vi.mock('./heartbeat.js', () => ({
 import { createUnifiedWebSocketClient, setShuttingDown } from './client.js';
 import { onWebSocketAuthFailure } from '../../services/managed-key-renewal.js';
 import { WS_CONSTANTS } from './types.js';
+import { setSecretWebSocketStatus, setWebSocketStatus } from '../health.js';
+import { metrics } from '../metrics.js';
+import { wsLogger } from '../logger.js';
 
 const { state } = hoisted;
 
@@ -193,6 +218,7 @@ async function expectReconnectAfter(delay: number): Promise<void> {
 describe('Unified WebSocket client reconnect behaviour', () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.clearAllMocks();
     vi.spyOn(Math, 'random').mockReturnValue(0); // deterministic delays
     state.instances.length = 0;
     setShuttingDown(false);
@@ -226,6 +252,45 @@ describe('Unified WebSocket client reconnect behaviour', () => {
     lastSocket().simulateOpen();
     lastSocket().simulateServerClose(4001);
     await expectReconnectAfter(2000);
+
+    client.disconnect();
+  });
+
+  it('test_should_publish_connected_health_only_after_server_ack', () => {
+    const client = createUnifiedWebSocketClient([], []);
+    client.connect();
+
+    lastSocket().simulateOpen();
+    expect(setWebSocketStatus).toHaveBeenLastCalledWith(false);
+    expect(setSecretWebSocketStatus).toHaveBeenLastCalledWith(false);
+    expect(metrics.wsConnected).not.toHaveBeenCalled();
+
+    lastSocket().simulateMessage({
+      type: 'connection_established',
+      agentId: 'agent-ack',
+    });
+    expect(setWebSocketStatus).toHaveBeenLastCalledWith(true, expect.any(Date));
+    expect(setSecretWebSocketStatus).toHaveBeenLastCalledWith(true, expect.any(Date));
+    expect(metrics.wsConnected).toHaveBeenCalledOnce();
+
+    client.disconnect();
+  });
+
+  it('does not log malformed message content or credential fragments', () => {
+    const client = createUnifiedWebSocketClient([], []);
+    const canary = 'registration-token-canary-DO-NOT-LOG';
+    client.connect();
+
+    lastSocket().emit('message', `{"token":"${canary}",`);
+
+    const serializedWarnings = JSON.stringify(vi.mocked(wsLogger.warn).mock.calls);
+    expect(serializedWarnings).not.toContain(canary);
+    expect(serializedWarnings).not.toContain(canary.substring(0, 8));
+    expect(wsLogger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      ws: 'unified',
+      errorType: 'SyntaxError',
+      messageBytes: expect.any(Number),
+    }), 'Failed to parse message');
 
     client.disconnect();
   });
@@ -360,5 +425,31 @@ describe('Unified WebSocket client reconnect behaviour', () => {
     await expectReconnectAfter(1000);
 
     client.disconnect();
+  });
+
+  it('safely disconnects while connecting and permits one explicit reconnect', async () => {
+    const client = createUnifiedWebSocketClient([], []);
+    const errorHandler = vi.fn();
+    client.onError(errorHandler);
+
+    client.connect();
+    const connectingSocket = lastSocket();
+    expect(connectingSocket.readyState).toBe(hoisted.FakeWebSocket.CONNECTING);
+
+    expect(() => client.disconnect()).not.toThrow();
+    client.connect();
+    expect(state.instances).toHaveLength(2);
+
+    // `ws` emits the local CONNECTING-abort error asynchronously. It must use
+    // the normal error channel, while the retired socket's close must not
+    // schedule a third connection or disturb the replacement.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(errorHandler).toHaveBeenCalledTimes(1);
+    expect(errorHandler).toHaveBeenCalledWith(expect.any(Error));
+    expect(state.instances).toHaveLength(2);
+    expect(lastSocket().readyState).toBe(hoisted.FakeWebSocket.CONNECTING);
+
+    client.disconnect();
+    await vi.advanceTimersByTimeAsync(0);
   });
 });

@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch for exact Payara plugin update requests
+
+[Path]
+PathExists=/var/lib/zn-vault-agent/.plugin-update-trigger
+Unit=zn-vault-agent-plugin-updater.service
+TriggerLimitIntervalSec=10min
+TriggerLimitBurst=6
+
+[Install]
+WantedBy=paths.target

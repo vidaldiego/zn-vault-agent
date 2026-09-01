@@ -16,14 +16,14 @@ import type { SecretMapping, ExecSecret, EnvFileMapping } from './types.js';
 export function parseSecretMapping(mapping: string): SecretMapping & { literal?: string } {
   const eqIndex = mapping.indexOf('=');
   if (eqIndex === -1) {
-    throw new Error(`Invalid mapping format: ${mapping}. Expected: ENV_VAR=secret-id[.key]`);
+    throw new Error('Invalid mapping format. Expected: ENV_VAR=secret-id[.key]');
   }
 
   const envVar = mapping.substring(0, eqIndex);
   let secretPath = mapping.substring(eqIndex + 1);
 
   if (!envVar || !secretPath) {
-    throw new Error(`Invalid mapping format: ${mapping}. Expected: ENV_VAR=secret-id[.key]`);
+    throw new Error('Invalid mapping format. Expected: ENV_VAR=secret-id[.key]');
   }
 
   // Check for literal: prefix (no vault fetch)
@@ -39,7 +39,7 @@ export function parseSecretMapping(mapping: string): SecretMapping & { literal?:
   if (secretPath.startsWith('api-key:')) {
     const apiKeyName = secretPath.substring(8); // Remove 'api-key:' prefix
     if (!apiKeyName) {
-      throw new Error(`Invalid api-key format: ${mapping}. Expected: ENV_VAR=api-key:name`);
+      throw new Error('Invalid api-key format. Expected: ENV_VAR=api-key:name');
     }
     return {
       envVar,
@@ -114,7 +114,7 @@ export function parseSecretMappingFromConfig(config: ExecSecret): SecretMapping 
 }
 
 /**
- * Parse env file reference from CLI -e/--env-file argument
+ * Parse env file reference from CLI -e/--env-secret argument
  * Formats:
  *   alias:path/to/secret        -> secretId only
  *   alias:path/to/secret:PREFIX_ -> secretId with prefix

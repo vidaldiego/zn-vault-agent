@@ -76,7 +76,6 @@ export interface ManagedKeyStatus {
   isManagedMode: boolean;
   staleKeyDetected: boolean;
   managedKeyName?: string;
-  currentKeyPrefix?: string;
   nextRotationAt?: string;
   graceExpiresAt?: string;
   safetyRails: {

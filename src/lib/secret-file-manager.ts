@@ -172,7 +172,12 @@ export class SecretFileManager {
   }
 
   /**
-   * Register cleanup handler for process exit
+   * Register cleanup for the final process exit.
+   *
+   * Signal ownership belongs to the daemon/CLI entrypoint so it can first
+   * close mutation admission and drain in-flight work. Handling SIGINT or
+   * SIGTERM here would bypass that orderly shutdown and can race child
+   * lifecycle recovery.
    */
   private registerCleanup(): void {
     if (this.cleanupRegistered) return;
@@ -186,8 +191,6 @@ export class SecretFileManager {
     };
 
     process.on('exit', cleanup);
-    process.on('SIGINT', () => { cleanup(); process.exit(130); });
-    process.on('SIGTERM', () => { cleanup(); process.exit(143); });
 
     this.cleanupRegistered = true;
   }

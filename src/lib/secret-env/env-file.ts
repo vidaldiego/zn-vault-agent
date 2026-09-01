@@ -153,7 +153,6 @@ export function updateEnvFile(
     log.info({
       filePath: resolvedPath,
       envVar,
-      valuePrefix: newValue.substring(0, 8),
       added,
     }, 'Env file updated successfully');
 

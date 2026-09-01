@@ -8,20 +8,23 @@ on:
   pull_request:
     branches: [main, master]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
 
     strategy:
       matrix:
-        node-version: ['18', '20', '22']
+        node-version: ['22.13.0', '24']
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -35,8 +38,28 @@ jobs:
       - name: Type check
         run: npm run typecheck
 
+      - name: Validate privileged updater wrappers
+        run: |
+          bash -n deploy/scripts/zn-vault-agent-update.sh
+          bash -n deploy/scripts/zn-vault-plugin-update.sh
+
       - name: Build
         run: npm run build
+
+      - name: Verify updater assets in npm tarball
+        shell: bash
+        run: |
+          package_file=$(npm pack --json | node -e "let data='';process.stdin.on('data',c=>data+=c).on('end',()=>process.stdout.write(JSON.parse(data)[0].filename))")
+          tar -tzf "$package_file" | grep -Fx 'package/deploy/scripts/zn-vault-agent-update.sh'
+          tar -tzf "$package_file" | grep -Fx 'package/deploy/scripts/zn-vault-plugin-update.sh'
+          tar -tzf "$package_file" | grep -Fx 'package/deploy/systemd/zn-vault-agent-plugin-updater.service'
+          tar -tzf "$package_file" | grep -Fx 'package/deploy/systemd/zn-vault-agent-plugin-updater.path'
+          extract_dir=$(mktemp -d)
+          tar -xzf "$package_file" -C "$extract_dir"
+          bash -n "$extract_dir/package/deploy/scripts/zn-vault-agent-update.sh"
+          bash -n "$extract_dir/package/deploy/scripts/zn-vault-plugin-update.sh"
+          bash test/scripts/update-wrapper.bats.sh "$extract_dir/package/deploy/scripts/zn-vault-agent-update.sh"
+          node test/release/packaged-plugin-updater-smoke.mjs "$extract_dir/package/deploy/scripts/zn-vault-plugin-update.sh"
 
       - name: Unit tests
         run: npm run test:unit
@@ -47,12 +70,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version: '22.13.0'
           cache: 'npm'
 
       - name: Install dependencies

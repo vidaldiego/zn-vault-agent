@@ -94,7 +94,7 @@ npm run test:sdk:start
 | EXEC-08 | Signal forwarding (SIGINT) | High |
 | EXEC-09 | Signal forwarding (SIGTERM) | High |
 | EXEC-10 | Exit code propagation | High |
-| EXEC-11 | --env-file mode | Medium |
+| EXEC-11 | --env-secret mode | Medium |
 | EXEC-12 | Secrets not in logs | Critical |
 
 ### 5. WebSocket Tests (`test/websocket.test.ts`)
@@ -391,7 +391,7 @@ agent-tests:
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: '20'
+        node-version: '22.13.0'
 
     - name: Install vault dependencies
       run: npm ci

@@ -41,7 +41,10 @@ znvault host token haproxy-prod
 # Output: zrt_abc123...
 
 # On each server (hostname auto-detected, or use --host-name to override):
-zn-vault-agent login --url https://vault.example.com \
+npm install -g @zincapp/zn-vault-agent
+sudo zn-vault-agent setup --yes
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --bootstrap-token zrt_abc123...
 
 # Or one-command bootstrap:
@@ -52,9 +55,11 @@ curl -fsSL https://vault.example.com/v1/hosts/bootstrap.sh | \
 **Path B - Single Server:**
 ```bash
 npm install -g @zincapp/zn-vault-agent
-sudo zn-vault-agent setup
-zn-vault-agent login --url https://vault.example.com --bootstrap-token zrt_...
-zn-vault-agent certs add <cert-id> --combined /etc/haproxy/certs/frontend.pem
+sudo zn-vault-agent setup --yes
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com --bootstrap-token zrt_...
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent certs add <cert-id> --combined /etc/ssl/znvault/haproxy-frontend.pem
 sudo systemctl enable --now zn-vault-agent
 ```
 
@@ -118,11 +123,13 @@ znvault host token my-server
 # 2. Pass token to new server via cloud-init, Ansible, etc.
 
 # 3. Agent bootstraps with the token (hostname auto-detected)
-zn-vault-agent login --url https://vault.example.com \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --bootstrap-token zrt_abc123...
 
 # Or with explicit hostname:
-zn-vault-agent login --url https://vault.example.com \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --bootstrap-token zrt_abc123... \
   --host-name my-server-01
 ```
@@ -140,7 +147,8 @@ zn-vault-agent login --url https://vault.example.com \
 If you already have a managed API key, the agent auto-detects it and enables auto-rotation:
 
 ```bash
-zn-vault-agent login --url https://vault.example.com \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --api-key znv_abc123...
 # Agent detects managed key, retrieves tenant, and binds automatically
 ```
@@ -150,7 +158,8 @@ zn-vault-agent login --url https://vault.example.com \
 For development or testing only. Static keys don't auto-rotate and require manual renewal:
 
 ```bash
-zn-vault-agent login --url https://vault.example.com \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --api-key znv_abc123...
 # Warning displayed recommending managed keys
 ```
@@ -166,10 +175,41 @@ The fastest way to install on Linux servers:
 npm install -g @zincapp/zn-vault-agent
 
 # Setup systemd service (as root)
-sudo zn-vault-agent setup
+sudo zn-vault-agent setup --yes
 ```
 
-**Requirements:** Node.js 18+ must be installed.
+For an Agent 1 → Agent 2 commissioning, first prove the legacy updater is
+inactive and no old trigger remains. Either failing command is a NO-GO; setup
+will preserve and reject incompatible trigger evidence rather than deleting it:
+
+```bash
+! sudo systemctl is-active --quiet zn-vault-agent-updater.service
+sudo test ! -e /var/lib/zn-vault-agent/.update-trigger
+```
+
+If `configFromVault: true` has no authoritative local plugin declaration and
+the exact global Payara package is still 2.x, Agent 2 records it only as a
+recovery candidate. A reachable Vault still wins (`200` replaces the cache;
+`304` validates it). Only an authentication, bootstrap, or config-fetch failure
+opens the authenticated `UPDATE_REQUIRED` plane. This keeps the exact 2 -> 3
+updater reachable during a Vault outage without importing the legacy plugin,
+starting Payara, or letting stale disk state override Vault.
+
+After the root helper has installed the exact requested 3.x artifact, startup
+confirmation remains pending until that plugin actually starts. The next boot
+requires a complete Vault `200` (never `304`). If Vault is still unavailable,
+only the exact active operation + matching successful root receipt + restart
+marker + installed target manifest opens `STARTUP_CONFIRMATION_PENDING`; its
+authenticated GET stays `202` while a 30-second probe retries persisted
+bootstrap/auth and full config authority without restart-looping. One graceful
+restart is requested after a full `200`, and GET becomes `200` only after the
+normal remote config loads Payara 3 and its startup hook succeeds. Arbitrary
+missing, corrupt, 3.x, or future undeclared manifests cannot authorize either
+fallback. Publishing Agent 2 and Plugin 3 does not commission them on a
+production node.
+
+**Requirements:** Node.js 22.13.0 or newer must be installed. The package
+manager enforces the same minimum through `engines.node`.
 
 **What `setup` does:**
 
@@ -177,11 +217,41 @@ sudo zn-vault-agent setup
 2. Creates directories: `/etc/zn-vault-agent/`, `/var/lib/zn-vault-agent/`, `/var/log/zn-vault-agent/`
 3. Installs systemd service (enabled but not started)
 4. Creates config template at `/etc/zn-vault-agent/agent.env`
+5. Creates `/etc/zn-vault-agent/config.json` as `zn-vault-agent`, mode `0600`
+6. Creates the local mutation-plane credential at
+   `/etc/zn-vault-agent/payara-mutation-token` as `zn-vault-agent`, mode `0600`;
+   an existing valid credential is never overwritten and its value is never printed
+7. Installs and starts the root-owned updater `.path` watcher plus its wrapper
+8. Installs a validated `NOPASSWD` sudoers fragment for the bounded updater command
+9. On detected Payara hosts only, changes `/var/lib/zn-vault-agent` to
+   `zn-vault-agent:<Payara-primary-group>` mode `2750`, adds the Agent account to
+   that group, and installs a systemd drop-in carrying the same supplementary
+   group. This lets Payara read `0640` API-key rotations without granting it write
+   access to the Agent state directory.
+10. On detected Payara hosts only, the same drop-in permits sudo to the Payara
+    account, grants the required `/opt` write paths, and lifts the base unit's
+    memory cap for the Payara JVM
+
+`--yes` skips the interactive summary, not these installation effects. The
+updater watcher does not enable application auto-update by itself; that still
+requires the explicit auto-update configuration.
+
+For every systemd installation, run persistent commands such as `login`,
+`certs add`, and `secret add` with this prefix (later abbreviated examples
+assume it):
+
+```bash
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent <command>
+```
+
+Using a different identity is rejected once the service-owned config exists,
+preventing a configuration that systemd would not read.
 
 **Install specific version or channel:**
 
 ```bash
-npm install -g @zincapp/zn-vault-agent@1.3.0     # Specific version
+npm install -g @zincapp/zn-vault-agent@2.0.0     # Specific version
 npm install -g @zincapp/zn-vault-agent@beta      # Beta channel
 npm install -g @zincapp/zn-vault-agent@next      # Development
 ```
@@ -190,14 +260,16 @@ After installation, configure and start:
 
 ```bash
 # 1. Configure the agent (RECOMMENDED: bootstrap token)
-zn-vault-agent login --url https://vault.example.com \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --bootstrap-token zrt_abc123...
 
 # 2. Add certificate to sync
-zn-vault-agent certs add <cert-id> \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent certs add <cert-id> \
   --name "haproxy-frontend" \
-  --combined /etc/haproxy/certs/frontend.pem \
-  --reload "systemctl reload haproxy"
+  --combined /etc/ssl/znvault/haproxy-frontend.pem \
+  --reload "sudo /usr/bin/systemctl reload haproxy"
 
 # 3. Start service
 sudo systemctl start zn-vault-agent
@@ -207,9 +279,14 @@ sudo systemctl start zn-vault-agent
 
 ```bash
 # If you have a managed or static API key instead of a bootstrap token
-zn-vault-agent login --url https://vault.example.com \
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --api-key znv_abc123...
 ```
+
+The reload command requires a separately managed, least-privilege sudoers rule
+for exactly `/usr/bin/systemctl reload haproxy`. Do not overwrite the
+setup-managed `/etc/sudoers.d/zn-vault-agent` file.
 
 ### Option B: Using znvault CLI
 
@@ -343,7 +420,7 @@ The agent automatically renews API keys before they expire:
 ```
 {"level":"info","msg":"API key status","expiresInDays":25,"isExpiringSoon":true}
 {"level":"info","msg":"API key expiring soon, initiating rotation"}
-{"level":"info","msg":"API key rotated successfully","newPrefix":"znv_abc1"}
+{"level":"info","msg":"API key rotated successfully"}
 {"level":"info","msg":"Config file updated with new API key"}
 ```
 
@@ -436,7 +513,7 @@ Key B                     ██████████████████
 ```json
 {"level":"info","msg":"Managed key refresh scheduled","refreshInMinutes":55,"refreshAt":"2026-01-06T09:55:00Z"}
 {"level":"info","msg":"Binding to managed key","name":"agent-prod-server1"}
-{"level":"info","msg":"Managed key rotated","oldPrefix":"znv_abc1","newPrefix":"znv_xyz9","nextRotationAt":"2026-01-07T10:00:00Z"}
+{"level":"info","msg":"Managed key rotated","nextRotationAt":"2026-01-07T10:00:00Z","source":"scheduled"}
 {"level":"info","msg":"Managed key changed, reconnecting WebSocket"}
 ```
 
@@ -519,7 +596,7 @@ When using managed keys, the agent automatically persists new keys to the config
 {"level":"info","msg":"Starting ZnVault Agent"}
 {"level":"info","msg":"Using managed API key mode"}
 {"level":"info","msg":"Binding to managed key","name":"my-service-key"}
-{"level":"info","msg":"Managed key bound","prefix":"znv_abc1","nextRotationAt":"2026-01-08T20:00:00Z"}
+{"level":"info","msg":"Managed key bound","nextRotationAt":"2026-01-08T20:00:00Z"}
 {"level":"info","msg":"WebSocket connected"}
 {"level":"info","msg":"Managed key refresh scheduled","refreshInMinutes":55}
 ```
@@ -760,7 +837,7 @@ Environment variables override config file values:
 | `ZNVAULT_INSECURE` | Skip TLS verification (`true`/`false`) |
 | `ZNVAULT_AGENT_CONFIG_DIR` | Custom config directory |
 | `LOG_LEVEL` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
-| `LOG_FILE` | Optional log file path |
+| `LOG_FILE` | Optional file mirror for JSON logs; journald remains enabled |
 
 > **Note:** `znapiBaseUrl` is a config-file field only (no env-var override). Set it in `config.json` when deploying nodes that run znapi alongside the agent.
 
@@ -804,7 +881,7 @@ Options:
   --auto-update              Enable automatic updates
   --exec <command>           Command to execute (combined mode)
   -s, --secret <mapping>     Secret mapping for exec (repeatable)
-  -e, --env-file <ref>       Inject all vars from env secret (repeatable)
+  -e, --env-secret <ref>     Inject all vars from env secret (repeatable)
   --restart-on-change        Restart child on cert/secret changes
   --restart-delay <ms>       Delay before restart (default: 5000)
   --max-restarts <n>         Max restarts in window (default: 10)
@@ -903,7 +980,7 @@ zn-vault-agent exec \
   -- ./start.sh
 ```
 
-### Env File Injection (`-e/--env-file`)
+### Env File Injection (`-e/--env-secret`)
 
 Inject **all key-value pairs** from a secret as environment variables in a single command. This is ideal for secrets that contain multiple environment variables.
 
@@ -1067,8 +1144,8 @@ Run the daemon (cert/secret sync) AND manage a child process with injected secre
 zn-vault-agent start \
   --exec "payara start-domain domain1" \
   -s ZINC_CONFIG_USE_VAULT=literal:true \
-  -sf ZINC_CONFIG_API_KEY=api-key:my-managed-key \
-  -sf AWS_SECRET_ACCESS_KEY=alias:infra/prod.awsSecretKey \
+  -F ZINC_CONFIG_API_KEY=api-key:my-managed-key \
+  -F AWS_SECRET_ACCESS_KEY=alias:example/aws-secret-key \
   --restart-on-change \
   --health-port 9100
 ```
@@ -1084,15 +1161,15 @@ zn-vault-agent start \
 
 ### Secure File Mode (v1.6.8+)
 
-For sensitive secrets, use `-sf` (secret-file) instead of `-s` to prevent credential exposure in logs:
+For sensitive secrets, use `-F` (`--secret-file`) instead of `-s` to prevent credential exposure in logs:
 
 ```bash
 # Sensitive secrets via file (recommended for production)
 zn-vault-agent start \
   --exec "python server.py" \
   -s CONFIG_ENV=literal:production \
-  -sf API_KEY=api-key:my-key \
-  -sf DB_PASSWORD=alias:db.password \
+  -F API_KEY=api-key:my-key \
+  -F DB_PASSWORD=alias:db.password \
   --health-port 9100
 ```
 
@@ -1117,7 +1194,7 @@ zn-vault-agent start \
 |--------|---------|-------------|
 | `--exec <cmd>` | - | Command to execute with secrets |
 | `-s <mapping>` | - | Secret as env var (visible in logs) |
-| `-sf <mapping>` | - | Secret as file (secure, never in logs) |
+| `-F, --secret-file <mapping>` | - | Secret as file (secure, never in logs) |
 | `--secrets-to-files` | false | Auto-detect sensitive vars for file mode |
 | `--restart-on-change` | true | Restart child on changes |
 | `--restart-delay <ms>` | 5000 | Delay before restart |
@@ -1144,21 +1221,43 @@ The CLI provides the same configuration commands:
 
 When started with `--health-port`, the agent exposes:
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | JSON health status |
-| `/ready` | GET | Readiness probe (Kubernetes) |
-| `/live` | GET | Liveness probe |
-| `/metrics` | GET | Prometheus metrics |
-| `/scheduler/quiesce` | POST | Scheduler quiesce passthrough (see below) |
-| `/scheduler/status` | GET | Scheduler status passthrough |
-| `/scheduler/resume` | POST | Scheduler resume passthrough |
+| Endpoint | Method | Access | Description |
+|----------|--------|--------|-------------|
+| `/health` | GET | Public | JSON health status |
+| `/ready` | GET | Public | Readiness probe (Kubernetes) |
+| `/live` | GET | Public | Liveness probe |
+| `/metrics` | GET | Public | Prometheus metrics |
+| `/scheduler/quiesce` | POST | Bearer | Scheduler quiesce passthrough (see below) |
+| `/scheduler/status` | GET | Bearer | Scheduler status passthrough |
+| `/scheduler/resume` | POST | Bearer | Scheduler resume passthrough |
+
+Those four monitoring paths are the complete public allowlist on both HTTP and
+HTTPS. Every other path—including agent/plugin version and update routes,
+scheduler passthroughs, unknown paths, and every `/plugins/<name>/...` route—
+requires `Authorization: Bearer <credential>`. `setup` creates the shared
+credential at `/etc/zn-vault-agent/payara-mutation-token` as a private `0600`
+file; a missing or unsafe file aborts daemon startup. The Payara namespace also
+checks the same credential in its inherited plugin guard.
+
+The token value must stay out of argv, environment values, logs, shell history,
+and temporary files. Supported plugin CLI commands read the private file
+directly. A bespoke client must do the same inside its process and construct the
+Authorization header only in memory. `ZNVAULT_CONTROL_TOKEN_FILE`, when used by
+an isolated installer or test, carries a file **path**, never the credential.
 
 ### Scheduler Passthrough Routes
 
 The `/scheduler/*` routes forward requests to the local znapi instance's `/internal/scheduler/*` endpoints. They are used by `znvault-plugin-payara` during scheduler-aware deploys to quiesce (drain in-flight jobs), verify drain, and resume the scheduler after the WAR is deployed.
 
-**No deploy secret.** znapi's `/internal/scheduler/*` filter authorizes purely on loopback (the agent posts to `127.0.0.1`, which the agent already binds to the same box as znapi). So the agent sends **no** `X-Internal-Secret` and requires **no** provisioned secret file — `znapiBaseUrl` is the only configuration. (Before 2026-06-23 the agent read `/etc/zincapi/scheduler-deploy-secret` and returned `500 "deploy secret unreadable"` when it was absent; that requirement, and the provisioning step, are gone.) The agent still sends `X-Internal-Origin: deploy` as audit context, which znapi ignores for authorization.
+**No downstream deploy secret.** The inbound Agent `/scheduler/*` route still
+requires the local control-plane Bearer credential described above. After that
+check, znapi's `/internal/scheduler/*` filter authorizes the Agent's outbound
+request purely on loopback (`127.0.0.1`). The Agent therefore sends no
+`X-Internal-Secret`; `znapiBaseUrl` is the only downstream configuration.
+(Before 2026-06-23 the Agent read `/etc/zincapi/scheduler-deploy-secret` and
+returned `500 "deploy secret unreadable"` when it was absent.) It still sends
+`X-Internal-Origin: deploy` as audit context, which znapi ignores for
+authorization.
 
 **Error responses:**
 
@@ -1193,6 +1292,9 @@ znvault_agent_api_request_duration_seconds{method}
 ## TLS/HTTPS Configuration
 
 The agent can expose its health/metrics endpoints over HTTPS using TLS certificates. There are two modes:
+
+HTTPS uses the same route allowlist and the same local control-plane credential
+as HTTP; enabling TLS does not make control or plugin routes public.
 
 ### Auto-Managed TLS (Recommended)
 
@@ -1381,8 +1483,14 @@ Add plugins to your `config.json`:
 Then install the plugin package:
 
 ```bash
-npm install @zincapp/znvault-plugin-payara
+sudo npm install -g @zincapp/znvault-plugin-payara@^3
 ```
+
+Agent 2.x requires Payara plugin `>=3.0.0 <4.0.0` because both processes must
+use the same ownership-safe mutation lock protocol. On an existing Payara
+host, stage plugin 3 first and Agent 2 second without restarting the service
+between installs, then verify the compatible pair together. Agent 2 fails
+closed before importing a Payara 2.x or unverified future-major entrypoint.
 
 ### Available Plugins
 
@@ -1406,6 +1514,11 @@ Plugins register HTTP routes under `/plugins/<name>/`. For example, the Payara p
 - `GET /plugins/payara/status` - Payara status
 - `GET /plugins/payara/hashes` - WAR file hashes for diff deployment
 - `POST /plugins/payara/deploy` - Apply WAR changes
+
+All plugin routes require the local Bearer credential. Payara applies a second,
+inherited guard using the same token file, so a request must pass both the Agent
+control-plane gate and the plugin namespace gate before body parsing or handler
+execution.
 
 ### Plugin Health
 
@@ -1472,10 +1585,11 @@ Plugin types are exported from `@zincapp/zn-vault-agent/plugins`.
 npm install -g @zincapp/zn-vault-agent
 
 # Setup systemd (as root)
-sudo zn-vault-agent setup
+sudo zn-vault-agent setup --yes
 
-# Configure (tenant is auto-detected from API key)
-zn-vault-agent login --url https://vault.example.com \
+# Configure the same system path and identity used by the service
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent login --url https://vault.example.com \
   --api-key znv_abc123...
 
 # Enable and start
@@ -1489,7 +1603,7 @@ journalctl -u zn-vault-agent -f
 
 | Path | Description |
 |------|-------------|
-| `/usr/local/bin/zn-vault-agent` | Agent binary |
+| Output of `command -v zn-vault-agent` | Agent binary; `setup` records this absolute path in the generated unit |
 | `/etc/zn-vault-agent/config.json` | Main configuration |
 | `/etc/zn-vault-agent/secrets.env` | Sensitive credentials |
 | `/var/lib/zn-vault-agent/` | State directory |
@@ -1501,7 +1615,8 @@ journalctl -u zn-vault-agent -f
 
 ```bash
 # Check configuration
-zn-vault-agent start --validate
+sudo -u zn-vault-agent -H env ZNVAULT_AGENT_CONFIG_DIR=/etc/zn-vault-agent \
+  zn-vault-agent start --validate
 
 # Check logs
 journalctl -u zn-vault-agent -n 50
@@ -1568,9 +1683,8 @@ may be too restrictive for your Node.js version.
 > **Note**: v1.6.12+ disables SystemCallFilter by default. Upgrade to fix this issue:
 > ```bash
 > sudo npm install -g @zincapp/zn-vault-agent@latest
-> sudo cp /usr/lib/node_modules/@zincapp/zn-vault-agent/deploy/systemd/zn-vault-agent.service /etc/systemd/system/
-> sudo systemctl daemon-reload
-> sudo systemctl restart zn-vault-agent
+> # Regenerate the unit with the npm-linked binary path on this host.
+> sudo zn-vault-agent setup --yes
 > ```
 
 **For older versions**, disable the syscall filter manually:
@@ -1595,30 +1709,43 @@ sudo systemctl restart zn-vault-agent
 
 ## Auto-Update
 
-The agent automatically updates itself via npm. Updates are checked every 5 minutes by default.
+The agent supports periodic updates via npm, but periodic agent and plugin
+auto-update are **disabled by default**. When explicitly enabled, updates are
+checked every 5 minutes by default.
 
 ### How It Works
 
-1. Agent periodically checks `npm view @zincapp/zn-vault-agent version`
-2. If a newer version is available, it runs `npm install -g @zincapp/zn-vault-agent`
-3. Agent sends SIGTERM to itself, systemd restarts with new version
-4. Lock file prevents multiple agents from updating simultaneously
+1. The agent periodically resolves the configured exact npm dist-tag (Agent 2
+   defaults to `dr-m4`).
+2. If a newer version is available, it atomically publishes a mode-0600,
+   no-replace v1 update trigger.
+3. The systemd `.path` unit activates the sandbox-external updater oneshot,
+   which runs `npm install -g @zincapp/zn-vault-agent` as root.
+4. The wrapper retains the trigger through npm, persists terminal evidence,
+   and asks systemd to restart the agent; receipt replay closes crash windows.
+5. Runtime locking and the no-replace trigger handoff prevent overlap.
 
 ### Configuration
 
-Auto-update is **enabled by default**. Configure via environment variables:
+Agent and plugin auto-update are independent opt-ins. Enable either one
+explicitly with `true` or `1`:
 
 ```bash
 # In /etc/zn-vault-agent/agent.env:
-AUTO_UPDATE=true           # Enable/disable (default: true)
-AUTO_UPDATE_INTERVAL=300   # Check interval in seconds (default: 300)
-AUTO_UPDATE_CHANNEL=latest # Channel: latest, beta, next (default: latest)
+AUTO_UPDATE=true                  # Agent periodic updates (default: false)
+AUTO_UPDATE_INTERVAL=300          # Check interval in seconds (default: 300)
+AUTO_UPDATE_CHANNEL=dr-m4         # Agent channel: latest, beta, next, dr-m4 (default: dr-m4)
+
+PLUGIN_AUTO_UPDATE=true           # Plugin periodic updates (default: false)
+PLUGIN_AUTO_UPDATE_INTERVAL=300   # Check interval in seconds (default: 300)
+PLUGIN_AUTO_UPDATE_CHANNEL=latest # Channel: latest, beta, next (default: latest)
 ```
 
-Or disable via CLI flag:
+Set either enable flag to `false` or `0` to disable it explicitly. The CLI can
+also force the periodic checkers off:
 
 ```bash
-zn-vault-agent start --no-auto-update
+zn-vault-agent start --no-auto-update --no-plugin-auto-update
 ```
 
 ### Manual Updates
@@ -1631,7 +1758,7 @@ npm outdated -g @zincapp/zn-vault-agent
 npm update -g @zincapp/zn-vault-agent
 
 # Install specific version
-npm install -g @zincapp/zn-vault-agent@1.3.0
+npm install -g @zincapp/zn-vault-agent@2.0.0
 ```
 
 ### Update Channels (npm dist-tags)
@@ -1641,6 +1768,14 @@ npm install -g @zincapp/zn-vault-agent@1.3.0
 | `latest` | `npm install -g @zincapp/zn-vault-agent@latest` | Production releases |
 | `beta` | `npm install -g @zincapp/zn-vault-agent@beta` | Pre-release testing |
 | `next` | `npm install -g @zincapp/zn-vault-agent@next` | Development builds |
+| `dr-m4` | `npm install -g @zincapp/zn-vault-agent@dr-m4` | Fenced Agent 2.x migration |
+
+Agent 2.x is a coordinated migration with Payara plugin 3.x. Its exact stable
+artifacts publish under the temporary `dr-m4` dist-tag, which is the Agent 2
+updater default while periodic update remains opt-in. This leaves `latest` on
+Agent 1.x and causes no implicit rollout. Manual update requests must carry the
+caller UUID, exact current version, and exact target resolved from `dr-m4`;
+promoting to `latest` is a separate fleet decision with before/after receipts.
 
 ## Security Considerations
 
@@ -1692,31 +1827,91 @@ npm run test:coverage
 
 ## Releases
 
-This package uses GitHub Actions for CI/CD with npm's OIDC trusted publishing.
+GitHub Actions splits CI from publication. `.github/workflows/ci.yml` validates
+pushes and pull requests. The tag-triggered `.github/workflows/publish.yml`
+publishes the npm package with OIDC provenance; it does **not** create a GitHub
+Release. The GitHub Release is a separate, explicit operator step.
 
 ### CI Pipeline
 
-On every push to `main` or pull request:
+On every push to `main` or pull request, `.github/workflows/ci.yml` runs:
 - Linting and type checking
 - Build verification
-- Unit tests on Node.js 18, 20, 22
+- Unit tests on Node.js 22.13 and 24
 
 ### Publishing to npm
 
-Releases are automated via git tags:
+Before tagging Agent 2.0.0, pack the exact Agent 2.0.0 and Payara Plugin 3.0.0
+artifacts and run the cross-package smoke against both Node.js 22.13 and 24:
 
 ```bash
-# 1. Bump version in package.json
-npm version patch   # or minor/major
+# Capture the npm fence before any tag exists; this must print a 1.x version
+export AGENT_LATEST_BEFORE="$(npm view @zincapp/zn-vault-agent dist-tags.latest)"
+case "$AGENT_LATEST_BEFORE" in 1.*) ;; *) exit 1 ;; esac
 
-# 2. Push changes and tag
-git push && git push --tags
+# Set the Agent release version without creating a commit or tag
+npm version 2.0.0 --no-git-tag-version
+printf '%s\n' 2.0.0 > VERSION
 
-# GitHub Actions will automatically:
-# - Run tests
-# - Build the package
-# - Publish to npm with provenance
+# Build/package each final release snapshot (in its own repository)
+mkdir -p /tmp/znvault-release
+npm ci && npm run lint && npm run typecheck && npm run test:unit && npm run build
+npm pack --pack-destination /tmp/znvault-release
+
+cd /path/to/znvault-plugin-payara
+npm ci && npm run lint && npm run typecheck && npm run test:unit && npm run build
+npm pack --pack-destination /tmp/znvault-release
+
+cd /path/to/zn-vault-agent
+./test/release/tarball-smoke.sh \
+  /tmp/znvault-release/zincapp-zn-vault-agent-2.0.0.tgz \
+  /tmp/znvault-release/zincapp-znvault-plugin-payara-3.0.0.tgz
 ```
+
+Only after that exact paired-tarball smoke passes:
+
+```bash
+# 1. Review and commit the complete already-smoked snapshot, including every
+#    source, test, workflow, documentation, and version-metadata change
+git status --short
+git diff --check
+git add -A
+git diff --cached --check
+git diff --cached --stat
+git commit -m "chore(release): v2.0.0"
+git push origin HEAD:main
+
+# 2. Wait for CI on that exact commit, then create/push one annotated tag
+git tag -a v2.0.0 -m "v2.0.0"
+git push origin v2.0.0
+
+# 3. After publish.yml succeeds, record the existing latest pointer and create
+#    the non-latest GitHub Release manually
+AGENT_GH_LATEST_BEFORE=$(gh api repos/vidaldiego/zn-vault-agent/releases/latest --jq .tag_name)
+gh release create v2.0.0 --verify-tag --generate-notes --latest=false
+```
+
+Never use `git push --tags`. Record `npm view @zincapp/zn-vault-agent
+dist-tags.latest` before tagging; it must be a 1.x version. After publication,
+verify the exact package and prove that neither npm nor GitHub moved a latest
+pointer:
+
+```bash
+npm view @zincapp/zn-vault-agent@2.0.0 version dist.integrity
+npm view @zincapp/zn-vault-agent dist-tags --json
+test "$(npm view @zincapp/zn-vault-agent dist-tags.latest)" = "$AGENT_LATEST_BEFORE"
+test "$(gh api repos/vidaldiego/zn-vault-agent/releases/latest --jq .tag_name)" = "$AGENT_GH_LATEST_BEFORE"
+test "$AGENT_GH_LATEST_BEFORE" != "v2.0.0"
+gh release view v2.0.0 --json tagName,isDraft,isPrerelease \
+  --jq 'select(.tagName == "v2.0.0" and .isDraft == false and .isPrerelease == false)'
+```
+
+`AGENT_LATEST_BEFORE` is the recorded pre-tag 1.x value. A mismatch is a
+release NO-GO, not something to repair by moving tags during the same run.
+The tag workflow keeps full tests in an unprivileged job. Its minimal OIDC job
+uses `npm ci --ignore-scripts`, builds and packs once, exercises both privileged
+wrappers from that tarball, records its SHA-256, and passes that exact unchanged
+`.tgz` path to `npm publish`; it never publishes the checkout directory.
 
 **Available channels (npm dist-tags):**
 
@@ -1725,15 +1920,19 @@ git push && git push --tags
 | `latest` | Stable releases | `npm install -g @zincapp/zn-vault-agent` |
 | `beta` | Pre-release testing | `npm install -g @zincapp/zn-vault-agent@beta` |
 | `next` | Development builds | `npm install -g @zincapp/zn-vault-agent@next` |
+| `dr-m4` | Fenced Agent 2.x migration artifacts; Agent 2 updater default | `npm install -g @zincapp/zn-vault-agent@dr-m4` |
 
-Pre-release versions (e.g., `1.3.0-beta.1`) are automatically tagged as `beta` or `next`.
+Pre-release versions (e.g., `2.1.0-beta.1`) are automatically tagged as `beta` or `next`.
+Stable Agent 2.x versions publish under `dr-m4`, leaving `latest` unchanged;
+promotion requires a separate verified fleet-migration decision and receipts.
 
-### Manual Release (if needed)
+### Release Recovery
 
-```bash
-npm login
-npm publish --access public
-```
+npm publication is performed only by the tag-triggered GitHub Actions workflow
+with OIDC provenance. If it fails, correct the cause and re-run that workflow
+for the exact existing tag; do not publish a locally built or stale `dist/`
+directory with `npm publish`. Create the GitHub Release only after npm
+publication and the fenced dist-tag checks succeed.
 
 ## License
 

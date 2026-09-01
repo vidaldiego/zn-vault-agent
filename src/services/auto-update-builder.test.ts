@@ -55,4 +55,12 @@ describe('buildAutoUpdateService', () => {
     expect(off.service).toBeInstanceOf(NpmAutoUpdateService);
     expect(on.service).toBeInstanceOf(NpmAutoUpdateService);
   });
+
+  it('never starts the Agent updater in Payara recovery-only mode', () => {
+    const { service, started } = buildAutoUpdateService({ enabled: true }, true, true);
+
+    expect(service).toBeInstanceOf(NpmAutoUpdateService);
+    expect(started).toBe(false);
+    expect(startSpy).not.toHaveBeenCalled();
+  });
 });

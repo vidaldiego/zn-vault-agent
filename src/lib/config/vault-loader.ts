@@ -217,7 +217,10 @@ export async function fetchConfigFromVault(options: FetchConfigOptions): Promise
             modified: true,
           });
         } catch (err) {
-          log.error({ err, data }, 'Failed to parse vault config response');
+          log.error({
+            errorType: err instanceof Error ? err.name : typeof err,
+            responseBytes: Buffer.byteLength(data),
+          }, 'Failed to parse vault config response');
           resolve({
             success: false,
             error: 'Invalid response from vault',
@@ -328,7 +331,7 @@ export async function discoverAgentIdentity(options: {
 
         if (res.statusCode !== 200) {
           log.warn(
-            { statusCode: res.statusCode, body: data },
+            { statusCode: res.statusCode, responseBytes: Buffer.byteLength(data) },
             'Failed to discover agent identity'
           );
           resolve(null);
@@ -343,7 +346,10 @@ export async function discoverAgentIdentity(options: {
           );
           resolve(response);
         } catch (err) {
-          log.error({ err, data }, 'Failed to parse identity response');
+          log.error({
+            errorType: err instanceof Error ? err.name : typeof err,
+            responseBytes: Buffer.byteLength(data),
+          }, 'Failed to parse identity response');
           resolve(null);
         }
       });

@@ -13,6 +13,8 @@ import { AgentRunner, createTempOutputDir } from '../helpers/agent-runner.js';
 import { VaultTestClient, type ManagedApiKey } from '../helpers/vault-client.js';
 import { TEST_ENV, getVaultClient } from '../setup.js';
 
+const testRunId = `${process.pid}-${Date.now()}`;
+
 describe('Exec Mode', () => {
   let agent: AgentRunner;
   let vault: VaultTestClient;
@@ -26,18 +28,20 @@ describe('Exec Mode', () => {
 
     // Create test API key
     testApiKey = await vault.createApiKey({
-      name: 'exec-test-key',
-      expiresInDays: 1,
+      name: `exec-test-key-${testRunId}`,
+      expiresInDays: 90,
       permissions: [
         'secret:read:metadata',
         'secret:read:value',
+        // Required when exec resolves an api-key:name mapping via bind.
+        'api_key:read',
       ],
       tenantId: TEST_ENV.tenantId,
     });
 
     // Create test secrets
     testSecret1 = await vault.createSecret({
-      alias: 'exec/api-key',
+      alias: `exec/api-key-${testRunId}`,
       tenant: TEST_ENV.tenantId,
       type: 'credential',  // Valid types: opaque, credential, setting
       data: {
@@ -47,7 +51,7 @@ describe('Exec Mode', () => {
     });
 
     testSecret2 = await vault.createSecret({
-      alias: 'exec/database',
+      alias: `exec/database-${testRunId}`,
       tenant: TEST_ENV.tenantId,
       type: 'credential',
       data: {
@@ -155,7 +159,7 @@ describe('Exec Mode', () => {
     it('EXEC-04: should write secrets to env file', async () => {
       const envFilePath = resolve(outputDir, 'secrets.env');
 
-      // CLI --env-file writes secrets to file instead of running command
+      // CLI --output writes secrets to file instead of running command
       const result = await agent.exec({
         command: [],  // No command when writing to file
         map: [
@@ -545,7 +549,7 @@ describe('Exec Mode', () => {
     });
   });
 
-  describe('Env File Injection (--env-file / -e)', () => {
+  describe('Env Secret Injection (--env-secret / -e)', () => {
     let envFileSecret: { id: string; alias: string } | null = null;
     let envFileSecret2: { id: string; alias: string } | null = null;
 
@@ -586,7 +590,7 @@ describe('Exec Mode', () => {
       }
     });
 
-    it('EXEC-ENVFILE-01: should inject all vars from env file secret', async () => {
+    it('EXEC-ENVFILE-01: should accept the long --env-secret flag through the real Node CLI', async () => {
       const result = await agent.exec({
         command: ['sh', '-c', 'echo "$DB_HOST|$DB_PORT|$DB_USER"'],
         map: [],
@@ -597,11 +601,12 @@ describe('Exec Mode', () => {
       expect(result.stdout.trim()).toBe('localhost|5432|testuser');
     });
 
-    it('EXEC-ENVFILE-02: should apply prefix to all vars from env file', async () => {
+    it('EXEC-ENVFILE-02: should accept the short -e flag and apply a prefix', async () => {
       const result = await agent.exec({
         command: ['sh', '-c', 'echo "$APP_DB_HOST|$APP_DB_PORT"'],
         map: [],
         envFiles: [`alias:${envFileSecret!.alias}:APP_`],
+        envSecretFlag: '-e',
       });
 
       expect(result.exitCode).toBe(0);
@@ -682,7 +687,7 @@ describe('Exec Mode', () => {
       });
 
       expect(result.exitCode).not.toBe(0);
-      expect(result.stderr.toLowerCase()).toMatch(/required|secret|env-file/);
+      expect(result.stderr.toLowerCase()).toMatch(/required|secret|env-secret/);
     });
   });
 });

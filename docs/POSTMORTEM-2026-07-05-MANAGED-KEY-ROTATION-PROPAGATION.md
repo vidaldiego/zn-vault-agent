@@ -151,7 +151,7 @@ Manual verification on a host after rollout:
 ```bash
 znvault apikey managed rotate <name>
 # within ~60s, WITHOUT restarting the agent:
-sudo head -c 8 /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY
+sudo stat -c '%y %n' /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY
 journalctl -u zn-vault-agent | grep "Managed key rotation propagated"
 ```
 

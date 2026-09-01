@@ -206,4 +206,34 @@ describe('MessageDispatcher update-available', () => {
     expect(updateCalls[0].version).toBe('2.0.0');
     expect(updateCalls[0].channel).toBe('beta');
   });
+
+  it.each([
+    { version: 'not-semver', channel: 'stable', force: false },
+    { version: '2.0.0', channel: 'unknown', force: false },
+    { version: '2.0.0', channel: 'stable', force: 'false' },
+    { version: '2.0.0', force: false },
+  ])('drops malformed top-level update event %# with zero dispatch', (fields) => {
+    dispatcher.handleMessage(null, {
+      type: 'update-available',
+      ...fields,
+    } as unknown as UnifiedAgentEvent);
+
+    expect(updateCalls).toHaveLength(0);
+  });
+
+  it('drops malformed legacy force without dispatch', () => {
+    dispatcher.handleMessage(null, {
+      type: 'event',
+      topic: 'updates',
+      data: {
+        event: 'update.available',
+        version: '2.0.0',
+        channel: 'stable',
+        force: 'false',
+        timestamp: new Date().toISOString(),
+      },
+    } as unknown as UnifiedAgentEvent);
+
+    expect(updateCalls).toHaveLength(0);
+  });
 });

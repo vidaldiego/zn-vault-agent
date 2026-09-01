@@ -2,6 +2,15 @@
 // Safe shell execution utilities - prevent command injection
 
 import { execFileSync } from 'node:child_process';
+import { runProcessGroupCommand } from './reload-command.js';
+
+const SAFE_UNIX_ACCOUNT_NAME = /^[a-z_][a-z0-9_-]{0,30}\$?$/;
+
+function assertSafeUnixAccountName(value: string, kind: 'user' | 'group'): void {
+  if (!SAFE_UNIX_ACCOUNT_NAME.test(value)) {
+    throw new Error(`Unsafe Unix ${kind} name: ${value}`);
+  }
+}
 
 /**
  * Safely change file ownership using execFileSync (no shell invocation).
@@ -17,6 +26,23 @@ export function chownSafe(filePath: string, owner: string): void {
 }
 
 /**
+ * Async ownership change for shared-lock critical sections. Unlike
+ * execFileSync, this keeps the event loop responsive and does not return until
+ * the entire bounded process group is terminal.
+ */
+export async function chownSafeAsync(filePath: string, owner: string): Promise<void> {
+  const [user, group] = owner.split(':');
+  const args = group ? [`${user}:${group}`, filePath] : [user, filePath];
+  const result = await runProcessGroupCommand('chown', args, {
+    timeoutMs: 10_000,
+    operationLabel: 'Ownership command',
+  });
+  if (!result.success) {
+    throw new Error(result.message);
+  }
+}
+
+/**
  * Safely change file permissions using execFileSync (no shell invocation).
  * Prevents command injection by not using string interpolation in a shell.
  *
@@ -25,6 +51,11 @@ export function chownSafe(filePath: string, owner: string): void {
  */
 export function chmodSafe(filePath: string, mode: string): void {
   execFileSync('chmod', [mode, filePath], { stdio: 'pipe' });
+}
+
+/** Validate one sudoers candidate without invoking a shell. */
+export function validateSudoersSafe(filePath: string): void {
+  execFileSync('visudo', ['-cf', filePath], { stdio: 'pipe' });
 }
 
 /**
@@ -63,12 +94,49 @@ export function useraddSafe(username: string, options: {
  * @returns true if user exists
  */
 export function userExists(username: string): boolean {
+  assertSafeUnixAccountName(username, 'user');
   try {
     execFileSync('id', [username], { stdio: 'pipe' });
     return true;
   } catch {
     return false;
   }
+}
+
+/** Resolve a user's primary Unix group without invoking a shell. */
+export function getPrimaryGroupSafe(username: string): string {
+  assertSafeUnixAccountName(username, 'user');
+  const group = execFileSync('id', ['-gn', username], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+  assertSafeUnixAccountName(group, 'group');
+  return group;
+}
+
+/**
+ * Ensure a Unix user is a member of a shared group. Returns true only when
+ * setup changed the account. The post-command identity read is the fail-closed
+ * proof that the requested membership was actually persisted.
+ */
+export function ensureUserInGroupSafe(username: string, group: string): boolean {
+  assertSafeUnixAccountName(username, 'user');
+  assertSafeUnixAccountName(group, 'group');
+
+  const readGroups = (): string[] => execFileSync('id', ['-Gn', username], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim().split(/\s+/).filter(Boolean);
+
+  if (readGroups().includes(group)) return false;
+
+  execFileSync('usermod', ['--append', '--groups', group, username], {
+    stdio: 'pipe',
+  });
+  if (!readGroups().includes(group)) {
+    throw new Error(`Failed to add Unix user ${username} to group ${group}`);
+  }
+  return true;
 }
 
 /**

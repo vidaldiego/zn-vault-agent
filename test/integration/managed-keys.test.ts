@@ -8,10 +8,12 @@
  * detects during login and handles rotation seamlessly.
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { AgentRunner } from '../helpers/agent-runner.js';
 import { VaultTestClient, type ManagedApiKey } from '../helpers/vault-client.js';
 import { TEST_ENV, getVaultClient } from '../setup.js';
+
+const testRunId = `${Date.now()}-${process.pid}`;
 
 // Helper to wait for a condition
 async function waitFor(
@@ -31,7 +33,12 @@ describe('Managed API Keys', () => {
   let agent: AgentRunner;
   let vault: VaultTestClient;
   let managedKey: ManagedApiKey | null = null;
-  let initialBindKey: string | null = null;
+
+  async function bindFreshManagedKey(): Promise<string> {
+    if (!managedKey) throw new Error('Managed key is not initialized');
+    const response = await vault.bindManagedApiKey(managedKey.name, TEST_ENV.tenantId);
+    return response.key;
+  }
 
   beforeAll(async () => {
     vault = await getVaultClient();
@@ -39,22 +46,20 @@ describe('Managed API Keys', () => {
     // Create a managed API key for testing with VERY SHORT times
     // Using 'on-bind' mode so each bind returns a fresh key
     managedKey = await vault.createManagedApiKey({
-      name: `agent-managed-test-${Date.now()}`,
+      name: `agent-managed-test-${testRunId}`,
       permissions: [
         'certificate:read:metadata',
         'certificate:read:value',
         'secret:read:metadata',
         'secret:read:value',
+        // Required for the agent to bind its own managed key.
+        'api_key:read',
       ],
       tenantId: TEST_ENV.tenantId,
       rotationMode: 'on-bind',
       rotationInterval: '60s',  // Minimum allowed rotation interval
       gracePeriod: '30s',       // Minimum allowed grace period (we use expireGracePeriod for fast tests)
     });
-
-    // Get initial key value via bind
-    const bindResponse = await vault.bindManagedApiKey(managedKey.name, TEST_ENV.tenantId);
-    initialBindKey = bindResponse.key;
   }, 30000);
 
   afterAll(async () => {
@@ -73,7 +78,7 @@ describe('Managed API Keys', () => {
     agent.setup();
   });
 
-  afterAll(() => {
+  afterEach(() => {
     agent?.cleanup();
   });
 
@@ -83,7 +88,7 @@ describe('Managed API Keys', () => {
       const result = await agent.login({
         url: TEST_ENV.vaultUrl,
         tenantId: TEST_ENV.tenantId,
-        apiKey: initialBindKey!,
+        apiKey: await bindFreshManagedKey(),
         insecure: TEST_ENV.insecure,
         skipTest: false, // Run connection test to trigger auto-detection
       });
@@ -107,7 +112,7 @@ describe('Managed API Keys', () => {
       await agent.login({
         url: TEST_ENV.vaultUrl,
         tenantId: TEST_ENV.tenantId,
-        apiKey: initialBindKey!,
+        apiKey: await bindFreshManagedKey(),
         insecure: TEST_ENV.insecure,
         skipTest: false,
       });
@@ -122,8 +127,8 @@ describe('Managed API Keys', () => {
     it('MANAGED-03: should work with static API key (no managed key config)', async () => {
       // Create a regular (non-managed) API key
       const staticKey = await vault.createApiKey({
-        name: 'agent-static-test',
-        expiresInDays: 1,
+        name: `agent-static-test-${testRunId}`,
+        expiresInDays: 90,
         permissions: ['certificate:read:metadata', 'certificate:read:value'],
         tenantId: TEST_ENV.tenantId,
       });
@@ -158,7 +163,7 @@ describe('Managed API Keys', () => {
       await agent.login({
         url: TEST_ENV.vaultUrl,
         tenantId: TEST_ENV.tenantId,
-        apiKey: initialBindKey!,
+        apiKey: await bindFreshManagedKey(),
         insecure: TEST_ENV.insecure,
         skipTest: false,
       });
@@ -191,7 +196,7 @@ describe('Managed API Keys', () => {
       await agent.login({
         url: TEST_ENV.vaultUrl,
         tenantId: TEST_ENV.tenantId,
-        apiKey: initialBindKey!,
+        apiKey: await bindFreshManagedKey(),
         insecure: TEST_ENV.insecure,
         skipTest: false,
       });
@@ -306,12 +311,12 @@ describe('Managed API Keys', () => {
       await agent.login({
         url: TEST_ENV.vaultUrl,
         tenantId: TEST_ENV.tenantId,
-        apiKey: initialBindKey!,
+        apiKey: await bindFreshManagedKey(),
         insecure: TEST_ENV.insecure,
         skipTest: false,
       });
 
-      // Run exec with literal value (simpler test that doesn't need apikey:read)
+      // A literal mapping does not perform an additional managed-key bind.
       const result = await agent.exec({
         command: ['node', '-e', 'console.log(process.env.TEST_VALUE)'],
         map: ['TEST_VALUE=literal:managed-key-test-value'],
@@ -339,8 +344,8 @@ describe('Managed API Keys', () => {
     it('MANAGED-10: should continue working if managed key detection fails', async () => {
       // Create a static key
       const staticKey = await vault.createApiKey({
-        name: 'agent-static-fallback-test',
-        expiresInDays: 1,
+        name: `agent-static-fallback-test-${testRunId}`,
+        expiresInDays: 90,
         permissions: ['certificate:read:metadata', 'certificate:read:value'],
         tenantId: TEST_ENV.tenantId,
       });

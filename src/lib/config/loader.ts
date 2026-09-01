@@ -209,6 +209,22 @@ export function loadConfig(): AgentConfig {
 }
 
 /**
+ * Read persisted/environment configuration without replacing the active
+ * config-from-Vault runtime snapshot. This synchronous cache suspension is a
+ * narrow recovery seam: callers can observe repaired credentials/bootstrap
+ * state while the daemon continues serving a synthetic status-only config.
+ */
+export function loadPersistedConfig(): AgentConfig {
+  const runtimeConfig = inMemoryConfig;
+  inMemoryConfig = null;
+  try {
+    return loadConfig();
+  } finally {
+    inMemoryConfig = runtimeConfig;
+  }
+}
+
+/**
  * Get a specific config value
  */
 export function getConfig<K extends keyof AgentConfig>(key: K): AgentConfig[K] {
@@ -223,13 +239,20 @@ export function getConfig<K extends keyof AgentConfig>(key: K): AgentConfig[K] {
  */
 export function isConfigured(): boolean {
   const config = loadConfig();
-  const hasAuth =
-    config.auth.apiKey !== undefined ||
-    process.env.ZNVAULT_API_KEY !== undefined ||
-    config.auth.username !== undefined ||
-    process.env.ZNVAULT_USERNAME !== undefined ||
-    config.auth.bootstrapToken !== undefined; // Bootstrap token counts as pending auth
-  return config.vaultUrl !== '' && config.tenantId !== '' && hasAuth;
+  const hasApiKey = !!(config.auth.apiKey || process.env.ZNVAULT_API_KEY);
+  const username = config.auth.username || process.env.ZNVAULT_USERNAME;
+  const password = config.auth.password || process.env.ZNVAULT_PASSWORD;
+  const hasPasswordAuth = !!(username && password);
+  const hasBootstrapToken = !!config.auth.bootstrapToken;
+  const hasAuth = hasApiKey || hasPasswordAuth || hasBootstrapToken;
+  const hasTenant = !!config.tenantId;
+
+  // API keys are tenant-scoped by the server and login can persist that tenant
+  // through /auth/api-keys/self. Bootstrap tokens receive it during
+  // registration. Requiring tenantId before either flow would block the flow
+  // that obtains it behind "Not configured".
+  const canDiscoverTenant = hasApiKey || hasBootstrapToken;
+  return config.vaultUrl !== '' && hasAuth && (hasTenant || canDiscoverTenant);
 }
 
 /**
@@ -237,7 +260,10 @@ export function isConfigured(): boolean {
  */
 export function getConfigPath(): string {
   const configFile = getConfigFile();
-  if (process.getuid?.() === 0 && fs.existsSync(configFile)) {
+  // A caller-provided config directory is authoritative even before the file
+  // is created. Otherwise report the same existing system file loadConfig()
+  // reads, regardless of the current uid.
+  if (process.env.ZNVAULT_AGENT_CONFIG_DIR || fs.existsSync(configFile)) {
     return configFile;
   }
   return userConfig.path;

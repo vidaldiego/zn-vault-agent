@@ -54,7 +54,7 @@ export interface CertRemoveCommandOptions {
  */
 export interface ExecCommandOptions {
   secret?: string[];
-  envFile?: string[];
+  envSecret?: string[];
   watch?: boolean;
   output?: string;
   inherit?: boolean;

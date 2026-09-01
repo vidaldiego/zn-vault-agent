@@ -13,6 +13,8 @@ import { AgentRunner, createTempOutputDir } from '../helpers/agent-runner.js';
 import { VaultTestClient } from '../helpers/vault-client.js';
 import { TEST_ENV, getVaultClient } from '../setup.js';
 
+const testRunId = `${process.pid}-${Date.now()}`;
+
 describe('Secret Management', () => {
   let agent: AgentRunner;
   let vault: VaultTestClient;
@@ -25,8 +27,8 @@ describe('Secret Management', () => {
 
     // Create test API key with secret permissions
     testApiKey = await vault.createApiKey({
-      name: 'secret-test-key',
-      expiresInDays: 1,
+      name: `secret-test-key-${testRunId}`,
+      expiresInDays: 90,
       permissions: [
         'secret:read:metadata',
         'secret:read:value',
@@ -36,7 +38,7 @@ describe('Secret Management', () => {
 
     // Create test secret with nested data
     testSecret = await vault.createSecret({
-      alias: 'test/db-credentials',
+      alias: `test/db-credentials-${testRunId}`,
       tenant: TEST_ENV.tenantId,
       type: 'credential',
       data: {

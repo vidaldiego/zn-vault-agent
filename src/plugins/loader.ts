@@ -5,7 +5,8 @@ import type { FastifyInstance } from 'fastify';
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import fs from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
+import semver from 'semver';
 import { createLogger } from '../lib/logger.js';
 import type {
   AgentPlugin,
@@ -33,6 +34,52 @@ const PLUGIN_HOOK_TIMEOUT_MS = 30_000;
  */
 const PLUGIN_START_TIMEOUT_MS = 120_000;
 
+const PAYARA_PLUGIN_PACKAGE = '@zincapp/znvault-plugin-payara';
+const PAYARA_PLUGIN_NAME = 'payara';
+const PAYARA_PLUGIN_VERSION_RANGE = '>=3.0.0 <4.0.0';
+
+/** Fatal compatibility failure: continuing without the configured Payara plugin is unsafe. */
+export class PluginCompatibilityError extends Error {
+  readonly code = 'PLUGIN_INCOMPATIBLE_VERSION';
+
+  constructor(identifier: string, version: unknown) {
+    const detectedVersion = typeof version === 'string' && version.length > 0
+      ? version
+      : 'missing or invalid';
+    super(
+      `PLUGIN_INCOMPATIBLE_VERSION: Incompatible Payara plugin '${identifier}' ` +
+      `version ${detectedVersion}. ` +
+      `ZnVault Agent 2.x requires ${PAYARA_PLUGIN_PACKAGE} ${PAYARA_PLUGIN_VERSION_RANGE} ` +
+      'for the ownership-safe cross-process mutation lock. Refusing to start with a legacy ' +
+      `or unverified lock protocol. Install a compatible version with: npm install -g ${PAYARA_PLUGIN_PACKAGE}@^3`
+    );
+    this.name = 'PluginCompatibilityError';
+  }
+}
+
+/** Fatal configured-plugin failure for the Agent 2 / Payara 3 lifecycle pair. */
+export class RequiredPluginLoadError extends Error {
+  readonly code = 'REQUIRED_PLUGIN_LOAD_FAILED';
+  override readonly cause: Error;
+
+  constructor(identifier: string, cause: unknown) {
+    const normalizedCause = cause instanceof Error ? cause : new Error(String(cause));
+    super(
+      `REQUIRED_PLUGIN_LOAD_FAILED: Required plugin '${identifier}' could not be loaded: ` +
+      normalizedCause.message
+    );
+    this.name = 'RequiredPluginLoadError';
+    this.cause = normalizedCause;
+  }
+}
+
+function assertCompatiblePayaraVersion(identifier: string, version: unknown): void {
+  const validVersion = typeof version === 'string' ? semver.valid(version) : null;
+  if (!validVersion || !semver.satisfies(validVersion, PAYARA_PLUGIN_VERSION_RANGE)) {
+    throw new PluginCompatibilityError(identifier, version);
+  }
+}
+
 /** Cached global npm prefix */
 let cachedGlobalPrefix: string | null = null;
 
@@ -46,7 +93,7 @@ function getGlobalNpmPrefix(): string {
   }
 
   try {
-    cachedGlobalPrefix = execSync('npm config get prefix', {
+    cachedGlobalPrefix = execFileSync('npm', ['config', 'get', 'prefix'], {
       encoding: 'utf-8',
       timeout: 10_000,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -81,7 +128,11 @@ function getGlobalNpmPrefix(): string {
  * @param packageName The npm package name (e.g., '@zincapp/my-plugin')
  * @returns The full path to the package directory in global node_modules
  */
-function resolveGlobalPackageDir(packageName: string): string {
+function resolveGlobalPackageDir(packageName: string, globalNodeModulesDir?: string): string {
+  if (globalNodeModulesDir) {
+    return path.join(globalNodeModulesDir, packageName);
+  }
+
   const prefix = getGlobalNpmPrefix();
   // On macOS/Linux: {prefix}/lib/node_modules/{package}
   // On Windows: {prefix}/node_modules/{package}
@@ -97,19 +148,115 @@ function resolveGlobalPackageDir(packageName: string): string {
  * @param packageDir The package directory path
  * @returns The full path to the entry point file
  */
-function resolvePackageEntryPoint(packageDir: string): string {
+interface PackageManifest {
+  version?: unknown;
+  exports?: Record<string, unknown> | string;
+  main?: string;
+  module?: string;
+}
+
+function readPackageManifest(packageDir: string): PackageManifest {
   const pkgJsonPath = path.join(packageDir, 'package.json');
 
   if (!fs.existsSync(pkgJsonPath)) {
     throw new Error(`package.json not found in ${packageDir}`);
   }
 
-  const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8')) as {
-    exports?: Record<string, unknown> | string;
-    main?: string;
-    module?: string;
-  };
+  return JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8')) as PackageManifest;
+}
 
+export interface PayaraManifestInspection {
+  configured: boolean;
+  recoveryRequired: boolean;
+  version?: string;
+}
+
+/**
+ * Config-from-Vault keeps plugin declarations remote, so the local bootstrap
+ * config may not identify a Payara host while Vault itself is unavailable.
+ * Only an exact installed major-2 manifest is actionable without that remote
+ * declaration: it opens the bounded 2 -> 3 recovery plane, never a plugin
+ * import or normal daemon path. Missing, corrupt and non-2 manifests do not
+ * authorize a remote-config bypass.
+ */
+export function inspectInstalledPayaraRecoveryManifest(
+  globalNodeModulesDir?: string
+): PayaraManifestInspection {
+  try {
+    const packageDir = resolveGlobalPackageDir(PAYARA_PLUGIN_PACKAGE, globalNodeModulesDir);
+    const pkgJsonPath = path.join(packageDir, 'package.json');
+    if (!fs.existsSync(pkgJsonPath)) {
+      return { configured: false, recoveryRequired: false };
+    }
+    const manifest = readPackageManifest(packageDir);
+    const version = typeof manifest.version === 'string'
+      ? semver.valid(manifest.version)
+      : null;
+    if (version !== null && version === manifest.version && semver.major(version) === 2) {
+      return { configured: true, recoveryRequired: true, version };
+    }
+  } catch {
+    // An undeclared package is not trusted as configuration. The strict
+    // configured inspection below will still surface any declared failure.
+  }
+  return { configured: false, recoveryRequired: false };
+}
+
+/** Inspect the only recovery state that may precede remote configuration. */
+export function inspectPayaraStartupPreflight(
+  config: AgentConfig,
+  globalNodeModulesDir?: string
+): PayaraManifestInspection {
+  // In config-from-Vault mode the local plugins array is only a cache. It must
+  // never become authoritative before a live conditional fetch has either
+  // replaced it (200) or validated its version (304). The installed 2.x
+  // manifest is therefore only a bounded fallback candidate for a failed
+  // remote-authority attempt; callers must not treat it as permission to skip
+  // that attempt.
+  if (config.configFromVault === true) {
+    return inspectInstalledPayaraRecoveryManifest(globalNodeModulesDir);
+  }
+  return inspectConfiguredPayaraManifest(config, globalNodeModulesDir);
+}
+
+/**
+ * Inspect configured Payara before any import, hook, child process, dynamic
+ * secret or deployment mutation. Exact 2.x is the sole recovery exception;
+ * missing/corrupt/unversioned/future manifests remain fatal.
+ */
+export function inspectConfiguredPayaraManifest(
+  config: AgentConfig,
+  globalNodeModulesDir?: string
+): PayaraManifestInspection {
+  const pluginConfigs = (config as AgentConfig & { plugins?: PluginConfig[] }).plugins ?? [];
+  const payara = pluginConfigs.find(
+    plugin => plugin.package === PAYARA_PLUGIN_PACKAGE && plugin.enabled !== false
+  );
+  if (!payara) return { configured: false, recoveryRequired: false };
+  try {
+    const packageDir = resolveGlobalPackageDir(PAYARA_PLUGIN_PACKAGE, globalNodeModulesDir);
+    const manifest = readPackageManifest(packageDir);
+    const version = typeof manifest.version === 'string'
+      ? semver.valid(manifest.version)
+      : null;
+    if (!version || version !== manifest.version) {
+      throw new PluginCompatibilityError(PAYARA_PLUGIN_PACKAGE, manifest.version);
+    }
+    const major = semver.major(version);
+    if (major === 2) {
+      return { configured: true, recoveryRequired: true, version };
+    }
+    if (major === 3) {
+      return { configured: true, recoveryRequired: false, version };
+    }
+    throw new PluginCompatibilityError(PAYARA_PLUGIN_PACKAGE, version);
+  } catch (err) {
+    if (err instanceof PluginCompatibilityError) throw err;
+    throw new RequiredPluginLoadError(PAYARA_PLUGIN_PACKAGE, err);
+  }
+}
+
+function resolvePackageEntryPoint(packageDir: string, pkgJson: PackageManifest): string {
   // Resolve entry point from exports (ESM) or main (CJS fallback)
   let entryPoint: string | undefined;
 
@@ -184,6 +331,8 @@ export interface PluginLoaderOptions {
   pluginDir?: string;
   /** Skip npm package discovery */
   skipNpmDiscovery?: boolean;
+  /** Override global node_modules discovery (test seam). */
+  globalNodeModulesDir?: string;
 }
 
 /**
@@ -218,9 +367,27 @@ export class PluginLoader extends EventEmitter {
       }
 
       try {
-        await this.loadPlugin(pluginConfig);
+        const loadedPlugin = await this.loadPlugin(pluginConfig);
+        if (pluginConfig.package === PAYARA_PLUGIN_PACKAGE && loadedPlugin === null) {
+          throw new Error(
+            `Required Payara plugin '${PAYARA_PLUGIN_PACKAGE}' was not registered`
+          );
+        }
       } catch (err) {
-        log.error({ err, config: pluginConfig }, 'Failed to load plugin');
+        log.error({
+          err,
+          package: pluginConfig.package,
+          path: pluginConfig.path,
+        }, 'Failed to load plugin');
+        if (err instanceof PluginCompatibilityError) {
+          throw err;
+        }
+        if (pluginConfig.package === PAYARA_PLUGIN_PACKAGE) {
+          // Agent 2 and Payara plugin 3 are one fail-closed lifecycle pair. A
+          // missing, unimportable, invalid, throwing, or duplicate configured
+          // package must abort startup rather than disappear from health.
+          throw new RequiredPluginLoadError(PAYARA_PLUGIN_PACKAGE, err);
+        }
         // Continue loading other plugins
       }
     }
@@ -263,7 +430,10 @@ export class PluginLoader extends EventEmitter {
       } else if (packageName) {
         // Import npm package from global node_modules
         // Always use global npm to ensure consistent plugin versions across the system
-        const globalPackageDir = resolveGlobalPackageDir(packageName);
+        const globalPackageDir = resolveGlobalPackageDir(
+          packageName,
+          this.options.globalNodeModulesDir
+        );
 
         if (!fs.existsSync(globalPackageDir)) {
           throw new Error(
@@ -272,8 +442,15 @@ export class PluginLoader extends EventEmitter {
           );
         }
 
+        const packageManifest = readPackageManifest(globalPackageDir);
+        if (packageName === PAYARA_PLUGIN_PACKAGE) {
+          // This must happen before import: legacy releases execute an
+          // incompatible check/write/rm lock protocol once lifecycle starts.
+          assertCompatiblePayaraVersion(packageName, packageManifest.version);
+        }
+
         // ESM requires importing the actual entry point file, not just the directory
-        const entryPoint = resolvePackageEntryPoint(globalPackageDir);
+        const entryPoint = resolvePackageEntryPoint(globalPackageDir, packageManifest);
         log.debug({ packageName, globalPackageDir, entryPoint }, 'Loading plugin from global npm');
         module = await import(entryPoint) as { default?: AgentPlugin | PluginFactory };
       } else {
@@ -294,6 +471,12 @@ export class PluginLoader extends EventEmitter {
 
       // Validate plugin interface
       this.validatePlugin(plugin);
+
+      if (packageName === PAYARA_PLUGIN_PACKAGE || plugin.name === PAYARA_PLUGIN_NAME) {
+        // Validate the exported identity too, covering local-path plugins and
+        // a package whose runtime export does not match its manifest.
+        assertCompatiblePayaraVersion(identifier, plugin.version);
+      }
 
       // Check for duplicate names
       if (this.plugins.has(plugin.name)) {
@@ -336,6 +519,7 @@ export class PluginLoader extends EventEmitter {
       try {
         await this.loadPlugin({ path: pluginPath });
       } catch (err) {
+        if (err instanceof PluginCompatibilityError) throw err;
         log.warn({ err, path: pluginPath }, 'Failed to load local plugin');
       }
     }
@@ -592,7 +776,11 @@ export class PluginLoader extends EventEmitter {
 
         try {
           const status = await loaded.plugin.healthCheck(ctx);
-          statuses.push(status);
+          statuses.push({
+            ...status,
+            name: loaded.plugin.name,
+            version: loaded.plugin.version,
+          });
 
           // If health check returns healthy and plugin was in error state, recover it
           if (status.status === 'healthy' && loaded.status === 'error') {
@@ -603,7 +791,8 @@ export class PluginLoader extends EventEmitter {
         } catch (err) {
           const error = err instanceof Error ? err : new Error(String(err));
           statuses.push({
-            name,
+            name: loaded.plugin.name,
+            version: loaded.plugin.version,
             status: 'unhealthy',
             message: `Health check failed: ${error.message}`,
           });
@@ -614,14 +803,16 @@ export class PluginLoader extends EventEmitter {
       // No healthCheck method - report based on plugin status
       if (loaded.status === 'error') {
         statuses.push({
-          name,
+          name: loaded.plugin.name,
+          version: loaded.plugin.version,
           status: 'unhealthy',
           message: loaded.error?.message ?? 'Plugin failed to load',
         });
       } else if (loaded.status === 'running') {
         // Running but no health check - assume healthy
         statuses.push({
-          name,
+          name: loaded.plugin.name,
+          version: loaded.plugin.version,
           status: 'healthy',
         });
       }

@@ -332,10 +332,7 @@ export async function syncManagedKeyFile(
         // Fall through to write expected key
       }
     } else if (backupKey) {
-      log.warn({
-        backupPrefix: backupKey.substring(0, 20),
-        expectedPrefix: expectedKey.substring(0, 20),
-      }, 'Backup exists but does not match expected key - using expected key');
+      log.warn({ path: filePath }, 'Backup exists but does not match expected key - using expected key');
     }
   }
 
@@ -351,8 +348,6 @@ export async function syncManagedKeyFile(
     if (probeResult === 'invalid') {
       log.error({
         path: filePath,
-        configKeyPrefix: expectedKey.substring(0, 20),
-        fileKeyPrefix: currentKey.substring(0, 20),
         configSource: describeApiKeySource(),
       }, 'Managed key file differs from config, but the config key FAILED vault authentication - ' +
          'NOT overwriting the key file. The config value is stale (it came from ' +
@@ -372,8 +367,7 @@ export async function syncManagedKeyFile(
   // File is out of sync - fix it with expected key
   log.warn({
     path: filePath,
-    expectedPrefix: expectedKey.substring(0, 20),
-    currentPrefix: currentKey?.substring(0, 20) ?? '(missing)',
+    currentKeyPresent: currentKey !== null,
   }, 'Managed key file OUT OF SYNC - auto-fixing');
 
   try {

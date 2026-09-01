@@ -10,7 +10,7 @@ export interface NpmVersionInfo {
   updateAvailable: boolean;
 }
 
-export type UpdateChannel = 'latest' | 'beta' | 'next';
+export type UpdateChannel = 'latest' | 'beta' | 'next' | 'dr-m4';
 
 export interface UpdateConfig {
   /** Enable auto-updates */
@@ -31,11 +31,14 @@ export const DEFAULT_UPDATE_CONFIG: UpdateConfig = {
   // Production-safe default: disabled. Auto-updating a long-running daemon
   // from npm is a supply-chain risk (no code signing on the upstream
   // package). Opt-in via config: set `update.enabled = true` in
-  // /etc/zn-vault-agent/config.json or ZNVAULT_UPDATE_ENABLED=true after
+  // /etc/zn-vault-agent/config.json or AUTO_UPDATE=true after
   // an internal gating process is in place.
   enabled: false,
   checkIntervalMs: 5 * 60 * 1000, // 5 minutes
-  channel: 'latest',
+  // Agent 2 is fenced from the Agent 1 `latest` fleet while the paired Payara
+  // plugin migration is commissioned. Manual and opt-in periodic updates must
+  // therefore resolve against the exact Agent 2 migration channel.
+  channel: 'dr-m4',
   stagedRolloutMaxDelayMs: 30 * 60 * 1000, // 30 minutes max delay for staged rollout
   healthCheckTimeoutMs: 30_000, // 30 seconds
   rollbackOnFailure: true,

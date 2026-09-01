@@ -5,7 +5,7 @@ import { handleUpdateEvent } from './update-handler.js';
 import type { AgentUpdateEvent } from './types.js';
 import type { NpmAutoUpdateService } from '../../services/npm-auto-update.js';
 
-// The handler only touches the logger and the NpmAutoUpdateService.triggerUpdate
+// The handler only touches the logger and the NpmAutoUpdateService.requestUpdate
 // method, so we mock the logger and pass a stub service.
 const logInfo = vi.fn();
 const logWarn = vi.fn();
@@ -32,13 +32,16 @@ function makeEvent(overrides: Partial<AgentUpdateEvent> = {}): AgentUpdateEvent 
 }
 
 /**
- * Build a stub NpmAutoUpdateService exposing only triggerUpdate, which is the
+ * Build a stub NpmAutoUpdateService exposing only requestUpdate, which is the
  * single method the handler calls.
  */
 function makeService(
-  trigger: NpmAutoUpdateService['triggerUpdate']
+  trigger: NpmAutoUpdateService['requestUpdate']
 ): NpmAutoUpdateService {
-  return { triggerUpdate: trigger } as unknown as NpmAutoUpdateService;
+  return {
+    requestUpdate: trigger,
+    getCurrentVersion: () => '1.20.17',
+  } as unknown as NpmAutoUpdateService;
 }
 
 describe('handleUpdateEvent', () => {
@@ -48,51 +51,50 @@ describe('handleUpdateEvent', () => {
     logError.mockClear();
   });
 
-  it('calls triggerUpdate when the npm auto-update service is present', async () => {
-    const triggerUpdate = vi.fn().mockResolvedValue({
-      success: true,
+  it('requests a durable pending update when the npm auto-update service is present', async () => {
+    const requestUpdate = vi.fn().mockResolvedValue({
+      status: 'pending',
+      requestId: '33333333-3333-4333-8333-333333333333',
+      package: '@zincapp/zn-vault-agent',
       previousVersion: '1.20.17',
-      newVersion: '1.21.0',
-      willRestart: true,
-      message: 'Updated to 1.21.0, restarting in 2 seconds',
+      targetVersion: '1.21.0',
+      pollPath: '/agent/update/33333333-3333-4333-8333-333333333333',
     });
-    const service = makeService(triggerUpdate);
+    const service = makeService(requestUpdate);
 
     await handleUpdateEvent(makeEvent(), service);
 
-    expect(triggerUpdate).toHaveBeenCalledTimes(1);
+    expect(requestUpdate).toHaveBeenCalledTimes(1);
     // Result is logged at info level
     expect(logInfo).toHaveBeenCalled();
   });
 
   it('threads the event force flag into triggerUpdate', async () => {
-    const triggerUpdate = vi.fn().mockResolvedValue({
-      success: true,
-      previousVersion: '1.20.17',
-      newVersion: '1.20.17',
-      willRestart: true,
-      message: 'Forced reinstall of 1.20.17',
-    });
-    const service = makeService(triggerUpdate);
+    const requestUpdate = vi.fn().mockResolvedValue({ status: 'pending' });
+    const service = makeService(requestUpdate);
 
     await handleUpdateEvent(makeEvent({ force: true }), service);
 
-    expect(triggerUpdate).toHaveBeenCalledWith({ force: true });
+    expect(requestUpdate).toHaveBeenCalledWith({
+      requestId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      expectedCurrentVersion: '1.20.17',
+      targetVersion: '1.21.0',
+      force: true,
+    });
   });
 
   it('passes force:false through when the event does not force', async () => {
-    const triggerUpdate = vi.fn().mockResolvedValue({
-      success: true,
-      previousVersion: '1.20.17',
-      newVersion: '1.21.0',
-      willRestart: true,
-      message: 'Updated to 1.21.0',
-    });
-    const service = makeService(triggerUpdate);
+    const requestUpdate = vi.fn().mockResolvedValue({ status: 'pending' });
+    const service = makeService(requestUpdate);
 
     await handleUpdateEvent(makeEvent({ force: false }), service);
 
-    expect(triggerUpdate).toHaveBeenCalledWith({ force: false });
+    expect(requestUpdate).toHaveBeenCalledWith({
+      requestId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      expectedCurrentVersion: '1.20.17',
+      targetVersion: '1.21.0',
+      force: false,
+    });
   });
 
   it('does not throw and warns when no update service is wired', async () => {
@@ -102,23 +104,17 @@ describe('handleUpdateEvent', () => {
   });
 
   it('logs the error and does not throw when triggerUpdate rejects', async () => {
-    const triggerUpdate = vi.fn().mockRejectedValue(new Error('npm registry unreachable'));
-    const service = makeService(triggerUpdate);
+    const requestUpdate = vi.fn().mockRejectedValue(new Error('npm registry unreachable'));
+    const service = makeService(requestUpdate);
 
     await expect(handleUpdateEvent(makeEvent(), service)).resolves.toBeUndefined();
-    expect(triggerUpdate).toHaveBeenCalledTimes(1);
+    expect(requestUpdate).toHaveBeenCalledTimes(1);
     expect(logError).toHaveBeenCalled();
   });
 
   it('logs receipt with version, channel and force', async () => {
-    const triggerUpdate = vi.fn().mockResolvedValue({
-      success: true,
-      previousVersion: '1.20.17',
-      newVersion: '1.21.0',
-      willRestart: true,
-      message: 'ok',
-    });
-    const service = makeService(triggerUpdate);
+    const requestUpdate = vi.fn().mockResolvedValue({ status: 'pending' });
+    const service = makeService(requestUpdate);
 
     await handleUpdateEvent(
       makeEvent({ version: '2.0.0', channel: 'beta', force: true }),

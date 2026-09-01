@@ -13,6 +13,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+const loggerSpies = vi.hoisted(() => ({
+  trace: vi.fn(),
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
 vi.mock('./loader.js', () => ({
   loadConfig: vi.fn(),
   isConfigInMemory: vi.fn(() => false),
@@ -29,13 +37,7 @@ vi.mock('./storage.js', () => ({
 }));
 
 vi.mock('../logger.js', () => ({
-  configLogger: {
-    trace: vi.fn(),
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
+  configLogger: loggerSpies,
 }));
 
 vi.mock('../../utils/shell.js', () => ({
@@ -126,6 +128,14 @@ describe('syncManagedKeyFile probe-before-auto-fix', () => {
     expect(fs.readFileSync(keyFilePath, 'utf-8')).toBe(CONFIG_KEY);
     // The previous (valid-looking) key was preserved as a backup
     expect(fs.readFileSync(`${keyFilePath}.backup`, 'utf-8')).toBe(DISK_KEY);
+
+    const serializedLogs = JSON.stringify(
+      Object.values(loggerSpies).map((spy) => spy.mock.calls)
+    );
+    expect(serializedLogs).not.toContain(CONFIG_KEY);
+    expect(serializedLogs).not.toContain(DISK_KEY);
+    expect(serializedLogs).not.toContain(CONFIG_KEY.substring(0, 20));
+    expect(serializedLogs).not.toContain(DISK_KEY.substring(0, 20));
   });
 
   it('test_should_auto_fix_file_when_probe_is_inconclusive', async () => {

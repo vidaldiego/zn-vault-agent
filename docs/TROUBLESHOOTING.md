@@ -31,7 +31,7 @@ This guide covers common issues and their solutions.
 
 **Symptoms:**
 - Application fails with "Valid authentication required (JWT token or API key)"
-- API key file contains old key (check with `head -c 20 /path/to/api-key-file`)
+- API key file contains the old key (compare exact protected values without printing them)
 - Agent config has different (newer) key than the file
 - Issue occurs after multiple key rotations
 
@@ -69,11 +69,11 @@ The v1.20.13 fix ensures the config is updated synchronously BEFORE dispatching 
    zn-vault-agent --version
 
    # Check logs for managed key tracking
-   sudo grep "Managed API keys tracked" /var/log/zn-vault-agent/agent.log
+   sudo journalctl -u zn-vault-agent -o cat --no-pager | grep "Managed API keys tracked"
    # Should show: {"totalManagedKeys":1,"fromAgent":1,...}
 
    # Check WebSocket subscription includes your key
-   sudo grep "managedKeys" /var/log/zn-vault-agent/agent.log | tail -1
+   sudo journalctl -u zn-vault-agent -o cat --no-pager | grep "managedKeys" | tail -1
    # Should show: "managedKeys":["your-key-name"]
    ```
 
@@ -161,7 +161,7 @@ zn-vault-agent login --url https://vault.example.com \
 **Verification:**
 ```bash
 # After upgrading to v1.20.12+, check logs for plugin event dispatch
-sudo grep "keyRotated event dispatch completed" /var/log/zn-vault-agent/agent.log
+sudo journalctl -u zn-vault-agent -o cat --no-pager | grep "keyRotated event dispatch completed"
 
 # You should see:
 # "Plugin keyRotated event dispatch completed" with handlersInvoked > 0
@@ -205,6 +205,29 @@ other plugin hooks because Payara WAR deployment normally takes 50-90 seconds.
 
 ---
 
+### Payara Mutation Lock Blocks Certificate or Secret Sync
+
+Certificate writes, secret-target writes, reload commands, and Payara plugin
+lifecycle/deployment operations share this exclusive lock:
+
+```text
+/var/lib/zn-vault-agent/znvault-deploy.lock
+```
+
+If another process holds the lock, agent and CLI sync fail closed before
+fetching or writing target data and before running a reload command. Re-run an
+explicit CLI sync after the Payara operation completes; daemon sync also gets
+another opportunity during its configured periodic poll.
+
+The agent never removes an existing lock based on age, malformed contents, or
+a dead PID. A leftover lock may represent an interrupted or ambiguous Payara
+mutation. Do not delete it until all agent, CLI, and plugin mutation entry
+points are quiesced and an operator has verified the exact prior owner and
+Payara application state. Lock removal is therefore a recovery procedure, not
+automatic cleanup.
+
+---
+
 ## WebSocket Connection
 
 ### Connection Drops Frequently
@@ -222,10 +245,10 @@ other plugin hooks because Payara WAR deployment normally takes 50-90 seconds.
 **Diagnosis:**
 ```bash
 # Check connection frequency
-sudo grep "Connecting to unified WebSocket" /var/log/zn-vault-agent/agent.log | wc -l
+sudo journalctl -u zn-vault-agent -o cat --no-pager | grep "Connecting to unified WebSocket" | wc -l
 
 # Check for specific errors
-sudo grep -i "websocket.*error\|websocket.*close" /var/log/zn-vault-agent/agent.log | tail -20
+sudo journalctl -u zn-vault-agent -o cat --no-pager | grep -Ei "websocket.*(error|close)" | tail -20
 ```
 
 ---
@@ -239,7 +262,7 @@ sudo grep -i "websocket.*error\|websocket.*close" /var/log/zn-vault-agent/agent.
 **Diagnosis:**
 ```bash
 # Check what the agent is subscribed to
-sudo grep "Subscriptions updated" /var/log/zn-vault-agent/agent.log | tail -1
+sudo journalctl -u zn-vault-agent -o cat --no-pager | grep "Subscriptions updated" | tail -1
 
 # Should show your certificates, secrets, and managed keys:
 # "subscriptions":{"certificates":[...],"secrets":[...],"managedKeys":[...]}
@@ -255,6 +278,102 @@ sudo grep "Subscriptions updated" /var/log/zn-vault-agent/agent.log | tail -1
 
 ## Diagnostic Commands
 
+### Shutdown During Certificate or Secret Deployment
+
+Certificate and secret write/reload operations share
+`/var/lib/zn-vault-agent/znvault-deploy.lock` with the Payara plugin. The agent
+defers `SIGTERM` and `SIGINT` while it owns that lock, releases it only after the
+mutation finishes, and then replays the signal. WebSocket work that collides
+with the lock is coalesced to the newest target generation; `/health` reports
+`status: "unhealthy"` while such work remains pending.
+
+The packaged and generated systemd units use `TimeoutStopSec=900`. Verify an
+installed unit after upgrading:
+
+```bash
+systemctl show zn-vault-agent -p TimeoutStopUSec
+```
+
+Do not delete an existing `znvault-deploy.lock` automatically. Quiesce every
+agent, CLI and Payara mutation entry point first, verify that no owner is still
+active, and only then follow the explicit operator recovery procedure.
+
+### Legacy Payara Plugin Enters Bounded Recovery
+
+ZnVault Agent 2.0.0 requires `@zincapp/znvault-plugin-payara` 3.0.0 or newer
+for normal operation. An exact globally installed 2.x manifest enters an
+`UPDATE_REQUIRED` recovery daemon instead of importing or starting the legacy
+plugin. Recovery exposes only the public monitoring routes and the
+authenticated exact updater routes (`POST /plugins/update` and
+`GET /plugins/update/:requestId`); Agent update, scheduler, plugin mutation,
+Vault bootstrap/config fetch, child processes, and deployment work remain off.
+
+The manifest-only probe also covers `configFromVault: true` hosts whose local
+bootstrap config has no plugin declaration, but it is only a fallback
+candidate. When authentication is available, the Agent still fetches the
+authoritative Vault config first: a `200` replaces the local cache and a `304`
+validates it. Recovery is selected only when the Agent cannot authenticate,
+bootstrap, or fetch that authority. This keeps the safe 2 -> 3 rail reachable
+during a Vault outage without allowing stale local plugin state to override a
+healthy Vault. An undeclared missing, corrupt, 3.x, or future manifest cannot
+authorize fallback. Once local or fetched configuration is authoritative, a
+configured missing, corrupt, unversioned, or future manifest remains a fatal
+`PLUGIN_INCOMPATIBLE_VERSION` error.
+
+After the root helper installs the exact requested Payara 3 artifact, the
+operation is still non-terminal until the new plugin starts. The next boot
+forces a complete Vault `200`; `304` is insufficient because the persisted
+bootstrap config may never have contained the remote plugin declaration. If
+Vault is still unavailable, only the exact active 2 -> 3 operation, matching
+successful root receipt, restart marker, absence of a local terminal, and exact
+installed target manifest enter `STARTUP_CONFIRMATION_PENDING`. This daemon
+keeps the authenticated operation GET at `202` and retries a full authority
+probe every 30 seconds, re-reading persisted credentials or bootstrap state. It
+does not restart on failed probes, so the systemd start burst is not consumed.
+After one full `200`, it requests one graceful restart; the normal remote config
+must load and start Payara 3 before GET becomes terminal `200` and active intent
+is cleared. Never treat package installation or a root receipt alone as startup
+confirmation.
+
+Inspect package metadata without changing the running host:
+
+```bash
+npm list -g @zincapp/znvault-plugin-payara --depth=0
+```
+
+Use the authenticated exact updater and poll its durable receipt. Do not run a
+second global npm mutation beside the root-owned updater, manually restart on a
+mere `202`, or delete its intent/receipt files. The Agent itself may request the
+two bounded pre-terminal restarts: first after exact root installation evidence,
+and then, only if the first boot entered `STARTUP_CONFIRMATION_PENDING`, after a
+full authoritative Vault `200` returns. Failed authority probes do not restart.
+The operator keeps polling: only successful Payara 3 startup makes GET terminal
+`200`. Do not bypass the gate with a local `path`: a local plugin exporting
+`name: "payara"` is subject to the same compatibility inspection.
+
+### Control-Plane Requests Return 401
+
+Only `/health`, `/ready`, `/live`, and `/metrics` are public. Agent
+version/update, scheduler, unknown, and all plugin routes require the private
+local Bearer credential; Payara checks the same credential a second time in its
+plugin namespace.
+
+Verify metadata without printing the token:
+
+```bash
+sudo stat -c '%U:%G %a %F %h %n' \
+  /etc/zn-vault-agent/payara-mutation-token
+# Expected: zn-vault-agent owner/group, mode 600, regular file, one link
+```
+
+If the file is missing, linked, permissive, or malformed, rerun the normal
+`sudo zn-vault-agent setup --yes` preflight; setup preserves an existing valid
+credential and refuses unsafe state. Never paste the value into curl argv,
+environment variables, logs, shell history, or a temporary header file.
+Supported plugin CLI commands read it directly. The optional
+`ZNVAULT_CONTROL_TOKEN_FILE` value is a file path for isolated tests/installers,
+not the token itself.
+
 ### Quick Health Check
 ```bash
 # Agent service status
@@ -264,7 +383,7 @@ sudo systemctl status zn-vault-agent
 curl -s http://localhost:9100/health | jq .
 
 # Recent logs
-sudo tail -100 /var/log/zn-vault-agent/agent.log | jq -r '.msg' | tail -20
+sudo journalctl -u zn-vault-agent -n 100 -o cat --no-pager | jq -r '.msg' | tail -20
 ```
 
 ### Configuration Check
@@ -283,22 +402,37 @@ cat /etc/zn-vault-agent/config.json | jq '{
 
 ### API Key File Check
 ```bash
+# The Agent writer and Payara reader must share Payara's primary group.
+payara_group="$(id -gn payara)"
+stat -c '%U:%G %a %n' /var/lib/zn-vault-agent
+id -Gn zn-vault-agent
+# Expected: owner zn-vault-agent, group "$payara_group", mode 2750, and the
+# Agent group list contains "$payara_group".
+
 # Check if API key file exists and is recent
 ls -la /var/lib/zn-vault-agent/secrets/
 
-# Compare file key prefix with config key prefix
-echo "File:   $(head -c 12 /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY 2>/dev/null)..."
-echo "Config: $(cat /etc/zn-vault-agent/config.json | jq -r '.auth.apiKey[:12]')..."
-# These should match!
+# Compare exact values without printing either credential or a fragment
+sudo sh -c '[ "$(cat /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY)" = "$(jq -r .auth.apiKey /etc/zn-vault-agent/config.json)" ]'
+# Exit status 0 means they match.
 ```
+
+For a configured Payara `apiKeyFilePath`, the plugin enforces the same contract
+on every atomic replacement: its directory is setgid `2750`, the file is `0640`,
+the Agent owns both, and Payara's primary group owns the group slot. It also
+checks every parent-directory traverse permission. A
+`PAYARA_API_KEY_PERMISSION_CONTRACT` error is a deliberate fail-closed state:
+rerun `sudo zn-vault-agent setup --yes`, restart the Agent so systemd applies
+its supplementary group, and repeat the `stat`/`id` checks. Do not weaken the
+file to world-readable or make the Payara group writable.
 
 ### WebSocket Subscription Check
 ```bash
 # Check current subscriptions
-sudo grep "Subscriptions updated" /var/log/zn-vault-agent/agent.log | tail -1 | jq '.subscriptions'
+sudo journalctl -u zn-vault-agent -o cat --no-pager | grep "Subscriptions updated" | tail -1 | jq '.subscriptions'
 
 # Check managed key tracking (v1.20.12+)
-sudo grep "Managed API keys tracked" /var/log/zn-vault-agent/agent.log | tail -1
+sudo journalctl -u zn-vault-agent -o cat --no-pager | grep "Managed API keys tracked" | tail -1
 ```
 
 ### Force Resync
@@ -307,7 +441,7 @@ sudo grep "Managed API keys tracked" /var/log/zn-vault-agent/agent.log | tail -1
 sudo systemctl restart zn-vault-agent
 
 # Watch logs for sync activity
-sudo tail -f /var/log/zn-vault-agent/agent.log | jq -r '[.time, .module, .msg] | join(" | ")'
+sudo journalctl -u zn-vault-agent -f -o cat | jq -r '[.time, .module, .msg] | join(" | ")'
 ```
 
 ---
@@ -320,7 +454,7 @@ If you're still experiencing issues:
    ```bash
    zn-vault-agent --version
    cat /etc/zn-vault-agent/config.json | jq 'del(.auth.apiKey)'
-   sudo tail -500 /var/log/zn-vault-agent/agent.log > agent-logs.json
+   sudo journalctl -u zn-vault-agent -n 500 -o cat --no-pager > agent-logs.json
    ```
 
 2. **Check release notes** for your version: https://github.com/zincware/zn-vault-agent/releases

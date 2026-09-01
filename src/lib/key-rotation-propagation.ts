@@ -65,8 +65,8 @@ export interface KeyRotatedDispatcher {
 export interface KeyRotationMeta {
   /** Managed key name the rotation applies to */
   keyName: string;
-  /** New key prefix (for logging/plugin event); derived from the key if absent */
-  newPrefix?: string;
+  /** Server-supplied compatibility field for the plugin event; never log it */
+  newPrefix: string;
   /** Next scheduled rotation (ISO timestamp) */
   nextRotationAt?: string;
   /** When the old key's grace period expires (ISO timestamp) */
@@ -267,14 +267,14 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
       log.debug({
         keyName: meta.keyName,
         source: meta.source,
-        keyPrefix: newKey.substring(0, 8),
       }, 'Key already propagated - skipping duplicate rotation propagation');
       return { propagated: false, skipped: 'duplicate', pluginsNotified: 0, envVarsUpdated: [], errors: [] };
     }
 
     const startTime = Date.now();
-    const oldPrefix = deps.config.auth.apiKey?.substring(0, 8) ?? '(none)';
-    const newPrefix = meta.newPrefix ?? newKey.substring(0, 8);
+    // Keep the legacy plugin-event field without ever deriving it from the
+    // credential locally. The server supplies it on every supported path.
+    const newPrefix = meta.newPrefix || '[REDACTED]';
     const errors: string[] = [];
     state.lastDetectedAt = detectedAt;
 
@@ -391,8 +391,6 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
     log.info({
       keyName: meta.keyName,
       source: meta.source,
-      oldPrefix,
-      newPrefix: newKey.substring(0, 8),
       pluginsNotified,
       envVarsUpdated,
       errors: errors.length > 0 ? errors : undefined,

@@ -6,6 +6,7 @@ import chalk from 'chalk';
 import {
   isConfigured,
   loadConfig,
+  loadPersistedConfig,
   getTargets,
   getSecretTargets,
   isManagedKeyMode,
@@ -29,6 +30,15 @@ import {
 import { loadUpdateConfig } from '../services/npm-auto-update.js';
 import { buildAutoUpdateService } from '../services/auto-update-builder.js';
 import { PluginAutoUpdateService, loadPluginUpdateConfig } from '../services/plugin-auto-update.js';
+import {
+  inspectConfiguredPayaraManifest,
+  inspectPayaraStartupPreflight,
+} from '../plugins/loader.js';
+import type { PluginConfig } from '../plugins/types.js';
+import {
+  PAYARA_PLUGIN_PACKAGE,
+  inspectPayaraPostUpdateRecoveryEvidence,
+} from '../services/plugin-update-rail.js';
 import { parseSecretMapping, isSensitiveEnvVar, type ExecSecret } from '../lib/secret-env.js';
 import type { StartCommandOptions } from './types.js';
 
@@ -37,18 +47,94 @@ function collect(value: string, previous: string[]): string[] {
   return previous.concat([value]);
 }
 
+/** Keep only the local transport/control state needed by the exact recovery updater. */
+export function buildPayaraRecoveryConfig(config: AgentConfig): AgentConfig {
+  const recoveryPlugin: PluginConfig = {
+    package: PAYARA_PLUGIN_PACKAGE,
+    enabled: true,
+    autoUpdate: {
+      enabled: false,
+    },
+  };
+  return {
+    ...config,
+    targets: [],
+    secretTargets: [],
+    exec: undefined,
+    globalReloadCmd: undefined,
+    plugins: [recoveryPlugin],
+  };
+}
+
+/**
+ * Re-run the complete persisted authority preflight while a synthetic
+ * post-update process remains status-only. Success means Vault returned a full
+ * configuration body; callers still restart before using it.
+ */
+export async function probeFullVaultConfigurationAuthority(): Promise<boolean> {
+  let config = loadPersistedConfig();
+  if (!isConfigFromVaultEnabled(config)) return false;
+
+  if (needsBootstrapRegistration(config)) {
+    try {
+      const registration = await exchangeBootstrapToken(config);
+      config = applyRegistrationResult(config, registration);
+      saveConfig(config);
+    } catch (err) {
+      logger.warn({ err }, 'Post-update authority bootstrap probe failed');
+      return false;
+    }
+  }
+
+  const apiKey = process.env.ZNVAULT_API_KEY ?? config.auth.apiKey;
+  if (!apiKey) return false;
+  if (!config.agentId) {
+    try {
+      const identity = await discoverAgentIdentity({
+        vaultUrl: config.vaultUrl,
+        apiKey,
+        hostname: config.hostname,
+        tenantId: config.tenantId,
+        insecure: config.insecure,
+      });
+      if (identity) {
+        config = { ...config, agentId: identity.agentId };
+        try {
+          saveConfig(config);
+        } catch (err) {
+          logger.warn({ err }, 'Could not persist identity during post-update authority probe');
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Post-update authority identity probe failed; trying full config fetch');
+    }
+  }
+
+  const result = await fetchConfigFromVault({
+    vaultUrl: config.vaultUrl,
+    apiKey,
+    insecure: config.insecure,
+    agentId: config.agentId,
+    hostConfigId: config.hostConfigId,
+    // Pending startup confirmation must receive the actual remote plugin
+    // declaration; an unqualified 304 is not sufficient.
+    configVersion: undefined,
+  });
+  return result.success && result.modified !== false && result.config !== undefined;
+}
+
 export function registerStartCommand(program: Command): void {
   program
     .command('start')
     .description('Start the certificate sync daemon')
     .option('-v, --verbose', 'Enable verbose logging')
     .option('--health-port <port>', 'Health/metrics HTTP server port (default: disabled)', parseInt)
-    .option('--health-host <host>', 'Health/metrics HTTP server bind host (default: 127.0.0.1; set to 0.0.0.0 only with caution — endpoints are unauthenticated)')
+    .option('--health-host <host>', 'HTTP/HTTPS bind host (default: 127.0.0.1; 0.0.0.0 exposes public monitoring routes, while control/plugin routes still require the local Bearer credential)')
     .option('--validate', 'Validate configuration before starting')
     .option('--foreground', 'Run in foreground (default)')
-    .option('--auto-update', 'Enable automatic updates (uses saved config)')
+    .option('--auto-update', 'Allow automatic updates when explicitly enabled by configuration')
     .option('--no-auto-update', 'Disable automatic updates')
-    .option('--plugin-auto-update', 'Enable automatic plugin updates (default: enabled)')
+    .option('--plugin-auto-update', 'Allow automatic plugin updates when explicitly enabled by configuration')
     .option('--no-plugin-auto-update', 'Disable automatic plugin updates')
     // Exec mode options
     .option('--exec <command>', 'Command to execute with secrets (combined mode)')
@@ -95,8 +181,8 @@ Examples:
   zn-vault-agent start \\
     --exec "python server.py" \\
     -s ZINC_CONFIG_USE_VAULT=literal:true \\
-    -sf ZINC_CONFIG_VAULT_API_KEY=api-key:my-key \\
-    -sf AWS_SECRET_ACCESS_KEY=alias:aws.secretKey \\
+    -F ZINC_CONFIG_VAULT_API_KEY=api-key:my-key \\
+    -F AWS_SECRET_ACCESS_KEY=alias:aws.secretKey \\
     --health-port 9100
 
   # Auto-detect sensitive secrets and write to files
@@ -121,19 +207,113 @@ Examples:
   # See docs/GUIDE.md for systemd service file
 `)
     .action(async (options: StartCommandOptions) => {
-      // Check configuration
-      if (!isConfigured()) {
-        console.error(chalk.red('Not configured. Run: zn-vault-agent login'));
-        process.exit(1);
+      let config = loadConfig();
+      const vaultConfigAuthority = isConfigFromVaultEnabled(config);
+      // A pending startup-confirmation tuple requires a complete authoritative
+      // response on the next normal boot. A 304 cannot safely validate a local
+      // bootstrap file that may never have contained the remote plugin list.
+      // Invalid local evidence still cannot block a healthy remote authority;
+      // it only makes the fetch unconditional and is surfaced if fallback is
+      // later required.
+      let requireFullAuthorityConfig = false;
+      if (vaultConfigAuthority) {
+        try {
+          requireFullAuthorityConfig = inspectPayaraPostUpdateRecoveryEvidence() !== null;
+        } catch (err) {
+          requireFullAuthorityConfig = true;
+          logger.warn(
+            { err },
+            'Local Payara post-update evidence is invalid; requiring a full authoritative config'
+          );
+        }
+      }
+      const preflightManifest = inspectPayaraStartupPreflight(config);
+      const recoveryCandidateVersion = preflightManifest.recoveryRequired
+        ? preflightManifest.version
+        : undefined;
+      let expectedPayaraRecoveryVersion: string | undefined;
+      let expectedPayaraPostUpdateRecoveryVersion: string | undefined;
+      let postUpdateAuthorityProbe: (() => Promise<boolean>) | undefined;
+      const payaraRecoverySelected = (): boolean =>
+        expectedPayaraRecoveryVersion !== undefined
+        || expectedPayaraPostUpdateRecoveryVersion !== undefined;
+      const activatePayaraRecovery = (reason: string, err?: unknown): boolean => {
+        if (recoveryCandidateVersion) {
+          config = buildPayaraRecoveryConfig(config);
+          setConfigInMemory(config);
+          expectedPayaraRecoveryVersion = recoveryCandidateVersion;
+          logger.error(
+            {
+              package: PAYARA_PLUGIN_PACKAGE,
+              version: expectedPayaraRecoveryVersion,
+              reason,
+              ...(err === undefined ? {} : { err }),
+            },
+            'UPDATE_REQUIRED fallback: exact Payara recovery selected'
+          );
+          return true;
+        }
+
+        // An installed major 3 alone is never authority. Only the exact,
+        // root-attested 2 -> 3 operation tuple may keep its status endpoint
+        // alive while config-from-Vault is temporarily unavailable.
+        if (!vaultConfigAuthority) return false;
+        const evidence = inspectPayaraPostUpdateRecoveryEvidence();
+        if (!evidence) return false;
+
+        const recoveryConfig = buildPayaraRecoveryConfig(config);
+        const installedManifest = inspectConfiguredPayaraManifest(recoveryConfig);
+        if (
+          !installedManifest.configured
+          || installedManifest.recoveryRequired
+          || installedManifest.version !== evidence.targetVersion
+        ) {
+          throw new Error(
+            'Installed Payara post-update manifest does not match the root-attested target'
+          );
+        }
+
+        postUpdateAuthorityProbe = probeFullVaultConfigurationAuthority;
+        config = recoveryConfig;
+        setConfigInMemory(config);
+        expectedPayaraPostUpdateRecoveryVersion = evidence.targetVersion;
+        logger.error(
+          {
+            package: PAYARA_PLUGIN_PACKAGE,
+            requestId: evidence.requestId,
+            previousVersion: evidence.previousVersion,
+            version: evidence.targetVersion,
+            reason,
+            ...(err === undefined ? {} : { err }),
+          },
+          'STARTUP_CONFIRMATION_PENDING fallback: root-attested Payara target selected'
+        );
+        return true;
+      };
+
+      // Local configuration is authoritative, so an explicitly configured
+      // exact 2.x package may enter recovery immediately. In config-from-Vault
+      // mode the same installed manifest is only a fallback candidate: the
+      // remote authority must win whenever it can answer.
+      if (!vaultConfigAuthority && recoveryCandidateVersion) {
+        activatePayaraRecovery('authoritative local configuration requires Payara 2.x recovery');
       }
 
-      let config = loadConfig();
+      // Normal operation requires Vault authentication. Exact Payara recovery
+      // authenticates its bounded local control plane with the separate token
+      // file and must remain available even when Vault credentials are broken.
+      if (!payaraRecoverySelected() && !isConfigured()) {
+        if (!vaultConfigAuthority || !activatePayaraRecovery('remote configuration cannot be authenticated')) {
+          console.error(chalk.red('Not configured. Run: zn-vault-agent login'));
+          process.exit(1);
+        }
+      }
 
       // ========================================================================
       // Bootstrap Registration (one-command deployment)
       // ========================================================================
       // If config has a bootstrap token but no API key, register with vault first
-      if (needsBootstrapRegistration(config)) {
+      if (!payaraRecoverySelected() && needsBootstrapRegistration(config)) {
         console.log(chalk.cyan('Bootstrap mode detected, registering with vault...'));
         logger.info({ vaultUrl: config.vaultUrl, hostname: config.hostname }, 'Starting bootstrap registration');
 
@@ -164,25 +344,35 @@ Examples:
             'Bootstrap registration complete, config persisted'
           );
         } catch (err) {
-          console.error(chalk.red('Bootstrap registration failed:'), err instanceof Error ? err.message : String(err));
-          console.error(chalk.yellow('Hint: Ensure the vault server is reachable and your bootstrap token is valid.'));
-          logger.error({ err }, 'Bootstrap registration failed');
-          process.exit(1);
+          if (!vaultConfigAuthority || !activatePayaraRecovery('bootstrap registration failed', err)) {
+            console.error(chalk.red('Bootstrap registration failed:'), err instanceof Error ? err.message : String(err));
+            console.error(chalk.yellow('Hint: Ensure the vault server is reachable and your bootstrap token is valid.'));
+            logger.error({ err }, 'Bootstrap registration failed');
+            process.exit(1);
+          }
         }
       }
 
       // Config-from-vault mode: fetch config from vault server at startup
-      if (isConfigFromVaultEnabled(config)) {
+      if (!payaraRecoverySelected() && isConfigFromVaultEnabled(config)) {
         // Auto-discover agent ID if not set (enables linking to host config)
         if (!config.agentId && config.auth?.apiKey) {
           console.log(chalk.cyan('Discovering agent identity from vault...'));
-          const identity = await discoverAgentIdentity({
-            vaultUrl: config.vaultUrl,
-            apiKey: config.auth.apiKey,
-            hostname: config.hostname,
-            tenantId: config.tenantId,
-            insecure: config.insecure,
-          });
+          let identity: Awaited<ReturnType<typeof discoverAgentIdentity>> = null;
+          try {
+            identity = await discoverAgentIdentity({
+              vaultUrl: config.vaultUrl,
+              apiKey: config.auth.apiKey,
+              hostname: config.hostname,
+              tenantId: config.tenantId,
+              insecure: config.insecure,
+            });
+          } catch (err) {
+            // Identity discovery is best-effort. The authoritative config
+            // request can still succeed by hostConfigId or hostname and must
+            // be attempted before considering the installed 2.x fallback.
+            logger.warn({ err }, 'Agent identity discovery failed; continuing to config fetch');
+          }
 
           if (identity) {
             config.agentId = identity.agentId;
@@ -209,23 +399,43 @@ Examples:
         console.log(chalk.cyan('Config-from-vault mode enabled, fetching config from vault...'));
         logger.info({ vaultUrl: config.vaultUrl }, 'Fetching config from vault');
 
-        const result = await fetchConfigFromVault({
-          vaultUrl: config.vaultUrl,
-          apiKey: config.auth.apiKey ?? '',
-          insecure: config.insecure,
-          agentId: config.agentId,
-          hostConfigId: config.hostConfigId,
-          configVersion: config.configVersion,
-        });
-
-        if (!result.success) {
-          console.error(chalk.red('Failed to fetch config from vault:'), result.error);
-          console.error(chalk.yellow('Hint: Ensure the vault server is reachable and your API key is valid.'));
-          logger.error({ error: result.error }, 'Failed to fetch config from vault');
-          process.exit(1);
+        let result: Awaited<ReturnType<typeof fetchConfigFromVault>>;
+        try {
+          result = await fetchConfigFromVault({
+            vaultUrl: config.vaultUrl,
+            apiKey: config.auth.apiKey ?? '',
+            insecure: config.insecure,
+            agentId: config.agentId,
+            hostConfigId: config.hostConfigId,
+            configVersion: requireFullAuthorityConfig ? undefined : config.configVersion,
+          });
+        } catch (err) {
+          if (!activatePayaraRecovery('remote configuration request threw', err)) {
+            throw err;
+          }
+          result = { success: false, error: err instanceof Error ? err.message : String(err) };
         }
 
-        if (result.config) {
+        if (
+          result.success
+          && requireFullAuthorityConfig
+          && (result.modified === false || result.config === undefined)
+        ) {
+          result = {
+            success: false,
+            error: 'Full authoritative config required while Payara startup confirmation is pending',
+          };
+        }
+
+        if (!result.success) {
+          if (!payaraRecoverySelected()
+            && !activatePayaraRecovery('remote configuration request failed', result.error)) {
+            console.error(chalk.red('Failed to fetch config from vault:'), result.error);
+            console.error(chalk.yellow('Hint: Ensure the vault server is reachable and your API key is valid.'));
+            logger.error({ error: result.error }, 'Failed to fetch config from vault');
+            process.exit(1);
+          }
+        } else if (result.config) {
           // Merge vault config with local config (keep local auth and managed key file settings)
           config = {
             ...result.config,
@@ -253,6 +463,35 @@ Examples:
           logger.debug({ version: result.version }, 'Config not modified');
         }
       }
+
+      // Inspect the installed Payara manifest before constructing or starting
+      // either background updater. Exact 2.x runs as a recovery-only control
+      // plane, where Agent self-update and periodic plugin polling are both
+      // forbidden; only the exact manual Payara 2 -> 3 rail remains available.
+      const payaraManifest = inspectConfiguredPayaraManifest(config);
+      if (
+        expectedPayaraRecoveryVersion
+        && (!payaraManifest.recoveryRequired
+          || payaraManifest.version !== expectedPayaraRecoveryVersion)
+      ) {
+        throw new Error('Installed Payara recovery manifest changed during startup');
+      }
+      if (
+        expectedPayaraPostUpdateRecoveryVersion
+        && (!payaraManifest.configured
+          || payaraManifest.recoveryRequired
+          || payaraManifest.version !== expectedPayaraPostUpdateRecoveryVersion)
+      ) {
+        throw new Error('Installed Payara post-update manifest changed during startup');
+      }
+      if (payaraManifest.recoveryRequired) {
+        if (!payaraManifest.version) {
+          throw new Error('Installed Payara recovery manifest has no exact version');
+        }
+        expectedPayaraRecoveryVersion = payaraManifest.version;
+      }
+      const payaraRecoveryOnly = payaraManifest.recoveryRequired
+        || expectedPayaraPostUpdateRecoveryVersion !== undefined;
 
       const targets = getTargets();
       const secretTargets = getSecretTargets();
@@ -289,7 +528,7 @@ Examples:
           try {
             secrets.push(createExecSecret(mapping, false));
           } catch (err) {
-            console.error(chalk.red('Invalid secret mapping:'), mapping);
+            console.error(chalk.red('Invalid secret mapping'));
             console.error(err instanceof Error ? err.message : String(err));
             process.exit(1);
           }
@@ -300,7 +539,7 @@ Examples:
           try {
             secrets.push(createExecSecret(mapping, true));
           } catch (err) {
-            console.error(chalk.red('Invalid secret-file mapping:'), mapping);
+            console.error(chalk.red('Invalid secret-file mapping'));
             console.error(err instanceof Error ? err.message : String(err));
             process.exit(1);
           }
@@ -424,8 +663,17 @@ Examples:
 
       // Auto-update status
       const updateConfig = loadUpdateConfig();
-      const autoUpdateEnabled = options.autoUpdate !== false && updateConfig.enabled;
-      console.log(`  Auto-update: ${autoUpdateEnabled ? chalk.green('enabled') : 'disabled (manual trigger available)'}`);
+      const autoUpdateEnabled = options.autoUpdate !== false
+        && updateConfig.enabled
+        && !payaraRecoveryOnly;
+      const autoUpdateStatus = autoUpdateEnabled
+        ? chalk.green('enabled')
+        : payaraRecoveryOnly
+          ? expectedPayaraPostUpdateRecoveryVersion
+            ? 'disabled (STARTUP_CONFIRMATION_PENDING recovery)'
+            : 'disabled (UPDATE_REQUIRED recovery)'
+          : 'disabled (manual trigger available)';
+      console.log(`  Auto-update: ${autoUpdateStatus}`);
 
       // Plugin auto-update status (shown later if plugins are configured)
 
@@ -439,16 +687,12 @@ Examples:
       }
 
       // Plugin status
-      interface PluginConfig {
-        package?: string;
-        path?: string;
-        enabled?: boolean;
-        autoUpdate?: { enabled?: boolean };
-      }
-      const pluginConfigs = ((config as typeof config & { plugins?: PluginConfig[] }).plugins) ?? [];
+      const pluginConfigs = config.plugins ?? [];
       const enabledPlugins = pluginConfigs.filter(p => p.enabled !== false);
       if (enabledPlugins.length > 0) {
-        const pluginUpdateEnabled = options.pluginAutoUpdate !== false && loadPluginUpdateConfig().enabled;
+        const pluginUpdateEnabled = options.pluginAutoUpdate !== false
+          && loadPluginUpdateConfig().enabled
+          && !payaraRecoveryOnly;
         console.log(`  Plugins:     ${chalk.cyan(enabledPlugins.length.toString())} configured`);
         console.log(`  Plugin update: ${pluginUpdateEnabled ? chalk.green('enabled') : 'disabled'}`);
       }
@@ -526,17 +770,32 @@ Examples:
       // auto-update flag — automatic npm-polling stays off by default (FIX A).
       if (autoUpdateEnabled) {
         logger.info('Starting npm-based auto-update service');
+      } else if (payaraRecoveryOnly) {
+        logger.info('Agent auto-update disabled by UPDATE_REQUIRED recovery fence');
       } else {
         logger.info('Auto-update periodic checker disabled; manual trigger available');
       }
-      const { service: autoUpdateService } = buildAutoUpdateService(updateConfig, autoUpdateEnabled);
+      const { service: autoUpdateService } = buildAutoUpdateService(
+        updateConfig,
+        autoUpdateEnabled,
+        payaraRecoveryOnly
+      );
 
-      // Start plugin auto-update service if enabled and plugins are configured
+      // Always expose the exact manual Payara updater when Payara is configured.
+      // Only periodic registry polling is gated by config/CLI flags.
       let pluginAutoUpdateService: PluginAutoUpdateService | null = null;
       const pluginUpdateConfig = loadPluginUpdateConfig();
-      const pluginAutoUpdateEnabled = options.pluginAutoUpdate !== false && pluginUpdateConfig.enabled && enabledPlugins.length > 0;
-      if (pluginAutoUpdateEnabled) {
-        logger.info({ plugins: enabledPlugins.length }, 'Starting plugin auto-update service');
+      pluginUpdateConfig.enabled = options.pluginAutoUpdate !== false
+        && pluginUpdateConfig.enabled
+        && !payaraRecoveryOnly;
+      const payaraConfigured = pluginConfigs.some(
+        plugin => plugin.package === PAYARA_PLUGIN_PACKAGE && plugin.enabled !== false
+      );
+      if (payaraConfigured) {
+        logger.info(
+          { periodicEnabled: pluginUpdateConfig.enabled },
+          'Starting exact Payara plugin updater service'
+        );
         pluginAutoUpdateService = new PluginAutoUpdateService(pluginConfigs, pluginUpdateConfig);
         pluginAutoUpdateService.start();
       }
@@ -550,6 +809,9 @@ Examples:
           pluginAutoUpdateService,
           npmAutoUpdateService: autoUpdateService,
           configFromVault: isConfigFromVaultEnabled(config),
+          expectedPayaraRecoveryVersion,
+          expectedPayaraPostUpdateRecoveryVersion,
+          postUpdateAuthorityProbe,
           // TLS options
           tls: tlsEnabled ? {
             enabled: tlsEnabled,

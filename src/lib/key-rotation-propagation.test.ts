@@ -364,7 +364,7 @@ describe('createKeyRotationPropagator', () => {
     expect(ctx.config.auth.apiKey).toBe(KEY_A);
   });
 
-  it('should log an explicit rotation-pickup line with source and prefixes', async () => {
+  it('should log rotation pickup without any credential-derived fragment', async () => {
     const { deps, ctx } = makeDeps();
     const propagator = createKeyRotationPropagator(deps);
 
@@ -376,9 +376,13 @@ describe('createKeyRotationPropagator', () => {
     expect(pickupCall?.[0]).toMatchObject({
       keyName: KEY_NAME,
       source: 'reconnect',
-      oldPrefix: KEY_A.substring(0, 8),
-      newPrefix: KEY_B.substring(0, 8),
     });
+    const serializedLogs = JSON.stringify(infoCalls);
+    expect(serializedLogs).not.toContain(KEY_A);
+    expect(serializedLogs).not.toContain(KEY_B);
+    expect(serializedLogs).not.toContain(KEY_A.substring(0, 8));
+    expect(serializedLogs).not.toContain(KEY_B.substring(0, 8));
+    expect(serializedLogs).not.toContain(META.newPrefix);
   });
 
   it('should work without a plugin loader (no plugins configured)', async () => {

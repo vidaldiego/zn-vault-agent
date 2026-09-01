@@ -1,43 +1,39 @@
-// Path: zn-vault-agent/src/services/plugin-auto-update.ts
-
 /**
- * Plugin Auto-Update Service
+ * Exact Payara plugin updater.
  *
- * Periodically checks npm registry for new versions of installed plugins
- * and auto-updates them via `npm install`. After updates, the daemon
- * restarts to load the new plugin versions.
+ * ProtectSystem=strict prevents the Agent from mutating global npm state. The
+ * Agent validates an exact control-plane request, publishes a durable trigger
+ * for a root-owned helper, verifies its receipt and independently reads the
+ * installed version before it may schedule one restart.
  */
-
-import { exec, execSync } from 'child_process';
-import { promisify } from 'util';
-import { existsSync, writeFileSync, unlinkSync, readFileSync, statSync } from 'fs';
+import { randomUUID } from 'node:crypto';
+import { execFile, execFileSync } from 'node:child_process';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
+import { promisify } from 'node:util';
 import semver from 'semver';
 import { logger } from '../lib/logger.js';
 import type { PluginConfig, PluginVersionInfo } from '../plugins/types.js';
 import type { UpdateChannel } from '../types/update.js';
+import {
+  PAYARA_PLUGIN_CHANNEL,
+  PAYARA_PLUGIN_PACKAGE,
+  PluginUpdateRail,
+  PluginUpdateRailError,
+  type PluginUpdateActiveOperation,
+  type PluginUpdateLocalTerminal,
+  type PluginUpdateReceipt,
+  type PluginUpdateRequest,
+  validatePluginUpdateRequest,
+} from './plugin-update-rail.js';
 
-const execAsync = promisify(exec);
-const LOCK_FILE = '/var/run/zn-vault-agent.plugin-update.lock';
+const execFileAsync = promisify(execFile);
+const UPDATE_RESTART_DELAY_MS = 2_000;
 
-/**
- * Package.json structure for type-safe parsing
- */
-interface PackageJson {
-  name?: string;
-  version?: string;
-  dependencies?: Record<string, string>;
-}
+export type { PluginUpdateRequest } from './plugin-update-rail.js';
 
-/**
- * npm list --json output structure
- */
-interface NpmListOutput {
-  dependencies?: Record<string, { version?: string }>;
-}
+interface PackageJson { version?: string }
+interface NpmListOutput { dependencies?: Record<string, { version?: string }> }
 
-/**
- * Plugin update result
- */
 export interface PluginUpdateResult {
   package: string;
   previousVersion: string;
@@ -46,31 +42,56 @@ export interface PluginUpdateResult {
   error?: string;
 }
 
-/**
- * Plugin auto-update service configuration
- */
+export type PluginUpdateOperationState = 'pending' | 'succeeded' | 'failed';
+
+export interface PluginUpdateOperationStatus {
+  requestId: string;
+  package: typeof PAYARA_PLUGIN_PACKAGE;
+  channel: typeof PAYARA_PLUGIN_CHANNEL;
+  previousVersion: string;
+  targetVersion: string;
+  newVersion: string;
+  installedVersion?: string;
+  status: PluginUpdateOperationState;
+  updated: 0 | 1;
+  willRestart: boolean;
+  restartScheduled: boolean;
+  code: string;
+  message: string;
+  pollPath: string;
+  requestedAt?: string;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
+export type PluginUpdateChannel = UpdateChannel | typeof PAYARA_PLUGIN_CHANNEL;
+
 export interface PluginAutoUpdateServiceConfig {
-  /** Global enable/disable (default: true) */
+  /** Enables periodic checks. Manual exact updates remain available. */
   enabled: boolean;
-  /** Check interval in milliseconds (default: 5 minutes) */
   checkIntervalMs: number;
-  /** Default channel for plugins without specific channel (default: 'latest') */
-  defaultChannel: UpdateChannel;
-  /** Maximum random delay before applying update for staged rollout (ms). 0 = no delay */
+  /** Compatibility field only; Payara is always fixed to dr-m4. */
+  defaultChannel: PluginUpdateChannel;
   stagedRolloutMaxDelayMs: number;
 }
 
 export const DEFAULT_PLUGIN_UPDATE_CONFIG: PluginAutoUpdateServiceConfig = {
-  // Production-safe default: disabled. Plugins run in-process with full
-  // agent capabilities; an unsigned npm update can replace the plugin's
-  // entire codebase. Operators must opt in explicitly per plugin (or
-  // globally via `pluginUpdate.enabled = true`) once a gating process
-  // is in place.
   enabled: false,
-  checkIntervalMs: 5 * 60 * 1000, // 5 minutes
-  defaultChannel: 'latest',
-  stagedRolloutMaxDelayMs: 30 * 60 * 1000, // 30 minutes max delay for staged rollout
+  checkIntervalMs: 5 * 60 * 1000,
+  defaultChannel: PAYARA_PLUGIN_CHANNEL,
+  stagedRolloutMaxDelayMs: 30 * 60 * 1000,
 };
+
+function sameRequest(request: PluginUpdateRequest, operation: PluginUpdateActiveOperation): boolean {
+  return request.requestId === operation.requestId
+    && request.package === operation.package
+    && request.expectedCurrentVersion === operation.expectedCurrentVersion
+    && request.expectedVersion === operation.expectedVersion;
+}
+
+function asMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 export class PluginAutoUpdateService {
   private checkInterval: NodeJS.Timeout | null = null;
@@ -79,495 +100,683 @@ export class PluginAutoUpdateService {
   private readonly config: PluginAutoUpdateServiceConfig;
   private readonly plugins: PluginConfig[];
   private readonly installedVersions = new Map<string, string>();
+  private readonly monitoring = new Set<string>();
+  private readonly monitorControllers = new Map<string, AbortController>();
+  private readonly restartTimeouts = new Set<NodeJS.Timeout>();
+  private stopped = false;
 
-  constructor(plugins: PluginConfig[], config: Partial<PluginAutoUpdateServiceConfig> = {}) {
+  constructor(
+    plugins: PluginConfig[],
+    config: Partial<PluginAutoUpdateServiceConfig> = {},
+    private readonly rail: PluginUpdateRail = new PluginUpdateRail()
+  ) {
     this.config = { ...DEFAULT_PLUGIN_UPDATE_CONFIG, ...config };
-    this.plugins = plugins.filter((p) => p.package !== undefined && p.enabled !== false);
+    this.plugins = plugins.filter(
+      (plugin) => plugin.package === PAYARA_PLUGIN_PACKAGE && plugin.enabled !== false
+    );
   }
 
-  /**
-   * Start the plugin auto-update service.
-   * Performs initial check after 2 minutes, then checks periodically.
-   */
+  /** Recovery and manual endpoints are independent of periodic polling. */
   start(): void {
-    if (!this.config.enabled || this.plugins.length === 0) {
-      logger.debug(
-        { enabled: this.config.enabled, pluginCount: this.plugins.length },
-        'Plugin auto-update disabled or no plugins to update'
+    this.stopped = false;
+    if (this.plugins.length === 0) {
+      logger.debug('Payara plugin updater unavailable: configured plugin is absent or disabled');
+      return;
+    }
+    void this.resumeActiveOperation().catch((err: unknown) => {
+      logger.error({ err }, 'Failed to resume durable Payara plugin update operation');
+    });
+    if (!this.periodicUpdatesEnabled()) {
+      logger.info(
+        { package: PAYARA_PLUGIN_PACKAGE, channel: PAYARA_PLUGIN_CHANNEL },
+        'Periodic Payara plugin updates disabled; manual exact updater remains available'
       );
       return;
     }
-
     logger.info(
       {
-        interval: this.config.checkIntervalMs / 1000,
-        plugins: this.plugins.map((p) => p.package),
+        intervalSeconds: this.config.checkIntervalMs / 1000,
+        package: PAYARA_PLUGIN_PACKAGE,
+        channel: PAYARA_PLUGIN_CHANNEL,
       },
-      'Starting plugin auto-update service'
+      'Starting exact Payara plugin update polling'
     );
-
-    // Detect currently installed versions
-    this.detectInstalledVersions();
-
-    // Initial check after 2 minutes (let daemon stabilize, after agent self-update check)
     this.initialCheckTimeout = setTimeout(() => {
-      this.checkAndUpdateAll().catch((err: unknown) => {
-        logger.error({ err }, 'Initial plugin auto-update check failed');
+      void this.checkAndUpdatePayara().catch((err: unknown) => {
+        logger.error({ err }, 'Initial Payara plugin update check failed');
       });
     }, 2 * 60_000);
-
-    // Then check periodically
     this.checkInterval = setInterval(() => {
-      this.checkAndUpdateAll().catch((err: unknown) => {
-        logger.error({ err }, 'Plugin auto-update check failed');
+      void this.checkAndUpdatePayara().catch((err: unknown) => {
+        logger.error({ err }, 'Payara plugin update check failed');
       });
     }, this.config.checkIntervalMs);
   }
 
-  /**
-   * Stop the plugin auto-update service.
-   */
   stop(): void {
-    if (this.initialCheckTimeout) {
-      clearTimeout(this.initialCheckTimeout);
-      this.initialCheckTimeout = null;
-    }
-    if (this.checkInterval) {
-      clearInterval(this.checkInterval);
-      this.checkInterval = null;
-    }
-    if (this.stagedRolloutTimeout) {
-      clearTimeout(this.stagedRolloutTimeout);
-      this.stagedRolloutTimeout = null;
-    }
-    logger.debug('Plugin auto-update service stopped');
+    this.stopped = true;
+    for (const controller of this.monitorControllers.values()) controller.abort();
+    for (const timeout of this.restartTimeouts) clearTimeout(timeout);
+    this.restartTimeouts.clear();
+    this.monitorControllers.clear();
+    this.monitoring.clear();
+    this.disablePeriodicPolling();
+    logger.debug('Payara plugin update service stopped');
   }
 
-  /**
-   * Check for updates for all plugins without installing.
-   */
+  /** Disable only automatic polling; manual/recovery operations stay live. */
+  disablePeriodicPolling(): void {
+    if (this.initialCheckTimeout) clearTimeout(this.initialCheckTimeout);
+    if (this.checkInterval) clearInterval(this.checkInterval);
+    if (this.stagedRolloutTimeout) clearTimeout(this.stagedRolloutTimeout);
+    this.initialCheckTimeout = null;
+    this.checkInterval = null;
+    this.stagedRolloutTimeout = null;
+  }
+
+  /** Always report only configured Payara, even when polling is disabled. */
   async checkForUpdates(): Promise<PluginVersionInfo[]> {
-    const results: PluginVersionInfo[] = [];
-
-    for (const plugin of this.plugins) {
-      if (!plugin.package) continue;
-
-      // Skip if plugin has auto-update disabled
-      if (plugin.autoUpdate?.enabled === false) {
-        logger.debug({ package: plugin.package }, 'Plugin auto-update disabled');
-        continue;
-      }
-
-      try {
-        const channel = plugin.autoUpdate?.channel ?? this.config.defaultChannel;
-        const current = this.installedVersions.get(plugin.package) ?? '0.0.0';
-        const latest = await this.getLatestVersion(plugin.package, channel);
-
-        results.push({
-          package: plugin.package,
-          current,
-          latest,
-          updateAvailable: this.isNewer(latest, current),
-        });
-      } catch (err) {
-        logger.warn({ err, package: plugin.package }, 'Failed to check plugin version');
-      }
-    }
-
-    return results;
+    this.requireConfiguredPayara();
+    const current = this.getInstalledPayaraVersion();
+    const latest = await this.getLatestVersion(PAYARA_PLUGIN_PACKAGE, PAYARA_PLUGIN_CHANNEL);
+    return [{
+      package: PAYARA_PLUGIN_PACKAGE,
+      channel: PAYARA_PLUGIN_CHANNEL,
+      current,
+      latest,
+      targetVersion: latest,
+      updateAvailable: semver.gt(latest, current),
+      updaterReady: await this.rail.isActive(),
+    }];
   }
 
-  /**
-   * Trigger immediate update check and installation.
-   * Used by HTTP endpoint to update plugins on-demand.
-   * Returns results of update attempts.
-   */
-  async triggerUpdates(): Promise<PluginUpdateResult[]> {
-    const updates = await this.checkForUpdates();
-    const availableUpdates = updates.filter((u) => u.updateAvailable);
+  async beginUpdate(request: PluginUpdateRequest): Promise<PluginUpdateOperationStatus> {
+    validatePluginUpdateRequest(request);
+    this.requireConfiguredPayara();
 
-    if (availableUpdates.length === 0) {
-      logger.debug({ checked: updates.length }, 'No plugin updates available');
-      return [];
-    }
+    // Terminal UUIDs are checked before active/trigger publication. A UUID can
+    // never be reused to mutate npm with a different from/target tuple.
+    const terminal = await this.readTerminalStatus(request.requestId, request);
+    if (terminal) return terminal;
 
-    logger.info(
-      { updates: availableUpdates.map((u) => `${u.package}@${u.current} → ${u.latest}`) },
-      'Plugin updates available, triggering update'
-    );
-
-    // Acquire lock (prevents multiple agents updating simultaneously)
-    if (!this.acquireLock()) {
-      throw new Error('Another agent is updating plugins, try again later');
-    }
-
-    const results: PluginUpdateResult[] = [];
-
-    try {
-      for (const update of availableUpdates) {
-        const plugin = this.plugins.find((p) => p.package === update.package);
-        if (!plugin) continue;
-
-        const channel = plugin.autoUpdate?.channel ?? this.config.defaultChannel;
-        const result = await this.updatePlugin(update.package, channel);
-        results.push({
-          package: update.package,
-          previousVersion: update.current,
-          newVersion: update.latest,
-          ...result,
-        });
-      }
-
-      const successful = results.filter((r) => r.success);
-      if (successful.length > 0) {
-        logger.info(
-          { updated: successful.map((r) => `${r.package}@${r.newVersion}`) },
-          'Plugin updates complete, requesting restart'
+    const active = this.rail.readActive();
+    if (active) {
+      if (active.requestId === request.requestId && !sameRequest(request, active)) {
+        throw new PluginUpdateRailError(
+          'REQUEST_ID_CONFLICT',
+          'requestId was already used for a different update request'
         );
-        // Schedule restart after response is sent
-        setTimeout(() => { this.requestRestart(); }, 2000);
       }
-    } finally {
-      this.releaseLock();
+      if (!sameRequest(request, active)) {
+        throw new PluginUpdateRailError('PLUGIN_UPDATE_IN_PROGRESS', 'Another plugin update is active');
+      }
+      this.monitor(active);
+      return this.pendingStatus(active);
     }
 
-    return results;
+    const current = this.getInstalledPayaraVersion();
+    if (current !== request.expectedCurrentVersion) {
+      throw new PluginUpdateRailError(
+        'CURRENT_VERSION_MISMATCH',
+        'Installed Payara plugin version does not match expectedCurrentVersion'
+      );
+    }
+    const advertised = await this.getLatestVersion(PAYARA_PLUGIN_PACKAGE, PAYARA_PLUGIN_CHANNEL);
+    if (advertised !== request.expectedVersion) {
+      throw new PluginUpdateRailError(
+        'TARGET_VERSION_MISMATCH',
+        `The ${PAYARA_PLUGIN_CHANNEL} channel does not resolve to expectedVersion`
+      );
+    }
+
+    if (current === request.expectedVersion) {
+      const now = new Date().toISOString();
+      const noOp: PluginUpdateLocalTerminal = {
+        requestId: request.requestId,
+        package: PAYARA_PLUGIN_PACKAGE,
+        channel: PAYARA_PLUGIN_CHANNEL,
+        previousVersion: current,
+        targetVersion: current,
+        installedVersion: current,
+        success: true,
+        requestedAt: now,
+        startedAt: now,
+        finishedAt: now,
+        code: 'ALREADY_INSTALLED',
+      };
+      this.rail.writeLocalTerminal(noOp);
+      return this.localTerminalStatus(noOp);
+    }
+    if (!semver.gt(request.expectedVersion, current)) {
+      throw new PluginUpdateRailError('PLUGIN_DOWNGRADE_REFUSED', 'Payara plugin downgrade refused');
+    }
+    if (!(await this.rail.isActive())) {
+      throw new PluginUpdateRailError(
+        'PLUGIN_UPDATER_RAIL_UNAVAILABLE',
+        'Root-owned Payara plugin updater path unit is not active'
+      );
+    }
+
+    const begun = this.rail.begin(request);
+    if (begun.kind === 'terminal') {
+      const replay = await this.readTerminalStatus(request.requestId, request);
+      if (!replay) {
+        throw new PluginUpdateRailError('TERMINAL_REPLAY_LOST', 'Durable terminal replay disappeared');
+      }
+      return replay;
+    }
+    this.monitor(begun.operation);
+    return this.pendingStatus(begun.operation);
+  }
+
+  async getUpdateStatus(requestId: string): Promise<PluginUpdateOperationStatus> {
+    const terminal = await this.readTerminalStatus(requestId);
+    if (terminal) return terminal;
+    const active = this.rail.readActive();
+    if (active?.requestId === requestId) {
+      this.monitor(active);
+      return this.pendingStatus(active);
+    }
+    throw new PluginUpdateRailError('PLUGIN_UPDATE_NOT_FOUND', 'Plugin update operation not found');
   }
 
   /**
-   * Check for updates and install if available (internal periodic check).
-   * Includes staged rollout delay to prevent thundering herd.
+   * Called only after the new daemon has completed Payara's startup hook. A
+   * root receipt and a restart marker are necessary but not sufficient for a
+   * 200 response: the target manifest must be running in this new process.
    */
-  private async checkAndUpdateAll(): Promise<void> {
-    const updates = await this.checkForUpdates();
-    const availableUpdates = updates.filter((u) => u.updateAvailable);
+  confirmPluginStartup(version: string, running: boolean): void {
+    const active = this.rail.readActive();
+    if (!active) return;
+    const receipt = this.rail.readReceipt(active.requestId);
+    if (!receipt?.success || receipt.targetVersion !== active.expectedVersion) return;
+    if (!this.rail.hasRestartMarker(active.requestId, active.expectedVersion)) return;
 
-    if (availableUpdates.length === 0) {
-      logger.debug({ checked: updates.length }, 'No plugin updates available');
+    const installed = this.readInstalledPayaraVersion() ?? active.expectedCurrentVersion;
+    const exactRunning = running
+      && version === active.expectedVersion
+      && installed === active.expectedVersion;
+    const terminal: PluginUpdateLocalTerminal = {
+      requestId: active.requestId,
+      package: PAYARA_PLUGIN_PACKAGE,
+      channel: PAYARA_PLUGIN_CHANNEL,
+      previousVersion: active.expectedCurrentVersion,
+      targetVersion: active.expectedVersion,
+      installedVersion: installed,
+      success: exactRunning,
+      requestedAt: receipt.requestedAt,
+      startedAt: receipt.startedAt,
+      finishedAt: new Date().toISOString(),
+      code: exactRunning ? 'STARTUP_CONFIRMED' : 'PLUGIN_STARTUP_FAILED',
+    };
+    this.rail.writeLocalTerminal(terminal);
+    this.rail.clearActive(active);
+  }
+
+  /** Compatibility facade for old callers; new HTTP clients poll by UUID. */
+  async triggerUpdates(request: PluginUpdateRequest): Promise<PluginUpdateResult[]> {
+    let status = await this.beginUpdate(request);
+    if (status.status === 'pending') {
+      try {
+        await this.rail.waitForReceipt(request);
+      } catch (err) {
+        if (err instanceof PluginUpdateRailError && err.code === 'PLUGIN_UPDATE_TIMEOUT') {
+          this.observeReceiptTimeout(request);
+        } else {
+          throw err;
+        }
+      }
+      status = await this.getUpdateStatus(request.requestId);
+    }
+    return [{
+      package: status.package,
+      previousVersion: status.previousVersion,
+      newVersion: status.installedVersion ?? status.targetVersion,
+      success: status.status === 'succeeded',
+      ...(status.status === 'failed' ? { error: status.message } : {}),
+    }];
+  }
+
+  private requireConfiguredPayara(): void {
+    if (this.plugins.length !== 1) {
+      throw new PluginUpdateRailError(
+        'PAYARA_PLUGIN_NOT_CONFIGURED',
+        'The Payara plugin is not configured and enabled on this agent'
+      );
+    }
+  }
+
+  private periodicUpdatesEnabled(): boolean {
+    return this.config.enabled && this.plugins[0]?.autoUpdate?.enabled !== false;
+  }
+
+  private async resumeActiveOperation(): Promise<void> {
+    let active = this.rail.readActive();
+    if (!active) {
+      // Trigger publication deliberately precedes active publication. If the
+      // Agent died in that narrow window, startup (not a second HTTP mutation)
+      // must finish the exact durable pair so the root helper can proceed.
+      // PluginUpdateRail.begin() checks immutable terminal UUIDs/conflicts
+      // first and only writes the missing active twin for this exact trigger.
+      const prepared = this.rail.readTrigger();
+      if (prepared) {
+        const resumed = this.rail.begin({
+          requestId: prepared.requestId,
+          package: prepared.package,
+          expectedCurrentVersion: prepared.expectedCurrentVersion,
+          expectedVersion: prepared.expectedVersion,
+        });
+        if (resumed.kind === 'terminal') {
+          throw new PluginUpdateRailError(
+            'ORPHANED_TRIGGER_TERMINAL_CONFLICT',
+            'Prepared trigger conflicts with an immutable terminal operation'
+          );
+        }
+        active = resumed.operation;
+      }
+    }
+    if (!active) return;
+    const local = this.rail.readLocalTerminal(active.requestId);
+    if (local) {
+      this.rail.clearActive(active);
       return;
     }
+    const receipt = this.rail.readReceipt(active.requestId);
+    if (receipt && !receipt.success) {
+      await this.receiptStatus(receipt, active);
+      return;
+    }
+    this.monitor(active);
+  }
 
-    logger.info(
-      { updates: availableUpdates.map((u) => `${u.package}@${u.current} → ${u.latest}`) },
-      'Plugin updates available, preparing upgrade'
+  private monitor(operation: PluginUpdateActiveOperation): void {
+    if (this.stopped || this.monitoring.has(operation.requestId)) return;
+    this.monitoring.add(operation.requestId);
+    const controller = new AbortController();
+    this.monitorControllers.set(operation.requestId, controller);
+    void this.rail.waitForReceipt(operation, controller.signal)
+      .then(async () => {
+        if (this.stopped || controller.signal.aborted) return;
+        await this.getUpdateStatus(operation.requestId);
+      })
+      .catch((err: unknown) => {
+        if (
+          this.stopped
+          || controller.signal.aborted
+          || (err instanceof PluginUpdateRailError && err.code === 'PLUGIN_UPDATE_CANCELLED')
+        ) return;
+        if (err instanceof PluginUpdateRailError && err.code === 'PLUGIN_UPDATE_TIMEOUT') {
+          this.observeReceiptTimeout(operation);
+          logger.error(
+            { requestId: operation.requestId },
+            'Root Payara plugin updater observation timed out; operation remains durably pending'
+          );
+          return;
+        }
+        logger.error(
+          { err, requestId: operation.requestId },
+          'Failed to verify root Payara plugin updater receipt; restart is forbidden'
+        );
+      })
+      .finally(() => {
+        if (this.monitorControllers.get(operation.requestId) === controller) {
+          this.monitorControllers.delete(operation.requestId);
+          this.monitoring.delete(operation.requestId);
+        }
+      });
+  }
+
+  private observeReceiptTimeout(request: PluginUpdateRequest): void {
+    const active = this.rail.readActive();
+    if (!active || !sameRequest(request, active)) return;
+    // The Agent's polling deadline is not evidence that the root helper has
+    // stopped. It may still own the kernel lock or be killed/retried by the
+    // five-minute oneshot. Keep both durable records and GET=202; only an exact
+    // root receipt may close the operation. This prevents a late successful
+    // install from contradicting a locally fabricated terminal failure.
+    logger.warn(
+      { requestId: request.requestId },
+      'Exact Payara update still pending after receipt observation deadline'
     );
+  }
 
-    // Staged rollout: random delay to prevent thundering herd
+  private async readTerminalStatus(
+    requestId: string,
+    expectedRequest?: PluginUpdateRequest
+  ): Promise<PluginUpdateOperationStatus | null> {
+    const local = this.rail.readLocalTerminal(requestId);
+    if (local) {
+      if (
+        expectedRequest
+        && (
+          local.package !== expectedRequest.package
+          || local.previousVersion !== expectedRequest.expectedCurrentVersion
+          || local.targetVersion !== expectedRequest.expectedVersion
+        )
+      ) {
+        throw new PluginUpdateRailError('REQUEST_ID_CONFLICT', 'requestId terminal request mismatch');
+      }
+      return this.localTerminalStatus(local);
+    }
+
+    const receipt = this.rail.readReceipt(requestId);
+    if (!receipt) return null;
+    if (
+      expectedRequest
+      && (
+        receipt.package !== expectedRequest.package
+        || receipt.previousVersion !== expectedRequest.expectedCurrentVersion
+        || receipt.targetVersion !== expectedRequest.expectedVersion
+      )
+    ) {
+      throw new PluginUpdateRailError('REQUEST_ID_CONFLICT', 'requestId receipt request mismatch');
+    }
+    const active = this.rail.readActive();
+    return await this.receiptStatus(
+      receipt,
+      active?.requestId === receipt.requestId ? active : undefined
+    );
+  }
+
+  private async receiptStatus(
+    receipt: PluginUpdateReceipt,
+    active?: PluginUpdateActiveOperation
+  ): Promise<PluginUpdateOperationStatus> {
+    if (
+      active
+      && (
+        receipt.requestId !== active.requestId
+        || receipt.package !== active.package
+        || receipt.channel !== active.channel
+        || receipt.previousVersion !== active.expectedCurrentVersion
+        || receipt.targetVersion !== active.expectedVersion
+        || receipt.requestedAt !== active.requestedAt
+      )
+    ) {
+      throw new PluginUpdateRailError('RECEIPT_MISMATCH', 'Root receipt does not match active request');
+    }
+
+    if (!receipt.success) {
+      const failure: PluginUpdateLocalTerminal = {
+        requestId: receipt.requestId,
+        package: PAYARA_PLUGIN_PACKAGE,
+        channel: PAYARA_PLUGIN_CHANNEL,
+        previousVersion: receipt.previousVersion,
+        targetVersion: receipt.targetVersion,
+        installedVersion: receipt.installedVersion ?? receipt.previousVersion,
+        success: false,
+        requestedAt: receipt.requestedAt,
+        startedAt: receipt.startedAt,
+        finishedAt: receipt.finishedAt,
+        code: `ROOT_${receipt.reason.toUpperCase()}`,
+      };
+      this.rail.writeLocalTerminal(failure);
+      if (active) this.rail.clearActive(active);
+      return this.localTerminalStatus(failure);
+    }
+
+    if (receipt.installedVersion !== receipt.targetVersion) {
+      return this.readbackFailure(receipt, active, receipt.installedVersion ?? receipt.previousVersion);
+    }
+    const installed = this.readInstalledPayaraVersion();
+    if (installed !== receipt.targetVersion) {
+      return this.readbackFailure(receipt, active, installed ?? receipt.previousVersion);
+    }
+
+    let scheduleNow = false;
+    try {
+      scheduleNow = this.rail.markRestartScheduled(receipt.requestId, receipt.targetVersion);
+    } catch (err) {
+      throw new PluginUpdateRailError(
+        'RESTART_MARKER_FAILED',
+        `Could not persist restart marker: ${asMessage(err)}`
+      );
+    }
+    if (scheduleNow) {
+      const timeout = setTimeout(() => {
+        this.restartTimeouts.delete(timeout);
+        if (this.stopped) return;
+        try {
+          this.requestRestart();
+        } catch (err) {
+          logger.error(
+            { err, requestId: receipt.requestId },
+            'Agent restart request failed; update remains pending startup confirmation'
+          );
+        }
+      }, UPDATE_RESTART_DELAY_MS);
+      this.restartTimeouts.add(timeout);
+    }
+    return {
+      requestId: receipt.requestId,
+      package: PAYARA_PLUGIN_PACKAGE,
+      channel: PAYARA_PLUGIN_CHANNEL,
+      previousVersion: receipt.previousVersion,
+      targetVersion: receipt.targetVersion,
+      newVersion: installed,
+      installedVersion: installed,
+      status: 'pending',
+      updated: 1,
+      willRestart: scheduleNow,
+      restartScheduled: true,
+      code: 'RESTART_PENDING',
+      message: scheduleNow
+        ? 'Exact artifact verified; awaiting restart and Payara startup confirmation'
+        : 'Awaiting target Payara startup confirmation after the scheduled restart',
+      pollPath: this.pollPath(receipt.requestId),
+      requestedAt: receipt.requestedAt,
+      startedAt: receipt.startedAt,
+      finishedAt: receipt.finishedAt,
+    };
+  }
+
+  private readbackFailure(
+    receipt: PluginUpdateReceipt,
+    active: PluginUpdateActiveOperation | undefined,
+    installedVersion: string
+  ): PluginUpdateOperationStatus {
+    const failure: PluginUpdateLocalTerminal = {
+      requestId: receipt.requestId,
+      package: PAYARA_PLUGIN_PACKAGE,
+      channel: PAYARA_PLUGIN_CHANNEL,
+      previousVersion: receipt.previousVersion,
+      targetVersion: receipt.targetVersion,
+      installedVersion,
+      success: false,
+      requestedAt: receipt.requestedAt,
+      startedAt: receipt.startedAt,
+      finishedAt: new Date().toISOString(),
+      code: 'AGENT_READBACK_MISMATCH',
+    };
+    this.rail.writeLocalTerminal(failure);
+    if (active) this.rail.clearActive(active);
+    return this.localTerminalStatus(failure);
+  }
+
+  private localTerminalStatus(terminal: PluginUpdateLocalTerminal): PluginUpdateOperationStatus {
+    const noOp = terminal.success && terminal.code === 'ALREADY_INSTALLED';
+    const restartScheduled = terminal.success
+      && !noOp
+      && this.rail.hasRestartMarker(terminal.requestId, terminal.targetVersion);
+    const completedUpdate = terminal.success && terminal.code === 'STARTUP_CONFIRMED';
+    return {
+      requestId: terminal.requestId,
+      package: PAYARA_PLUGIN_PACKAGE,
+      channel: PAYARA_PLUGIN_CHANNEL,
+      previousVersion: terminal.previousVersion,
+      targetVersion: terminal.targetVersion,
+      newVersion: terminal.installedVersion,
+      installedVersion: terminal.installedVersion,
+      status: terminal.success ? 'succeeded' : 'failed',
+      updated: terminal.success && !noOp ? 1 : 0,
+      willRestart: completedUpdate,
+      restartScheduled,
+      code: terminal.code,
+      message: terminal.success
+        ? (noOp
+            ? 'Requested Payara plugin artifact is already installed'
+            : 'Target Payara plugin startup was confirmed after restart')
+        : 'Exact Payara plugin update failed; restart is forbidden',
+      pollPath: this.pollPath(terminal.requestId),
+      requestedAt: terminal.requestedAt,
+      startedAt: terminal.startedAt,
+      finishedAt: terminal.finishedAt,
+    };
+  }
+
+  private pendingStatus(operation: PluginUpdateActiveOperation): PluginUpdateOperationStatus {
+    return {
+      requestId: operation.requestId,
+      package: PAYARA_PLUGIN_PACKAGE,
+      channel: PAYARA_PLUGIN_CHANNEL,
+      previousVersion: operation.expectedCurrentVersion,
+      targetVersion: operation.expectedVersion,
+      newVersion: operation.expectedVersion,
+      status: 'pending',
+      updated: 0,
+      willRestart: false,
+      restartScheduled: false,
+      code: 'PENDING',
+      message: 'Exact Payara plugin update is pending root receipt verification',
+      pollPath: this.pollPath(operation.requestId),
+      requestedAt: operation.requestedAt,
+    };
+  }
+
+  private pollPath(requestId: string): string {
+    return `/plugins/update/${requestId}`;
+  }
+
+  private async checkAndUpdatePayara(): Promise<void> {
+    let info = (await this.checkForUpdates())[0];
+    if (!info?.updateAvailable) return;
     if (this.config.stagedRolloutMaxDelayMs > 0) {
-      const delay = this.calculateStagedDelay();
-      logger.info({ delaySeconds: Math.round(delay / 1000) }, 'Plugin staged rollout delay');
-      await this.sleep(delay);
+      const delay = Math.floor(Math.random() * this.config.stagedRolloutMaxDelayMs);
+      await new Promise<void>((resolve) => {
+        this.stagedRolloutTimeout = setTimeout(resolve, delay);
+      });
+      info = (await this.checkForUpdates())[0];
+      if (!info?.updateAvailable) return;
+    }
 
-      // Re-check after delay - another agent may have updated
-      const recheck = await this.checkForUpdates();
-      const stillNeedUpdate = recheck.filter((u) => u.updateAvailable);
-      if (stillNeedUpdate.length === 0) {
-        logger.info('Plugin updates no longer needed after staged delay');
+    const request: PluginUpdateRequest = {
+      requestId: randomUUID(),
+      package: PAYARA_PLUGIN_PACKAGE,
+      expectedCurrentVersion: info.current,
+      expectedVersion: info.latest,
+    };
+    const status = await this.beginUpdate(request);
+    logger.info(
+      { requestId: request.requestId, status: status.status, targetVersion: request.expectedVersion },
+      'Periodic Payara plugin update delegated to exact root rail'
+    );
+  }
+
+  private getInstalledPayaraVersion(): string {
+    const version = this.readInstalledPayaraVersion();
+    if (!version) {
+      throw new PluginUpdateRailError(
+        'INSTALLED_VERSION_UNAVAILABLE',
+        'Could not read an exact installed Payara plugin version'
+      );
+    }
+    return version;
+  }
+
+  private readInstalledPayaraVersion(): string | null {
+    this.detectInstalledVersions();
+    return this.installedVersions.get(PAYARA_PLUGIN_PACKAGE) ?? null;
+  }
+
+  /** Exact readback from global npm state; no request value reaches argv. */
+  private detectInstalledVersions(): void {
+    this.installedVersions.delete(PAYARA_PLUGIN_PACKAGE);
+    try {
+      const output = execFileSync(
+        'npm',
+        ['list', '-g', '--json', '--depth=0'],
+        { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] }
+      );
+      const parsed = JSON.parse(output) as NpmListOutput;
+      const version = parsed.dependencies?.[PAYARA_PLUGIN_PACKAGE]?.version;
+      if (typeof version === 'string' && semver.valid(version) === version) {
+        this.installedVersions.set(PAYARA_PLUGIN_PACKAGE, version);
         return;
       }
+    } catch (err) {
+      logger.debug({ err }, 'npm list could not provide exact installed Payara plugin version');
     }
-
-    // Acquire lock (prevents multiple agents updating simultaneously)
-    if (!this.acquireLock()) {
-      logger.info('Another agent is updating plugins, skipping');
-      return;
-    }
-
-    const results: PluginUpdateResult[] = [];
 
     try {
-      for (const update of availableUpdates) {
-        const plugin = this.plugins.find((p) => p.package === update.package);
-        if (!plugin) continue;
-
-        const channel = plugin.autoUpdate?.channel ?? this.config.defaultChannel;
-        const result = await this.updatePlugin(update.package, channel);
-        results.push({
-          package: update.package,
-          previousVersion: update.current,
-          newVersion: update.latest,
-          ...result,
-        });
+      const globalRoot = execFileSync(
+        'npm',
+        ['root', '-g'],
+        { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] }
+      ).trim();
+      if (!globalRoot.startsWith('/') || globalRoot.includes('\n') || globalRoot.includes('\r')) return;
+      const packageJsonPath = `${globalRoot}/${PAYARA_PLUGIN_PACKAGE}/package.json`;
+      if (!existsSync(packageJsonPath)) return;
+      const state = lstatSync(packageJsonPath);
+      if (!state.isFile() || state.isSymbolicLink() || state.nlink !== 1 || state.size > 1024 * 1024) return;
+      const parsed = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as PackageJson;
+      if (typeof parsed.version === 'string' && semver.valid(parsed.version) === parsed.version) {
+        this.installedVersions.set(PAYARA_PLUGIN_PACKAGE, parsed.version);
       }
-
-      const successful = results.filter((r) => r.success);
-      if (successful.length > 0) {
-        logger.info(
-          { updated: successful.map((r) => `${r.package}@${r.newVersion}`) },
-          'Plugin updates complete, requesting restart'
-        );
-        this.requestRestart();
-      }
-    } finally {
-      this.releaseLock();
+    } catch (err) {
+      logger.debug({ err }, 'Direct global package readback failed for Payara plugin');
     }
   }
 
-  /**
-   * Calculate random delay for staged rollout.
-   */
-  private calculateStagedDelay(): number {
-    return Math.floor(Math.random() * this.config.stagedRolloutMaxDelayMs);
-  }
-
-  /**
-   * Sleep for specified milliseconds.
-   */
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-      this.stagedRolloutTimeout = setTimeout(resolve, ms);
-    });
-  }
-
-  /**
-   * Update a single plugin via npm install -g.
-   * Installs globally to ensure consistent plugin versions across the system.
-   * The plugin loader always loads from global npm.
-   */
-  private async updatePlugin(
+  private async getLatestVersion(
     packageName: string,
-    channel: UpdateChannel
-  ): Promise<{ success: boolean; error?: string }> {
-    logger.info({ package: packageName, channel }, 'Installing plugin update globally');
-
-    try {
-      // Install globally so the plugin loader can find it
-      const { stdout, stderr } = await execAsync(
-        `npm install -g ${packageName}@${channel}`,
-        { timeout: 5 * 60 * 1000 } // 5 minute timeout
+    channel: PluginUpdateChannel
+  ): Promise<string> {
+    if (packageName !== PAYARA_PLUGIN_PACKAGE || channel !== PAYARA_PLUGIN_CHANNEL) {
+      throw new PluginUpdateRailError(
+        'PLUGIN_UPDATE_SCOPE_INVALID',
+        'Payara updater registry lookup is fixed to the dr-m4 allowlist'
       );
-
-      if (stdout) logger.debug({ stdout: stdout.trim() }, 'npm install -g stdout');
-      if (stderr) logger.debug({ stderr: stderr.trim() }, 'npm install -g stderr');
-
-      return { success: true };
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      logger.error({ err, package: packageName }, 'Plugin global update failed');
-      return { success: false, error: errorMessage };
     }
+    const { stdout } = await execFileAsync(
+      'npm',
+      ['view', `${PAYARA_PLUGIN_PACKAGE}@${PAYARA_PLUGIN_CHANNEL}`, 'version'],
+      { timeout: 30_000, encoding: 'utf8' }
+    );
+    const target = stdout.trim();
+    if (semver.valid(target) !== target || semver.major(target) !== 3) {
+      throw new PluginUpdateRailError(
+        'CHANNEL_TARGET_INVALID',
+        'The Payara dr-m4 channel did not resolve to one exact 3.x semver'
+      );
+    }
+    return target;
   }
 
-  /** Cached global npm prefix */
-  private cachedGlobalPrefix: string | null = null;
-
-  /**
-   * Get the global npm prefix path.
-   * Results are cached for performance.
-   */
-  private getGlobalNpmPrefix(): string {
-    if (this.cachedGlobalPrefix !== null) {
-      return this.cachedGlobalPrefix;
-    }
-
-    try {
-      this.cachedGlobalPrefix = execSync('npm config get prefix', {
-        encoding: 'utf-8',
-        timeout: 10_000,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      }).trim();
-      logger.debug({ prefix: this.cachedGlobalPrefix }, 'Resolved global npm prefix');
-      return this.cachedGlobalPrefix;
-    } catch (err) {
-      // Fallback to common paths
-      const fallbacks = ['/usr/local', '/usr'];
-      const home = process.env.HOME;
-      if (home) {
-        fallbacks.push(`${home}/.npm-global`);
-      }
-
-      for (const fallback of fallbacks) {
-        const isWindows = process.platform === 'win32';
-        const nodeModules = isWindows
-          ? `${fallback}/node_modules`
-          : `${fallback}/lib/node_modules`;
-        if (existsSync(nodeModules)) {
-          this.cachedGlobalPrefix = fallback;
-          logger.debug({ prefix: this.cachedGlobalPrefix }, 'Using fallback global npm prefix');
-          return this.cachedGlobalPrefix;
-        }
-      }
-
-      logger.warn({ err }, 'Could not determine global npm prefix');
-      this.cachedGlobalPrefix = '/usr/local';
-      return this.cachedGlobalPrefix;
-    }
-  }
-
-  /**
-   * Detect currently installed versions by checking global npm packages.
-   * Plugins are always installed and loaded from global npm.
-   */
-  private detectInstalledVersions(): void {
-    logger.debug({ plugins: this.plugins.map(p => p.package) }, 'Detecting installed plugin versions from global npm');
-
-    // First try npm list -g (checks global node_modules)
-    try {
-      const output = execSync('npm list -g --json --depth=0', {
-        encoding: 'utf-8',
-        timeout: 10000,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      const npmList = JSON.parse(output) as NpmListOutput;
-      const dependencies = npmList.dependencies ?? {};
-
-      for (const plugin of this.plugins) {
-        if (!plugin.package) continue;
-
-        const pkgInfo = dependencies[plugin.package];
-        if (pkgInfo?.version) {
-          this.installedVersions.set(plugin.package, pkgInfo.version);
-          logger.info({ package: plugin.package, version: pkgInfo.version, location: 'global' }, 'Detected installed plugin version');
-        } else {
-          this.installedVersions.set(plugin.package, '0.0.0');
-          logger.warn({ package: plugin.package }, 'Plugin not found in global npm packages');
-        }
-      }
-      return;
-    } catch (err) {
-      logger.warn({ err }, 'Failed to get versions via npm list -g, falling back to direct package.json check');
-    }
-
-    // Fallback: check package.json directly in global node_modules
-    const globalPrefix = this.getGlobalNpmPrefix();
-    const isWindows = process.platform === 'win32';
-    const globalNodeModules = isWindows
-      ? `${globalPrefix}/node_modules`
-      : `${globalPrefix}/lib/node_modules`;
-
-    for (const plugin of this.plugins) {
-      if (!plugin.package) continue;
-
-      try {
-        const globalPkgPath = `${globalNodeModules}/${plugin.package}/package.json`;
-        if (existsSync(globalPkgPath)) {
-          const pkg = JSON.parse(readFileSync(globalPkgPath, 'utf-8')) as PackageJson;
-          this.installedVersions.set(plugin.package, pkg.version ?? '0.0.0');
-          logger.info({ package: plugin.package, version: pkg.version, location: 'global' }, 'Detected installed plugin version via package.json');
-        } else {
-          this.installedVersions.set(plugin.package, '0.0.0');
-          logger.debug({ package: plugin.package, globalPkgPath }, 'Plugin not installed globally');
-        }
-      } catch {
-        this.installedVersions.set(plugin.package, '0.0.0');
-        logger.debug({ package: plugin.package }, 'Plugin not installed or version unknown');
-      }
-    }
-  }
-
-  /**
-   * Get latest version from npm registry.
-   */
-  private async getLatestVersion(packageName: string, channel: UpdateChannel): Promise<string> {
-    try {
-      const { stdout } = await execAsync(`npm view ${packageName}@${channel} version`, {
-        timeout: 30_000,
-      });
-      return stdout.trim();
-    } catch (err) {
-      logger.warn({ err, package: packageName, channel }, 'Failed to fetch latest version from npm');
-      throw err;
-    }
-  }
-
-  /**
-   * Compare semver versions using the semver package.
-   * Returns true if `latest` is newer than `current`.
-   * Properly handles pre-releases (e.g., 1.0.0-beta.1 < 1.0.0)
-   * and build metadata (ignored per semver spec).
-   */
-  private isNewer(latest: string, current: string): boolean {
-    try {
-      // semver.gt handles all edge cases including pre-releases
-      return semver.gt(latest, current);
-    } catch {
-      // Fallback to simple comparison if semver parsing fails
-      logger.warn({ latest, current }, 'Failed to parse semver, falling back to string comparison');
-      return latest > current;
-    }
-  }
-
-  /**
-   * Acquire update lock file.
-   * Returns false if another agent is updating.
-   */
-  private acquireLock(): boolean {
-    try {
-      if (existsSync(LOCK_FILE)) {
-        // Check if lock is stale (> 10 minutes old)
-        const stat = statSync(LOCK_FILE);
-        const age = Date.now() - stat.mtimeMs;
-        if (age < 10 * 60 * 1000) {
-          const pid = readFileSync(LOCK_FILE, 'utf-8').trim();
-          logger.debug({ pid, age: Math.round(age / 1000) }, 'Plugin update lock file exists');
-          return false;
-        }
-        logger.warn({ age: Math.round(age / 1000) }, 'Stale plugin update lock file detected, removing');
-      }
-      writeFileSync(LOCK_FILE, String(process.pid));
-      return true;
-    } catch (err) {
-      // Can't write to /var/run - might not be running as root
-      logger.debug({ err }, 'Could not acquire plugin update lock file (non-root?)');
-      return true; // Allow update anyway
-    }
-  }
-
-  /**
-   * Release update lock file.
-   */
-  private releaseLock(): void {
-    try {
-      unlinkSync(LOCK_FILE);
-    } catch {
-      // Ignore errors
-    }
-  }
-
-  /**
-   * Request daemon restart via SIGTERM.
-   * systemd will restart us with the new plugin versions.
-   */
   private requestRestart(): void {
-    logger.info('Sending SIGTERM to self for restart (plugin update)');
-    // Give logs time to flush
-    setTimeout(() => {
-      process.kill(process.pid, 'SIGTERM');
-    }, 1000);
+    logger.info('Sending SIGTERM to self after exact Payara plugin verification');
+    process.kill(process.pid, 'SIGTERM');
   }
 }
 
-/**
- * Load plugin auto-update config from environment or use defaults.
- */
 export function loadPluginUpdateConfig(): PluginAutoUpdateServiceConfig {
   const config: PluginAutoUpdateServiceConfig = { ...DEFAULT_PLUGIN_UPDATE_CONFIG };
+  const enabled = process.env.PLUGIN_AUTO_UPDATE?.trim().toLowerCase();
+  if (enabled === 'true' || enabled === '1') config.enabled = true;
+  if (enabled === 'false' || enabled === '0') config.enabled = false;
 
-  // Check for environment overrides
-  if (process.env.PLUGIN_AUTO_UPDATE === 'false' || process.env.PLUGIN_AUTO_UPDATE === '0') {
-    config.enabled = false;
+  const intervalText = process.env.PLUGIN_AUTO_UPDATE_INTERVAL;
+  if (intervalText) {
+    const interval = Number.parseInt(intervalText, 10);
+    if (Number.isFinite(interval) && interval > 0) config.checkIntervalMs = interval * 1000;
   }
-
-  if (process.env.PLUGIN_AUTO_UPDATE_INTERVAL) {
-    const interval = parseInt(process.env.PLUGIN_AUTO_UPDATE_INTERVAL, 10);
-    if (!isNaN(interval) && interval > 0) {
-      config.checkIntervalMs = interval * 1000; // Convert seconds to ms
-    }
+  const channel = process.env.PLUGIN_AUTO_UPDATE_CHANNEL?.trim().toLowerCase();
+  if (channel === 'latest' || channel === 'beta' || channel === 'next' || channel === 'dr-m4') {
+    config.defaultChannel = channel;
   }
-
-  if (process.env.PLUGIN_AUTO_UPDATE_CHANNEL) {
-    const channel = process.env.PLUGIN_AUTO_UPDATE_CHANNEL.toLowerCase();
-    if (channel === 'latest' || channel === 'beta' || channel === 'next') {
-      config.defaultChannel = channel;
-    }
+  const delayText = process.env.PLUGIN_AUTO_UPDATE_STAGED_DELAY;
+  if (delayText) {
+    const delay = Number.parseInt(delayText, 10);
+    if (Number.isFinite(delay) && delay >= 0) config.stagedRolloutMaxDelayMs = delay * 1000;
   }
-
-  if (process.env.PLUGIN_AUTO_UPDATE_STAGED_DELAY) {
-    const delay = parseInt(process.env.PLUGIN_AUTO_UPDATE_STAGED_DELAY, 10);
-    if (!isNaN(delay) && delay >= 0) {
-      config.stagedRolloutMaxDelayMs = delay * 1000; // Convert seconds to ms
-    }
-  }
-
   return config;
 }
