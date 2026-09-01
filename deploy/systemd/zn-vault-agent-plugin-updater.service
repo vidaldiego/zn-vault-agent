@@ -13,6 +13,9 @@ Group=root
 UMask=0022
 StateDirectory=zn-vault-agent-plugin-updater
 StateDirectoryMode=0755
+Environment=HOME=/var/lib/zn-vault-agent-plugin-updater
+Environment=NPM_CONFIG_CACHE=/var/lib/zn-vault-agent-plugin-updater/npm-cache
+Environment=NPM_CONFIG_USERCONFIG=/dev/null
 TimeoutStartSec=10min
 KillMode=control-group
 ExecStart=/usr/local/lib/zn-vault-agent/zn-vault-plugin-update.sh /var/lib/zn-vault-agent/.plugin-update-trigger /var/lib/zn-vault-agent/.plugin-update-active /var/lib/zn-vault-agent-plugin-updater /usr/bin/npm /usr/bin/node

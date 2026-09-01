@@ -615,6 +615,11 @@ describe('exact Payara plugin updater units', () => {
     expect(unit).toContain('/var/lib/zn-vault-agent/.plugin-update-trigger');
     expect(unit).toContain('/var/lib/zn-vault-agent/.plugin-update-active');
     expect(unit).toContain('StateDirectory=zn-vault-agent-plugin-updater');
+    expect(unit).toContain('Environment=HOME=/var/lib/zn-vault-agent-plugin-updater');
+    expect(unit).toContain(
+      'Environment=NPM_CONFIG_CACHE=/var/lib/zn-vault-agent-plugin-updater/npm-cache'
+    );
+    expect(unit).toContain('Environment=NPM_CONFIG_USERCONFIG=/dev/null');
     expect(unit).toContain('TimeoutStartSec=10min');
     expect(unit).toContain('StartLimitIntervalSec=10min');
     expect(unit).toContain('StartLimitBurst=6');
