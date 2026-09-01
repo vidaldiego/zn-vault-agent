@@ -17,8 +17,8 @@ import { pathToFileURL } from 'node:url';
 
 const AGENT_PACKAGE = '@zincapp/zn-vault-agent';
 const PLUGIN_PACKAGE = '@zincapp/znvault-plugin-payara';
-const EXPECTED_AGENT_VERSION = '2.0.0';
-const EXPECTED_PLUGIN_VERSION = '3.0.0';
+const EXPECTED_AGENT_VERSION = process.env.EXPECTED_AGENT_VERSION ?? '2.0.0';
+const EXPECTED_PLUGIN_VERSION = process.env.EXPECTED_PLUGIN_VERSION ?? '3.0.0';
 
 function packagePath(root, packageName, ...segments) {
   return join(root, 'node_modules', ...packageName.split('/'), ...segments);

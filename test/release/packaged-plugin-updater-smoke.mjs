@@ -101,6 +101,12 @@ exit 64
   ]);
   assert.match(serviceUnit, /^StartLimitIntervalSec=10min$/m);
   assert.match(serviceUnit, /^StartLimitBurst=6$/m);
+  assert.match(serviceUnit, /^Environment=HOME=\/var\/lib\/zn-vault-agent-plugin-updater$/m);
+  assert.match(
+    serviceUnit,
+    /^Environment=NPM_CONFIG_CACHE=\/var\/lib\/zn-vault-agent-plugin-updater\/npm-cache$/m
+  );
+  assert.match(serviceUnit, /^Environment=NPM_CONFIG_USERCONFIG=\/dev\/null$/m);
   assert.match(serviceUnit, /^TimeoutStartSec=10min$/m);
   assert.match(pathUnit, /^TriggerLimitIntervalSec=10min$/m);
   assert.match(pathUnit, /^TriggerLimitBurst=6$/m);

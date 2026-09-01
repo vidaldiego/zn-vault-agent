@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "Usage: $0 /absolute/path/zn-vault-agent-2.0.0.tgz /absolute/path/znvault-plugin-payara-3.0.0.tgz" >&2
+if [[ $# -lt 2 || $# -gt 4 ]]; then
+  echo "Usage: $0 /absolute/path/agent.tgz /absolute/path/plugin.tgz [agent-version] [plugin-version]" >&2
   exit 64
 fi
 
@@ -24,6 +24,8 @@ absolute_file() {
 
 agent_tarball=$(absolute_file "$1")
 plugin_tarball=$(absolute_file "$2")
+expected_agent_version=${3:-2.0.0}
+expected_plugin_version=${4:-3.0.0}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 runtime_script="$script_dir/tarball-smoke-runtime.mjs"
 
@@ -49,6 +51,8 @@ for node_image in $node_images; do
     --env=USER=node \
     --env=HOME=/tmp/home \
     --env=npm_config_cache=/tmp/npm-cache \
+    --env=EXPECTED_AGENT_VERSION="$expected_agent_version" \
+    --env=EXPECTED_PLUGIN_VERSION="$expected_plugin_version" \
     --tmpfs=/tmp:rw,exec,uid=1000,gid=1000,mode=700 \
     --tmpfs=/var/lib/zn-vault-agent:rw,exec,uid=1000,gid=1000,mode=700 \
     --mount="type=bind,src=$agent_tarball,dst=/artifacts/agent.tgz,readonly" \
@@ -72,8 +76,8 @@ for node_image in $node_images; do
         /artifacts/agent.tgz \
         /artifacts/plugin.tgz
       npm ls \
-        @zincapp/zn-vault-agent@2.0.0 \
-        @zincapp/znvault-plugin-payara@3.0.0 \
+        "@zincapp/zn-vault-agent@$EXPECTED_AGENT_VERSION" \
+        "@zincapp/znvault-plugin-payara@$EXPECTED_PLUGIN_VERSION" \
         --depth=0
       node ./smoke.mjs /artifacts/agent.tgz /artifacts/plugin.tgz
     '
