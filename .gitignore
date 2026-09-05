@@ -36,3 +36,6 @@ coverage/
 
 # Claude
 .claude/
+
+# Disposable integration-test profiles
+test/.test-config/

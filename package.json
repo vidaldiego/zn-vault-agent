@@ -43,7 +43,7 @@
     "lint:fix": "eslint src/ --fix",
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
-    "test": "../scripts/sdk-test-run.sh npm run test:all",
+    "test": "bash scripts/run-sdk-tests.sh",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:unit": "vitest run",

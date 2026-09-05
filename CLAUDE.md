@@ -6,21 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ZnVault Agent (`@zincapp/zn-vault-agent`) is a TypeScript/Node.js daemon that synchronizes TLS certificates and secrets from ZnVault to target servers with zero-downtime deployments. It runs as a systemd service and provides real-time updates via WebSocket, falling back to HTTP polling when unavailable.
 
-### Relationship to ZnVault Server
+### Independent workspace
 
-This agent is part of the ZnVault ecosystem. The parent directory (`../`) contains the main ZnVault server - see `../CLAUDE.md` for server documentation.
+This repository is `~/Drive/vault/zn-vault-agent`. The Vault server is the
+sibling `../zn-vault`, not the parent directory. Each component has its own
+Git root and agent instructions. See AGENTS.md for workspace boundaries.
 
-```
-zn-vault/                    # Parent - Vault server (Fastify, PostgreSQL)
-├── src/                     # Server source code
-├── zn-vault-agent/          # THIS REPO - Agent for certificate/secret sync
-├── zn-vault-sdk-node/       # Node.js SDK
-├── zn-vault-sdk-python/     # Python SDK
-├── zn-vault-sdk-swift/      # Swift SDK
-├── zn-vault-sdk-jvm/        # Kotlin/Java SDK
-├── znvault-cli/             # Admin CLI
-└── vault-secrets-app/       # macOS app
-```
 
 The agent communicates with the vault server via:
 - **REST API**: Authentication, certificate/secret fetching
@@ -90,14 +81,14 @@ npm run test:coverage
 
 ### Integration Test Setup
 
-Integration tests require a running vault instance. From the parent `zn-vault/` directory:
+Integration tests require a running vault instance. From the sibling `../zn-vault/` directory:
 
 ```bash
 # Start test environment (creates sdk-test tenant and API keys)
 npm run test:sdk:start
 
 # Then run integration tests
-cd zn-vault-agent
+cd ../zn-vault-agent
 npm run test:integration
 ```
 
