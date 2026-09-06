@@ -45,6 +45,13 @@ export interface CertTarget {
 export interface SecretTarget {
   /** Secret ID or alias in vault (e.g., "alias:db/credentials") */
   secretId: string;
+  /**
+   * Secret IDs or aliases whose updates must re-resolve and re-deploy this
+   * target. Use this when the target contains server-resolved `${ref:...}`
+   * references: the parent version does not change when a referenced secret
+   * rotates.
+   */
+  refreshOn?: string[];
   /** Human-readable name */
   name: string;
   /** Output format. Use 'none' for subscribe-only mode (no file output) */

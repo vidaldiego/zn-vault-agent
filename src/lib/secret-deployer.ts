@@ -312,7 +312,14 @@ export async function deployAllSecrets(
 
   for (const target of targets) {
     if (!shouldContinue()) break;
-    const result = await deploySecret(target, force, mutationLockPath);
+    // A referenced parent can resolve to new content while its own Vault
+    // version stays unchanged. Always re-resolve it during a full sync so an
+    // agent restart also recovers changes missed while it was offline.
+    const result = await deploySecret(
+      target,
+      force || (target.refreshOn?.length ?? 0) > 0,
+      mutationLockPath
+    );
     results.push(result);
   }
 

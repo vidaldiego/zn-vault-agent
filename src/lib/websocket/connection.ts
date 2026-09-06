@@ -30,7 +30,10 @@ export function buildWebSocketUrl(
   // Build initial subscription query params
   const certIds = config.targets.map(t => t.certId);
   const secretTargets = config.secretTargets ?? [];
-  const secretTargetIds = secretTargets.map(t => t.secretId);
+  const secretTargetIds = secretTargets.flatMap(t => [
+    t.secretId,
+    ...(t.refreshOn ?? []),
+  ]);
 
   // Combine secret target IDs with additional exec secret IDs
   const allSecretIds = [...new Set([...secretTargetIds, ...additionalSecretIds])];
