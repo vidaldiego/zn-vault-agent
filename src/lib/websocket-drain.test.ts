@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   acknowledgeSecretMutation,
+  admitSecretRefreshEventsToRetryQueue,
   admitSecretMutationAfterAwait,
   admitSecretEventToRetryQueue,
   createSingleFlightOperation,
@@ -8,9 +9,11 @@ import {
   InitialChildStartBarrier,
   initializeExecSecretIdentity,
   isSecretVersionConsumed,
+  findSecretRefreshMatches,
   pollExecOnlySecretVersions,
   runAdmittedChildRestart,
   type SecretMutationEvidence,
+  type SecretRefreshRetryItem,
   type SecretRetryItem,
   withActiveDeployment,
 } from './websocket.js';
@@ -280,6 +283,120 @@ describe('daemon mutation drain', () => {
     expect(restart).toHaveBeenCalledTimes(1);
     expect(acknowledgedIdentities).toEqual(['alias:example/prod']);
     expect(queue.pendingCount).toBe(0);
+  });
+
+  it('refreshes a referenced parent once for an alias-matched child event', async () => {
+    const target = {
+      secretId: 'alias:app/runtime-env',
+      refreshOn: ['alias:credentials/openai'],
+      name: 'runtime-env',
+      format: 'env' as const,
+      output: '/run/app/runtime.env',
+    };
+    expect(findSecretRefreshMatches(
+      [target],
+      'child-uuid',
+      'credentials/openai'
+    )).toEqual([{
+      target,
+      reference: 'alias:credentials/openai',
+      key: 'refresh:alias:app/runtime-env:credentials/openai',
+    }]);
+
+    const consumedVersions = new Map<string, number>();
+    const prepared: SecretRefreshRetryItem[] = [];
+    const queue = new RestartRequiredMutationQueue<
+      SecretRefreshRetryItem,
+      SecretMutationEvidence
+    >({
+      prepare: async item => {
+        prepared.push(item);
+        return { decision: 'resolved', evidence: { version: 9 } };
+      },
+      restart: async () => undefined,
+      acknowledge: item => {
+        consumedVersions.set(item.key, item.event.version);
+      },
+      retryDelayMs: 60_000,
+    });
+    const event = {
+      event: 'secret.rotated' as const,
+      secretId: 'child-uuid',
+      alias: 'credentials/openai',
+      version: 4,
+      timestamp: '2026-09-06T18:00:00.000Z',
+      tenantId: 'tenant-1',
+    };
+
+    await expect(admitSecretRefreshEventsToRetryQueue({
+      event,
+      targets: [target],
+      consumedVersions,
+      queue,
+    })).resolves.toEqual({
+      status: 'queued',
+      queuedKeys: ['refresh:alias:app/runtime-env:credentials/openai'],
+      matchedKeys: ['refresh:alias:app/runtime-env:credentials/openai'],
+    });
+    expect(prepared).toHaveLength(1);
+    expect(consumedVersions.get('refresh:alias:app/runtime-env:credentials/openai')).toBe(4);
+
+    await expect(admitSecretRefreshEventsToRetryQueue({
+      event,
+      targets: [target],
+      consumedVersions,
+      queue,
+    })).resolves.toEqual({
+      status: 'consumed',
+      matchedKeys: ['refresh:alias:app/runtime-env:credentials/openai'],
+    });
+    expect(prepared).toHaveLength(1);
+  });
+
+  it('keeps equal child versions independent across two references', async () => {
+    const target = {
+      secretId: 'alias:app/runtime-env',
+      refreshOn: ['alias:credentials/openai', 'alias:credentials/mistral'],
+      name: 'runtime-env',
+      format: 'env' as const,
+      output: '/run/app/runtime.env',
+    };
+    const consumedVersions = new Map<string, number>();
+    const prepared: string[] = [];
+    const queue = new RestartRequiredMutationQueue<
+      SecretRefreshRetryItem,
+      SecretMutationEvidence
+    >({
+      prepare: async item => {
+        prepared.push(item.reference);
+        return { decision: 'resolved', evidence: { version: 1 } };
+      },
+      restart: async () => undefined,
+      acknowledge: item => {
+        consumedVersions.set(item.key, item.event.version);
+      },
+      retryDelayMs: 60_000,
+    });
+
+    for (const alias of ['credentials/openai', 'credentials/mistral']) {
+      await expect(admitSecretRefreshEventsToRetryQueue({
+        event: {
+          event: 'secret.updated',
+          secretId: `${alias}-uuid`,
+          alias,
+          version: 1,
+          timestamp: '2026-09-06T18:00:00.000Z',
+          tenantId: 'tenant-1',
+        },
+        targets: [target],
+        consumedVersions,
+        queue,
+      })).resolves.toMatchObject({ status: 'queued' });
+    }
+    expect(prepared).toEqual([
+      'alias:credentials/openai',
+      'alias:credentials/mistral',
+    ]);
   });
 
   it('keeps polling single-flight across overlapping timer callbacks', async () => {

@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Secret targets can declare `refreshOn` references. The agent subscribes to
+  those child secrets, re-resolves the parent after a child update, forces a
+  safe parent render on startup, and polls child versions as a fallback when a
+  WebSocket event is missed. This keeps server-resolved `${ref:...}` parents
+  current even though the parent's own Vault version does not change.
+
 ## [2.0.0] - 2026-09-01 - Cross-Process Mutation Fence
 
 ### Breaking

@@ -304,6 +304,24 @@ export interface SecretMutationEvidence {
   version: number;
 }
 
+export interface SecretRefreshMatch {
+  target: SecretTarget;
+  reference: string;
+  key: string;
+}
+
+export interface SecretRefreshRetryItem {
+  event: SecretEvent;
+  target: SecretTarget;
+  reference: string;
+  key: string;
+}
+
+export type SecretRefreshAdmissionResult =
+  | { status: 'untracked' }
+  | { status: 'consumed'; matchedKeys: string[] }
+  | { status: 'queued'; queuedKeys: string[]; matchedKeys: string[] };
+
 export type SecretEventAdmissionResult =
   | { status: 'consumed' }
   | { status: 'untracked' }
@@ -349,6 +367,86 @@ function hasSecretReference(
   return candidates.some(candidate =>
     secretReferenceVariants(candidate).some(variant => references.has(variant))
   );
+}
+
+/** Stable per-target/per-reference queue and watermark key. */
+export function secretRefreshKey(target: SecretTarget, reference: string): string {
+  const normalizedReference = reference.startsWith('alias:')
+    ? reference.slice('alias:'.length)
+    : reference;
+  return `refresh:${target.secretId}:${normalizedReference}`;
+}
+
+/** Enumerate every configured reference dependency once. */
+export function listSecretRefreshMatches(targets: SecretTarget[]): SecretRefreshMatch[] {
+  const seen = new Set<string>();
+  const matches: SecretRefreshMatch[] = [];
+  for (const target of targets) {
+    for (const reference of target.refreshOn ?? []) {
+      const key = secretRefreshKey(target, reference);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      matches.push({ target, reference, key });
+    }
+  }
+  return matches;
+}
+
+/** Resolve a WebSocket event to every parent target that depends on it. */
+export function findSecretRefreshMatches(
+  targets: SecretTarget[],
+  ...eventReferences: string[]
+): SecretRefreshMatch[] {
+  const eventVariants = new Set(eventReferences.flatMap(secretReferenceVariants));
+  return listSecretRefreshMatches(targets).filter(({ reference }) =>
+    secretReferenceVariants(reference).some(variant => eventVariants.has(variant))
+  );
+}
+
+/**
+ * Admit reference-triggered parent refreshes to their own retry keys. Child
+ * versions are monotonic only within one dependency, so they must never share
+ * the parent's normal version watermark or another dependency's queue key.
+ */
+export async function admitSecretRefreshEventsToRetryQueue(options: {
+  event: SecretEvent;
+  targets: SecretTarget[];
+  consumedVersions: Map<string, number>;
+  queue: RestartRequiredMutationQueue<SecretRefreshRetryItem, SecretMutationEvidence>;
+}): Promise<SecretRefreshAdmissionResult> {
+  const matches = findSecretRefreshMatches(
+    options.targets,
+    options.event.secretId,
+    options.event.alias
+  );
+  if (matches.length === 0) return { status: 'untracked' };
+
+  const queuedKeys: string[] = [];
+  for (const match of matches) {
+    if (isSecretVersionConsumed(
+      options.consumedVersions.get(match.key),
+      options.event.version,
+      options.queue.getPendingGeneration(match.key)
+    )) {
+      continue;
+    }
+    options.queue.enqueue(match.key, options.event.version, {
+      event: options.event,
+      target: match.target,
+      reference: match.reference,
+      key: match.key,
+    });
+    queuedKeys.push(match.key);
+  }
+
+  for (const key of queuedKeys) {
+    await options.queue.retryNow(key);
+  }
+
+  const matchedKeys = matches.map(match => match.key);
+  return queuedKeys.length > 0
+    ? { status: 'queued', queuedKeys, matchedKeys }
+    : { status: 'consumed', matchedKeys };
 }
 
 /** Build the exact alias/UUID identity seed used by the production handler. */
@@ -988,6 +1086,7 @@ export async function startDaemon(options: {
       ? []
       : [[target.secretId, target.lastVersion]])
   );
+  const consumedSecretRefreshVersions = new Map<string, number>();
   const execSecretIdentityByReference = new Map<string, string>();
   const consumedExecSecretVersions = new Map<string, number>();
 
@@ -1473,11 +1572,16 @@ export async function startDaemon(options: {
   }
 
   let pendingSecretQueueCount = 0;
+  let pendingSecretRefreshQueueCount = 0;
   const execMetadataUnknown = new Set<string>();
+  const refreshMetadataUnknown = new Set<string>();
   const publishPendingSecretHealth = (): void => {
     setPendingMutationRetries(
       'secret',
-      pendingSecretQueueCount + execMetadataUnknown.size
+      pendingSecretQueueCount
+        + pendingSecretRefreshQueueCount
+        + execMetadataUnknown.size
+        + refreshMetadataUnknown.size
     );
   };
   const dispatchSecretChanged = async (
@@ -1701,6 +1805,70 @@ export async function startDaemon(options: {
     },
   });
 
+  const secretRefreshRetryQueue = new RestartRequiredMutationQueue<
+    SecretRefreshRetryItem,
+    SecretMutationEvidence
+  >({
+    account: withActiveDeployment,
+    prepare: async ({ event, target, reference }) => {
+      log.info(
+        { name: target.name, reference, version: event.version },
+        'Refreshing referenced secret target'
+      );
+      const result = await deploySecret(target, true);
+      if (!result.success) {
+        if (isLockContention(result.errorCode)) return { decision: 'retry' };
+        log.error(
+          { name: target.name, reference, error: result.message },
+          'Referenced secret target refresh failed'
+        );
+        return { decision: 'failed' };
+      }
+      return {
+        decision: 'resolved',
+        evidence: { version: result.version ?? event.version },
+      };
+    },
+    notify: async ({ target }, evidence) => {
+      if (!pluginLoader) return;
+      const secretEvent: SecretDeployedEvent = {
+        secretId: target.secretId,
+        alias: target.secretId.startsWith('alias:')
+          ? target.secretId.slice('alias:'.length)
+          : target.secretId,
+        name: target.name,
+        path: target.output,
+        format: target.format,
+        version: evidence.version,
+        isUpdate: true,
+      };
+      try {
+        await pluginLoader.dispatchEvent('secretDeployed', secretEvent);
+      } catch (pluginErr) {
+        log.error(
+          { err: pluginErr, secretId: target.secretId },
+          'Plugin failed to handle referenced secretDeployed event'
+        );
+      }
+    },
+    restart: async ({ reference }) => {
+      await restartChildAfterMutation?.(`referenced secret updated: ${reference}`);
+    },
+    acknowledge: (item) => {
+      consumedSecretRefreshVersions.set(item.key, item.event.version);
+    },
+    onPendingChange: count => {
+      pendingSecretRefreshQueueCount = count;
+      publishPendingSecretHealth();
+    },
+    onExhausted: (key, item, generation) => {
+      log.error(
+        { key, name: item.target.name, reference: item.reference, generation },
+        'Referenced secret refresh retry exhausted; polling recovery required'
+      );
+    },
+  });
+
   // Handle secret events
   async function handleSecretEvent(event: SecretEvent): Promise<void> {
     if (isShutdownRequested()) {
@@ -1709,6 +1877,12 @@ export async function startDaemon(options: {
     }
 
     await withActiveDeployment(async () => {
+      const refreshAdmission = await admitSecretRefreshEventsToRetryQueue({
+        event,
+        targets: secretTargets,
+        consumedVersions: consumedSecretRefreshVersions,
+        queue: secretRefreshRetryQueue,
+      });
       const admission = await admitSecretEventToRetryQueue({
         event,
         execSecretReferences,
@@ -1730,7 +1904,16 @@ export async function startDaemon(options: {
         // Plugins may subscribe to secrets that the core agent neither writes
         // to a file nor injects into exec. Preserve that generic event path.
         await dispatchSecretChanged(event, event.version);
-        log.debug({ secretId: event.secretId, alias: event.alias }, 'Received event for untracked secret');
+        log.debug(
+          {
+            secretId: event.secretId,
+            alias: event.alias,
+            refreshStatus: refreshAdmission.status,
+          },
+          refreshAdmission.status === 'untracked'
+            ? 'Received event for untracked secret'
+            : 'Received event for referenced secret'
+        );
       }
     });
 
@@ -2024,6 +2207,25 @@ export async function startDaemon(options: {
 
   // Initial sync - secrets
   if (secretTargets.length > 0 && !isStartupShutdownRequested()) {
+    // Snapshot reference generations before rendering their parents. A later
+    // WebSocket event or poll with a higher child generation must refresh the
+    // parent even though the parent's own version remains unchanged.
+    const initialRefreshVersions = new Map<string, number>();
+    for (const match of listSecretRefreshMatches(secretTargets)) {
+      if (initialRefreshVersions.has(match.reference)) continue;
+      try {
+        const metadata = await getSecretMetadata(match.reference);
+        initialRefreshVersions.set(match.reference, metadata.version);
+      } catch (err) {
+        refreshMetadataUnknown.add(match.key);
+        publishPendingSecretHealth();
+        log.error(
+          { err, reference: match.reference, name: match.target.name },
+          'Initial referenced secret metadata fetch failed'
+        );
+      }
+    }
+
     log.info('Performing initial secret sync');
     const secretResults = await withActiveDeployment(
       async () => deployAllSecrets(false, () => !isStartupShutdownRequested())
@@ -2035,6 +2237,17 @@ export async function startDaemon(options: {
         consumedSecretVersions.set(result.secretId, result.version);
       }
     }
+    const successfulTargets = new Set(
+      secretResults.filter(result => result.success).map(result => result.secretId)
+    );
+    for (const match of listSecretRefreshMatches(secretTargets)) {
+      const version = initialRefreshVersions.get(match.reference);
+      if (successfulTargets.has(match.target.secretId) && version !== undefined) {
+        consumedSecretRefreshVersions.set(match.key, version);
+        refreshMetadataUnknown.delete(match.key);
+      }
+    }
+    publishPendingSecretHealth();
     updateSecretStatus(secretSuccess, secretErrors);
     log.info({ total: secretResults.length, success: secretSuccess, errors: secretErrors }, 'Secret sync complete');
   }
@@ -2126,6 +2339,70 @@ export async function startDaemon(options: {
         });
       } catch (err) {
         log.error({ name: target.name, err }, 'Error polling certificate');
+      }
+    }
+
+    // Poll reference dependencies separately from their parent targets. A
+    // referenced child can rotate without incrementing the parent's version.
+    const refreshMetadataByReference = new Map<string, Awaited<ReturnType<typeof getSecretMetadata>>>();
+    const failedRefreshReferences = new Set<string>();
+    for (const match of listSecretRefreshMatches(secretTargets)) {
+      if (isShutdownRequested()) break;
+
+      if (secretRefreshRetryQueue.isPending(match.key)) {
+        await secretRefreshRetryQueue.retryNow(match.key);
+        continue;
+      }
+
+      let metadata = refreshMetadataByReference.get(match.reference);
+      if (!metadata && !failedRefreshReferences.has(match.reference)) {
+        try {
+          metadata = await getSecretMetadata(match.reference);
+          refreshMetadataByReference.set(match.reference, metadata);
+        } catch (err) {
+          failedRefreshReferences.add(match.reference);
+          log.error(
+            { err, reference: match.reference, name: match.target.name },
+            'Referenced secret metadata poll failed'
+          );
+        }
+      }
+
+      if (!metadata) {
+        refreshMetadataUnknown.add(match.key);
+        publishPendingSecretHealth();
+        continue;
+      }
+      if (refreshMetadataUnknown.delete(match.key)) publishPendingSecretHealth();
+
+      if (isSecretVersionConsumed(
+        consumedSecretRefreshVersions.get(match.key),
+        metadata.version,
+        secretRefreshRetryQueue.getPendingGeneration(match.key)
+      )) {
+        continue;
+      }
+
+      const event: SecretEvent = {
+        event: 'secret.updated',
+        secretId: metadata.id,
+        alias: metadata.alias,
+        version: metadata.version,
+        timestamp: new Date().toISOString(),
+        tenantId: config.tenantId ?? '',
+      };
+      secretRefreshRetryQueue.enqueue(match.key, metadata.version, {
+        event,
+        target: match.target,
+        reference: match.reference,
+        key: match.key,
+      });
+      const resolved = await secretRefreshRetryQueue.retryNow(match.key);
+      if (!resolved) {
+        log.error(
+          { reference: match.reference, name: match.target.name, version: metadata.version },
+          'Referenced secret poll mutation remains pending'
+        );
       }
     }
 
@@ -2334,6 +2611,7 @@ export async function startDaemon(options: {
     keyRotationPropagator.stop();
     certificateRetryQueue.stop();
     secretRetryQueue.stop();
+    secretRefreshRetryQueue.stop();
     unifiedClient.disconnect();
 
     // Cancel every source of new mutation work before draining operations
