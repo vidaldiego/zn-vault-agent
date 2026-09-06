@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.23.5] - 2026-09-06 - Canonical Alias Subscriptions
+
+### Fixed
+
+- WebSocket secret subscriptions now remove the optional `alias:` selector
+  prefix before sending aliases to Vault. Vault events carry canonical aliases,
+  so exact subscription matching now delivers parent and `refreshOn` child
+  updates immediately instead of relying on the polling fallback.
+
 ## [1.23.4] - 2026-09-06 - Referenced Secret Refresh
 
 ### Added
