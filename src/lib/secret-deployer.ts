@@ -263,7 +263,13 @@ export async function deployAllSecrets(force = false): Promise<SecretDeployResul
   const results: SecretDeployResult[] = [];
 
   for (const target of targets) {
-    const result = await deploySecret(target, force);
+    // A referenced parent can resolve to new content while its own Vault
+    // version stays unchanged. Always re-resolve it during a full sync so an
+    // agent restart also recovers changes missed while it was offline.
+    const result = await deploySecret(
+      target,
+      force || (target.refreshOn?.length ?? 0) > 0
+    );
     results.push(result);
   }
 
@@ -273,6 +279,53 @@ export async function deployAllSecrets(force = false): Promise<SecretDeployResul
   log.info({ total: results.length, success: successCount, errors: errorCount }, 'Secret deployment complete');
 
   return results;
+}
+
+export interface SecretRefreshTarget {
+  target: SecretTarget;
+  reference: string;
+  key: string;
+}
+
+function secretReferenceVariants(reference: string): string[] {
+  if (!reference) return [];
+  return reference.startsWith('alias:')
+    ? [reference, reference.slice('alias:'.length)]
+    : [reference, `alias:${reference}`];
+}
+
+/** Stable per-target/per-reference identity for polling watermarks. */
+export function secretRefreshKey(target: SecretTarget, reference: string): string {
+  const normalizedReference = reference.startsWith('alias:')
+    ? reference.slice('alias:'.length)
+    : reference;
+  return `refresh:${target.secretId}:${normalizedReference}`;
+}
+
+/** Enumerate every configured reference dependency once. */
+export function listSecretRefreshTargets(targets: SecretTarget[]): SecretRefreshTarget[] {
+  const seen = new Set<string>();
+  const matches: SecretRefreshTarget[] = [];
+  for (const target of targets) {
+    for (const reference of target.refreshOn ?? []) {
+      const key = secretRefreshKey(target, reference);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      matches.push({ target, reference, key });
+    }
+  }
+  return matches;
+}
+
+/** Resolve a child event to every referenced parent target that depends on it. */
+export function findSecretRefreshTargets(
+  targets: SecretTarget[],
+  ...eventReferences: string[]
+): SecretRefreshTarget[] {
+  const eventVariants = new Set(eventReferences.flatMap(secretReferenceVariants));
+  return listSecretRefreshTargets(targets).filter(({ reference }) =>
+    secretReferenceVariants(reference).some(variant => eventVariants.has(variant))
+  );
 }
 
 /**

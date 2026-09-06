@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.23.4] - 2026-09-06 - Referenced Secret Refresh
+
+### Added
+
+- Secret targets can declare `refreshOn` references. The agent subscribes to
+  those child secrets, re-resolves the parent after a child update, forces a
+  safe parent render on startup, and polls child versions as a fallback when a
+  WebSocket event is missed. This keeps server-resolved `${ref:...}` parents
+  current even though the parent's own Vault version does not change.
+
 ## [1.23.3] - 2026-08-28 - Dynamic Credential Ownership v2
 
 ### Security

@@ -531,6 +531,7 @@ interface AgentConfig {
   // === SECRET TARGETS ===
   secretTargets?: Array<{
     secretId: string;                  // alias:path or UUID
+    refreshOn?: string[];              // Re-deploy this target when a referenced secret changes
     name: string;
     format: 'env' | 'json' | 'yaml' | 'raw' | 'template' | 'none';
     output?: string;                   // File path

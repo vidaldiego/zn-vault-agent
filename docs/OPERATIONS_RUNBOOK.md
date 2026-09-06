@@ -226,6 +226,7 @@ this file in the field need to know which is which.
       // Admin-set
       "name":       "backup-master-key",
       "secretId":   "alias:archon/backups/master-key",
+      "refreshOn":  [],               // referenced secrets that re-render this target
       "output":     "/run/zn-vault-agent/secrets/backup-master-key",
       "format":     "raw",           // or "env", "json"
       "mode":       "0440",

@@ -12,7 +12,13 @@ import {
   type TLSConfig,
 } from './config.js';
 import { deployCertificate, deployAllCertificates } from './deployer.js';
-import { deploySecret, deployAllSecrets, findSecretTarget } from './secret-deployer.js';
+import {
+  deploySecret,
+  deployAllSecrets,
+  findSecretTarget,
+  findSecretRefreshTargets,
+  listSecretRefreshTargets,
+} from './secret-deployer.js';
 import { wsLogger as log } from './logger.js';
 import { metrics, initializeMetrics } from './metrics.js';
 import {
@@ -51,7 +57,7 @@ import {
   parseSecretMappingFromConfig,
   type SecretMapping,
 } from './secret-env.js';
-import { bindManagedApiKey } from './api.js';
+import { bindManagedApiKey, getSecretMetadata } from './api.js';
 import { createKeyRotationPropagator } from './key-rotation-propagation.js';
 import {
   createPluginLoader,
@@ -183,6 +189,7 @@ export async function startDaemon(options: {
 } = {}): Promise<void> {
   const config = loadConfig();
   const secretTargets = config.secretTargets ?? [];
+  const consumedSecretRefreshVersions = new Map<string, number>();
 
   // Initialize plugin loader
   let pluginLoader: PluginLoader | null = null;
@@ -637,6 +644,62 @@ export async function startDaemon(options: {
     let deployedSecretTarget = false;
     let isExecSecret = false;
 
+    // A child referenced through `${ref:...}` can change without incrementing
+    // the parent secret's version. Re-resolve every parent that explicitly
+    // declares this child in refreshOn.
+    for (const refresh of findSecretRefreshTargets(
+      secretTargets,
+      event.secretId,
+      event.alias
+    )) {
+      const consumedVersion = consumedSecretRefreshVersions.get(refresh.key);
+      if (consumedVersion !== undefined && event.version <= consumedVersion) {
+        continue;
+      }
+
+      activeDeployments++;
+      try {
+        log.info(
+          { name: refresh.target.name, reference: refresh.reference, version: event.version },
+          'Refreshing referenced secret target'
+        );
+        const result = await deploySecret(refresh.target, true);
+        if (!result.success) {
+          log.error(
+            { name: refresh.target.name, reference: refresh.reference, error: result.message },
+            'Referenced secret target refresh failed'
+          );
+          continue;
+        }
+
+        consumedSecretRefreshVersions.set(refresh.key, event.version);
+        deployedSecretTarget = true;
+        if (pluginLoader) {
+          const secretEvent: SecretDeployedEvent = {
+            secretId: refresh.target.secretId,
+            alias: refresh.target.secretId.startsWith('alias:')
+              ? refresh.target.secretId.slice('alias:'.length)
+              : refresh.target.secretId,
+            name: refresh.target.name,
+            path: refresh.target.output,
+            format: refresh.target.format,
+            version: result.version ?? event.version,
+            isUpdate: true,
+          };
+          try {
+            await pluginLoader.dispatchEvent('secretDeployed', secretEvent);
+          } catch (pluginErr) {
+            log.error(
+              { err: pluginErr, secretId: refresh.target.secretId },
+              'Plugin failed to handle referenced secretDeployed event'
+            );
+          }
+        }
+      } finally {
+        activeDeployments--;
+      }
+    }
+
     // Check if this is a secret target (file deployment)
     const target = findSecretTarget(event.secretId) ?? findSecretTarget(event.alias);
     if (target) {
@@ -689,7 +752,7 @@ export async function startDaemon(options: {
       }
     }
 
-    if (!target && !isExecSecret) {
+    if (!target && !isExecSecret && !deployedSecretTarget) {
       log.debug({ secretId: event.secretId, alias: event.alias }, 'Received event for untracked secret');
     }
   }
@@ -965,10 +1028,36 @@ export async function startDaemon(options: {
 
   // Initial sync - secrets
   if (secretTargets.length > 0) {
+    // Snapshot child generations before rendering their parents. If a child
+    // changes after this point, WebSocket or polling observes a higher version
+    // and forces another parent render.
+    const initialRefreshVersions = new Map<string, number>();
+    for (const refresh of listSecretRefreshTargets(secretTargets)) {
+      if (initialRefreshVersions.has(refresh.reference)) continue;
+      try {
+        const metadata = await getSecretMetadata(refresh.reference);
+        initialRefreshVersions.set(refresh.reference, metadata.version);
+      } catch (err) {
+        log.error(
+          { err, reference: refresh.reference, name: refresh.target.name },
+          'Initial referenced secret metadata fetch failed'
+        );
+      }
+    }
+
     log.info('Performing initial secret sync');
     const secretResults = await deployAllSecrets(false);
     const secretSuccess = secretResults.filter(r => r.success).length;
     const secretErrors = secretResults.filter(r => !r.success).length;
+    const successfulTargets = new Set(
+      secretResults.filter(result => result.success).map(result => result.secretId)
+    );
+    for (const refresh of listSecretRefreshTargets(secretTargets)) {
+      const version = initialRefreshVersions.get(refresh.reference);
+      if (successfulTargets.has(refresh.target.secretId) && version !== undefined) {
+        consumedSecretRefreshVersions.set(refresh.key, version);
+      }
+    }
     updateSecretStatus(secretSuccess, secretErrors);
     log.info({ total: secretResults.length, success: secretSuccess, errors: secretErrors }, 'Secret sync complete');
   }
@@ -1017,6 +1106,56 @@ export async function startDaemon(options: {
         }
       } catch (err) {
         log.error({ name: target.name, err }, 'Error polling secret');
+      }
+    }
+
+    // Poll child generations independently. The parent version is unchanged
+    // when a server-resolved reference rotates, so normal target polling alone
+    // cannot detect this class of update.
+    const refreshMetadataByReference = new Map<string, Awaited<ReturnType<typeof getSecretMetadata>>>();
+    const failedRefreshReferences = new Set<string>();
+    for (const refresh of listSecretRefreshTargets(secretTargets)) {
+      if (getIsShuttingDown()) break;
+
+      let metadata = refreshMetadataByReference.get(refresh.reference);
+      if (!metadata && !failedRefreshReferences.has(refresh.reference)) {
+        try {
+          metadata = await getSecretMetadata(refresh.reference);
+          refreshMetadataByReference.set(refresh.reference, metadata);
+        } catch (err) {
+          failedRefreshReferences.add(refresh.reference);
+          log.error(
+            { err, reference: refresh.reference, name: refresh.target.name },
+            'Referenced secret metadata poll failed'
+          );
+        }
+      }
+      if (!metadata) continue;
+
+      const consumedVersion = consumedSecretRefreshVersions.get(refresh.key);
+      if (consumedVersion !== undefined && metadata.version <= consumedVersion) {
+        continue;
+      }
+
+      try {
+        const result = await deploySecret(refresh.target, true);
+        if (result.success) {
+          consumedSecretRefreshVersions.set(refresh.key, metadata.version);
+          log.info(
+            { name: refresh.target.name, reference: refresh.reference, version: metadata.version },
+            'Referenced secret target refreshed during poll'
+          );
+        } else {
+          log.error(
+            { name: refresh.target.name, reference: refresh.reference, error: result.message },
+            'Referenced secret target poll refresh failed'
+          );
+        }
+      } catch (err) {
+        log.error(
+          { name: refresh.target.name, reference: refresh.reference, err },
+          'Error refreshing referenced secret target during poll'
+        );
       }
     }
   };

@@ -1,12 +1,4 @@
-# Publish to npm when a version tag is pushed
-# Uses OIDC trusted publishing - no NPM_TOKEN needed!
-#
-# One-time setup on npmjs.com (after first manual publish):
-#   1. Go to package settings → Trusted publisher → GitHub Actions
-#   2. Configure: org=zincapp, repo=zn-vault-agent, workflow=publish.yml
-#   3. Click "Set up connection"
-#
-# Usage: git tag v1.3.0 && git push origin v1.3.0
+# Publish one verified npm artifact when a version tag on main is pushed.
 
 name: Publish to npm
 
@@ -17,52 +9,138 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # Required for OIDC authentication
 
 jobs:
-  publish:
+  test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '24'  # Node 24+ includes npm with OIDC support
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '20.20.2'
           cache: 'npm'
+
+      - name: Verify tagged commit belongs to main
+        shell: bash
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "Tagged commit is not contained in origin/main"
+            exit 1
+          fi
+
+      - name: Verify version matches tag
+        shell: bash
+        run: |
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          LOCK_VERSION=$(node -p "require('./package-lock.json').version")
+          LOCK_ROOT_VERSION=$(node -p "require('./package-lock.json').packages[''].version")
+          FILE_VERSION=$(tr -d '\r\n' < VERSION)
+          EXPECTED_VERSIONS="$TAG_VERSION|$TAG_VERSION|$TAG_VERSION|$TAG_VERSION"
+          ACTUAL_VERSIONS="$PKG_VERSION|$LOCK_VERSION|$LOCK_ROOT_VERSION|$FILE_VERSION"
+          if [[ "$ACTUAL_VERSIONS" != "$EXPECTED_VERSIONS" ]]; then
+            echo "Release version mismatch: tag=$TAG_VERSION package=$PKG_VERSION lock=$LOCK_VERSION lock-root=$LOCK_ROOT_VERSION VERSION=$FILE_VERSION"
+            exit 1
+          fi
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
+      - name: Run linter
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Run unit tests
         run: npm run test:unit
 
       - name: Build
         run: npm run build
 
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install OIDC-capable npm
+        run: npm install -g npm@11.17.0
+
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Build publish candidate
+        run: npm run build
+
       - name: Verify version matches tag
+        shell: bash
         run: |
           TAG_VERSION=${GITHUB_REF#refs/tags/v}
           PKG_VERSION=$(node -p "require('./package.json').version")
-          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
-            echo "Error: Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
+          LOCK_VERSION=$(node -p "require('./package-lock.json').version")
+          LOCK_ROOT_VERSION=$(node -p "require('./package-lock.json').packages[''].version")
+          FILE_VERSION=$(tr -d '\r\n' < VERSION)
+          EXPECTED_VERSIONS="$TAG_VERSION|$TAG_VERSION|$TAG_VERSION|$TAG_VERSION"
+          ACTUAL_VERSIONS="$PKG_VERSION|$LOCK_VERSION|$LOCK_ROOT_VERSION|$FILE_VERSION"
+          if [[ "$ACTUAL_VERSIONS" != "$EXPECTED_VERSIONS" ]]; then
+            echo "Release version mismatch: tag=$TAG_VERSION package=$PKG_VERSION lock=$LOCK_VERSION lock-root=$LOCK_ROOT_VERSION VERSION=$FILE_VERSION"
             exit 1
           fi
-          echo "Version: $PKG_VERSION"
 
-      - name: Publish to npm (OIDC)
-        run: npm publish --provenance --access public
-        # No NODE_AUTH_TOKEN needed - uses OIDC trusted publishing
-
-      - name: Tag beta/next if pre-release
-        if: contains(github.ref, '-beta') || contains(github.ref, '-alpha') || contains(github.ref, '-rc')
+      - name: Pack and verify the exact publish artifact
+        id: release_artifact
+        shell: bash
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          if [[ "$VERSION" == *"-beta"* ]]; then
-            npm dist-tag add @zincapp/zn-vault-agent@$VERSION beta
-          elif [[ "$VERSION" == *"-alpha"* ]] || [[ "$VERSION" == *"-rc"* ]]; then
-            npm dist-tag add @zincapp/zn-vault-agent@$VERSION next
+          release_dir="$RUNNER_TEMP/znvault-release"
+          mkdir -p "$release_dir"
+          pack_json=$(npm pack --json --pack-destination "$release_dir")
+          package_name=$(printf '%s' "$pack_json" | node -e "let data='';process.stdin.on('data',c=>data+=c).on('end',()=>process.stdout.write(JSON.parse(data)[0].filename))")
+          if [[ -z "$package_name" || "$package_name" == */* ]]; then
+            echo "npm pack returned an unsafe package filename: $package_name"
+            exit 1
           fi
+          package_file="$release_dir/$package_name"
+          package_sha256=$(sha256sum "$package_file" | awk '{print $1}')
+          echo "path=$package_file" >> "$GITHUB_OUTPUT"
+          echo "sha256=$package_sha256" >> "$GITHUB_OUTPUT"
+          echo "Validated publish artifact sha256=$package_sha256"
+          extract_dir=$(mktemp -d)
+          tar -xzf "$package_file" -C "$extract_dir"
+          test "$(node -p "require('$extract_dir/package/package.json').version")" = "${GITHUB_REF#refs/tags/v}"
+          node "$extract_dir/package/dist/index.js" --help >/dev/null
+
+      - name: Publish verified artifact to npm
+        env:
+          PACKAGE_FILE: ${{ steps.release_artifact.outputs.path }}
+          PACKAGE_SHA256: ${{ steps.release_artifact.outputs.sha256 }}
+        run: |
+          actual_sha256=$(sha256sum "$PACKAGE_FILE" | awk '{print $1}')
+          if [[ "$actual_sha256" != "$PACKAGE_SHA256" ]]; then
+            echo "Publish artifact changed after validation"
+            exit 1
+          fi
+          npm publish "$PACKAGE_FILE" --provenance --access public --tag latest

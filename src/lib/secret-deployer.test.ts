@@ -5,7 +5,11 @@
 // must NOT short-circuit. See issue #1.
 
 import { describe, it, expect, vi } from 'vitest';
-import { shouldSkipDeploy } from './secret-deployer.js';
+import {
+  findSecretRefreshTargets,
+  listSecretRefreshTargets,
+  shouldSkipDeploy,
+} from './secret-deployer.js';
 
 describe('shouldSkipDeploy', () => {
   const fileExists = (paths: string[]) => vi.fn((p: string) => paths.includes(p));
@@ -117,5 +121,51 @@ describe('shouldSkipDeploy', () => {
       spy,
     );
     expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe('referenced secret targets', () => {
+  const target = {
+    secretId: 'alias:app/runtime-env',
+    refreshOn: [
+      'alias:credentials/openai',
+      'alias:credentials/mistral',
+      'alias:credentials/mistral',
+    ],
+    name: 'runtime-env',
+    format: 'env' as const,
+    output: '/run/app/runtime.env',
+  };
+
+  it('deduplicates dependencies with stable per-reference keys', () => {
+    expect(listSecretRefreshTargets([target])).toEqual([
+      {
+        target,
+        reference: 'alias:credentials/openai',
+        key: 'refresh:alias:app/runtime-env:credentials/openai',
+      },
+      {
+        target,
+        reference: 'alias:credentials/mistral',
+        key: 'refresh:alias:app/runtime-env:credentials/mistral',
+      },
+    ]);
+  });
+
+  it('matches an event alias exactly and keeps equal child versions independent', () => {
+    expect(findSecretRefreshTargets(
+      [target],
+      'child-uuid',
+      'credentials/mistral'
+    )).toEqual([{
+      target,
+      reference: 'alias:credentials/mistral',
+      key: 'refresh:alias:app/runtime-env:credentials/mistral',
+    }]);
+    expect(findSecretRefreshTargets(
+      [target],
+      'child-uuid',
+      'credentials/mistral-extra'
+    )).toEqual([]);
   });
 });
