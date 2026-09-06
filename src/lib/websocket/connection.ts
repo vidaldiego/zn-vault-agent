@@ -36,7 +36,14 @@ export function buildWebSocketUrl(
   ]);
 
   // Combine secret target IDs with additional exec secret IDs
-  const allSecretIds = [...new Set([...secretTargetIds, ...additionalSecretIds])];
+  // The Vault event payload carries aliases without the optional CLI/config
+  // `alias:` discriminator. Subscribe with that canonical form so the
+  // server's exact match delivers the event; UUIDs remain unchanged.
+  const allSecretIds = [...new Set(
+    [...secretTargetIds, ...additionalSecretIds].map(id =>
+      id.startsWith('alias:') ? id.slice('alias:'.length) : id
+    )
+  )];
 
   if (certIds.length > 0) {
     url.searchParams.set('certIds', certIds.join(','));

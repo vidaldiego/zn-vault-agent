@@ -30,12 +30,14 @@ describe('referenced secret subscriptions', () => {
     const url = new URL(buildWebSocketUrl([
       'alias:exec/secret',
       'alias:credentials/openai',
+      '00000000-0000-4000-8000-000000000001',
     ]));
     expect(url.searchParams.get('secretIds')?.split(',')).toEqual([
-      'alias:app/runtime-env',
-      'alias:credentials/openai',
-      'alias:credentials/mistral',
-      'alias:exec/secret',
+      'app/runtime-env',
+      'credentials/openai',
+      'credentials/mistral',
+      'exec/secret',
+      '00000000-0000-4000-8000-000000000001',
     ]);
   });
 });

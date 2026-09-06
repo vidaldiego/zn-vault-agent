@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- WebSocket secret subscriptions now remove the optional `alias:` selector
+  prefix before sending aliases to Vault. Vault events carry canonical aliases,
+  so exact subscription matching now delivers parent and `refreshOn` child
+  updates immediately instead of relying on the polling fallback.
+
 ### Maintenance releases
 
 - Agent `1.23.4` backports reference dependency refresh to the Node.js 20 line
