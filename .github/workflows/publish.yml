@@ -131,7 +131,9 @@ jobs:
           extract_dir=$(mktemp -d)
           tar -xzf "$package_file" -C "$extract_dir"
           test "$(node -p "require('$extract_dir/package/package.json').version")" = "${GITHUB_REF#refs/tags/v}"
-          node "$extract_dir/package/dist/index.js" --help >/dev/null
+          smoke_dir=$(mktemp -d)
+          npm install --prefix "$smoke_dir" --ignore-scripts "$package_file"
+          node "$smoke_dir/node_modules/@zincapp/zn-vault-agent/dist/index.js" --help >/dev/null
 
       - name: Publish verified artifact to npm
         env:
