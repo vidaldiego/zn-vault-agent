@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Maintenance releases
+
+- Agent `1.23.4` backports reference dependency refresh to the Node.js 20 line
+  used by the Archon fleet. Its release commit is retained in `main` history so
+  the tagged npm artifact remains reproducible without replacing the 2.x tree.
+
 ### Added
 
 - Secret targets can declare `refreshOn` references. The agent subscribes to
