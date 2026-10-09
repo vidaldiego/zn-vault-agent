@@ -84,6 +84,7 @@ export interface LoginCommandOptions {
 export interface SecretsAddCommandOptions {
   name?: string;
   format?: 'env' | 'json' | 'yaml' | 'raw' | 'template';
+  encoding?: 'base64';
   output?: string;
   key?: string;
   template?: string;

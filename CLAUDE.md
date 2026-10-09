@@ -164,6 +164,22 @@ Environment variables override config file values (`ZNVAULT_*` prefix).
 
 ### Secret Mapping Types
 
+File targets can materialize a Base64 field directly as binary bytes with
+`format: "raw"`, `encoding: "base64"`, `key: "serverP12Base64"` and the exact
+consumer `output` path. The daemon and `secret sync` CLI strictly require a
+non-empty canonical padded Base64 string. Writes, permissions and requested
+ownership complete atomically inside the shared Payara mutation lock; malformed
+data or ownership failure preserves the old file and does not commit its version.
+No reload hook or shell decoder is needed. `secret add --format raw --encoding
+base64 --key serverP12Base64 --output /path/server.p12` creates the same target.
+Existing raw targets without `encoding` retain their text behavior. Never enable
+binary targets on old agents: they ignore the additive field. Upgrade a shared
+fleet first using hook-free legacy outputs, then enable binary output paths.
+When several targets select different keys from one secret, rotation events fan
+out to every target. Mutation retry queues, runtime watermarks and persisted
+version receipts are per named target, so one successful file cannot suppress
+another file's failed or missed update.
+
 The `secret-env.ts` module (modularized in `secret-env/`) parses several mapping formats:
 
 **Individual mappings (`-s/--secret`):**

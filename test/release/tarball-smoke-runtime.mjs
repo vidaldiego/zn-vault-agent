@@ -210,7 +210,9 @@ try {
     mkdir(join(domainRoot, 'applications'), { recursive: true }),
     mkdir('/var/lib/zn-vault-agent', { recursive: true, mode: 0o700 }),
   ]);
-  await writeFile(warPath, 'release-smoke-war\n', { mode: 0o600 });
+  // Payara 3.0.10 hashes ZIP entries during startup reconciliation. Use a
+  // valid empty ZIP fixture so this smoke exercises the current installed pair.
+  await writeFile(warPath, Buffer.from('504b0506000000000000000000000000000000000000', 'hex'), { mode: 0o600 });
   const controlToken = randomBytes(32).toString('base64url');
   assert.equal(controlToken.length, 43);
   await writeFile(controlTokenPath, `${controlToken}\n`, { mode: 0o600 });

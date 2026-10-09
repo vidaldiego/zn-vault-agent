@@ -10,6 +10,7 @@ import path from 'node:path';
 import { chownSafeAsync } from '../utils/shell.js';
 import { runReloadCommand } from '../utils/reload-command.js';
 import { readTemplateFile } from '../utils/template-file.js';
+import { decodeBase64Secret, validateSecretEncoding, writeBinarySecretFile } from '../utils/binary-secret.js';
 import {
   addSecretTarget,
   removeSecretTarget,
@@ -37,9 +38,10 @@ import type {
 async function formatSecretData(
   secret: DecryptedSecret,
   format: SecretTarget['format'],
-  options: { key?: string; envPrefix?: string; templatePath?: string }
-): Promise<string> {
+  options: { key?: string; envPrefix?: string; templatePath?: string; encoding?: string }
+): Promise<string | Buffer> {
   const data = secret.data;
+  if (options.encoding === 'base64') return decodeBase64Secret(data, options.key);
 
   switch (format) {
     case 'env': {
@@ -112,10 +114,11 @@ async function formatSecretData(
  */
 async function writeSecretFile(
   filePath: string,
-  content: string,
+  content: string | Buffer,
   owner?: string,
   mode?: string
 ): Promise<void> {
+  if (Buffer.isBuffer(content)) return writeBinarySecretFile(filePath, content, owner, mode);
   // Ensure directory exists
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
@@ -149,6 +152,7 @@ export async function syncSecretTarget(
   try {
     return await withSharedMutationLock('secret-cli', async () => {
       const secret = await getSecret(target.secretId);
+      validateSecretEncoding(target.format, target.encoding, target.key);
 
       // Skip file writing for 'none' format (subscribe-only mode)
       if (target.format !== 'none') {
@@ -157,6 +161,7 @@ export async function syncSecretTarget(
           key: target.key,
           envPrefix: target.envPrefix,
           templatePath: target.templatePath,
+          encoding: target.encoding,
         });
 
         // Write to file
@@ -175,7 +180,7 @@ export async function syncSecretTarget(
       }
 
       // Commit the observed version only after the consumer reload is terminal.
-      updateSecretTargetVersion(target.secretId, secret.version);
+      updateSecretTargetVersion(target.secretId, secret.version, target.name);
 
       return true;
     }, mutationLockPath);
@@ -262,6 +267,7 @@ Examples:
     .option('-f, --format <format>', 'Output format: env, json, yaml, raw, template', 'env')
     .option('-o, --output <path>', 'Output file path')
     .option('-k, --key <key>', 'For raw format: key to extract')
+    .option('--encoding <encoding>', 'For raw format: base64 to decode binary bytes')
     .option('-t, --template <path>', 'For template format: template file path')
     .option('-p, --prefix <prefix>', 'For env format: variable name prefix')
     .option('--owner <user:group>', 'File ownership')
@@ -311,6 +317,12 @@ Examples:
       }
 
       // Validate format-specific options
+      try {
+        validateSecretEncoding(format, options.encoding, options.key);
+      } catch (err) {
+        console.error(chalk.red(err instanceof Error ? err.message : 'Invalid encoding'));
+        process.exit(1);
+      }
       if (format === 'raw' && !options.key) {
         console.error(chalk.red('--key is required for raw format'));
         process.exit(1);
@@ -376,6 +388,7 @@ Examples:
         format,
         output: targetOutput,
         key: options.key,
+        encoding: options.encoding,
         templatePath: options.template,
         envPrefix: options.prefix,
         owner: options.owner,

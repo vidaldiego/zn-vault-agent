@@ -8,6 +8,7 @@ import { chownSafeAsync } from '../utils/shell.js';
 import { runReloadCommand } from '../utils/reload-command.js';
 import { readTemplateFile } from '../utils/template-file.js';
 import { validateOutputPath } from '../utils/path.js';
+import { decodeBase64Secret, validateSecretEncoding, writeBinarySecretFile } from '../utils/binary-secret.js';
 import { getSecret } from './api.js';
 import { updateSecretTargetVersion, getSecretTargets, loadConfig } from './config.js';
 import { deployLogger as log } from './logger.js';
@@ -35,8 +36,9 @@ export interface SecretDeployResult {
 async function formatSecretData(
   data: Record<string, unknown>,
   format: string,
-  options: { key?: string; envPrefix?: string; templatePath?: string }
-): Promise<string> {
+  options: { key?: string; envPrefix?: string; templatePath?: string; encoding?: string }
+): Promise<string | Buffer> {
+  if (options.encoding === 'base64') return decodeBase64Secret(data, options.key);
   switch (format) {
     case 'env': {
       const prefix = options.envPrefix ?? '';
@@ -102,10 +104,11 @@ async function formatSecretData(
  */
 async function writeSecretFile(
   filePath: string,
-  content: string,
+  content: string | Buffer,
   owner?: string,
   mode?: string
 ): Promise<void> {
+  if (Buffer.isBuffer(content)) return writeBinarySecretFile(filePath, content, owner, mode);
   // Validate path to prevent traversal attacks
   validateOutputPath(filePath);
 
@@ -166,6 +169,7 @@ async function deploySecretWithLockHeld(
 
     // Fetch secret from vault
     const secret = await getSecret(target.secretId);
+    validateSecretEncoding(target.format, target.encoding, target.key);
 
     // Check if update needed (unless forced)
     if (!force && shouldSkipDeploy(target, secret.version)) {
@@ -186,6 +190,7 @@ async function deploySecretWithLockHeld(
         key: target.key,
         envPrefix: target.envPrefix,
         templatePath: target.templatePath,
+        encoding: target.encoding,
       });
 
       // Write to file
@@ -205,7 +210,7 @@ async function deploySecretWithLockHeld(
     }
 
     // Commit the observed version only after the consumer reload is terminal.
-    updateSecretTargetVersion(target.secretId, secret.version);
+    updateSecretTargetVersion(target.secretId, secret.version, target.name);
 
     const durationMs = Date.now() - startTime;
     metrics.secretDeployed(target.name, true, durationMs);
@@ -335,8 +340,13 @@ export async function deployAllSecrets(
  * Find secret target by ID or alias
  */
 export function findSecretTarget(secretIdOrAlias: string): SecretTarget | undefined {
+  return findSecretTargets(secretIdOrAlias)[0];
+}
+
+/** One secret may feed several files; every matching consumer must refresh. */
+export function findSecretTargets(secretIdOrAlias: string): SecretTarget[] {
   const targets = getSecretTargets();
-  return targets.find(t =>
+  return targets.filter(t =>
     t.secretId === secretIdOrAlias ||
     t.secretId === `alias:${secretIdOrAlias}` ||
     secretIdOrAlias.includes(t.secretId)

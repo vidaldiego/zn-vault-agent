@@ -14,7 +14,7 @@ import {
   type TLSConfig,
 } from './config.js';
 import { deployCertificate, deployAllCertificates } from './deployer.js';
-import { deploySecret, deployAllSecrets, findSecretTarget } from './secret-deployer.js';
+import { deploySecret, deployAllSecrets, findSecretTarget, findSecretTargets } from './secret-deployer.js';
 import { wsLogger as log } from './logger.js';
 import { metrics, initializeMetrics } from './metrics.js';
 import {
@@ -466,6 +466,10 @@ export function initializeExecSecretIdentity(
  * queue. Alias binding, the final watermark recheck, queue key selection and
  * immediate retry are shared verbatim by production and focal wiring tests.
  */
+export function secretTargetMutationKey(target: Pick<SecretTarget, 'secretId' | 'name'>): string {
+  return JSON.stringify([target.secretId, target.name]);
+}
+
 export async function admitSecretEventToRetryQueue(options: {
   event: SecretEvent;
   execSecretReferences: Set<string>;
@@ -474,9 +478,26 @@ export async function admitSecretEventToRetryQueue(options: {
   consumedExecSecretVersions: Map<string, number>;
   queue: RestartRequiredMutationQueue<SecretRetryItem, SecretMutationEvidence>;
   findTarget: (reference: string) => SecretTarget | undefined;
+  findTargets?: (reference: string) => SecretTarget[];
   beforeEnqueue?: () => Promise<void>;
 }): Promise<SecretEventAdmissionResult> {
   const { event } = options;
+  if (options.findTargets) {
+    const matches = new Map(
+      [...options.findTargets(event.secretId), ...options.findTargets(event.alias)]
+        .map(target => [secretTargetMutationKey(target), target])
+    );
+    if (matches.size > 0) {
+      let result: SecretEventAdmissionResult = { status: 'consumed' };
+      for (const target of matches.values()) {
+        const admission = await admitSecretEventToRetryQueue({
+          ...options, findTargets: undefined, findTarget: () => target,
+        });
+        if (admission.status === 'queued') result = admission;
+      }
+      return result;
+    }
+  }
   const resolveMutationContext = (): {
     isExecSecret: boolean;
     target: SecretTarget | undefined;
@@ -509,9 +530,9 @@ export async function admitSecretEventToRetryQueue(options: {
     const execKey = `exec:${execIdentity}`;
     const alreadyConsumed = target
       ? isSecretVersionConsumed(
-        options.consumedSecretVersions.get(target.secretId),
+        options.consumedSecretVersions.get(secretTargetMutationKey(target)),
         event.version,
-        options.queue.getPendingGeneration(target.secretId)
+        options.queue.getPendingGeneration(secretTargetMutationKey(target))
       )
       : isExecSecret && isSecretVersionConsumed(
         options.consumedExecSecretVersions.get(execIdentity),
@@ -530,14 +551,14 @@ export async function admitSecretEventToRetryQueue(options: {
       const { isExecSecret, target, execIdentity, execKey } = resolveMutationContext();
       queuedExecIdentity = execIdentity;
       if (target) {
-        options.queue.enqueue(target.secretId, event.version, {
+        options.queue.enqueue(secretTargetMutationKey(target), event.version, {
           event,
           target,
           restartReason: isExecSecret
             ? 'secret file and exec value updated'
             : 'secret file updated',
         });
-        queuedKey = target.secretId;
+        queuedKey = secretTargetMutationKey(target);
       } else if (isExecSecret) {
         options.queue.enqueuePrepared(execKey, event.version, {
           event,
@@ -573,8 +594,9 @@ export function acknowledgeSecretMutation(
   }
 ): string {
   if (item.target) {
-    state.consumedSecretVersions.set(item.target.secretId, evidence.version);
-    return item.target.secretId;
+    const key = secretTargetMutationKey(item.target);
+    state.consumedSecretVersions.set(key, evidence.version);
+    return key;
   }
 
   const identity = item.execIdentity
@@ -1084,7 +1106,7 @@ export async function startDaemon(options: {
   const consumedSecretVersions = new Map<string, number>(
     secretTargets.flatMap(target => target.lastVersion === undefined
       ? []
-      : [[target.secretId, target.lastVersion]])
+      : [[secretTargetMutationKey(target), target.lastVersion]])
   );
   const consumedSecretRefreshVersions = new Map<string, number>();
   const execSecretIdentityByReference = new Map<string, string>();
@@ -1891,6 +1913,7 @@ export async function startDaemon(options: {
         consumedExecSecretVersions,
         queue: secretRetryQueue,
         findTarget: reference => findSecretTarget(reference),
+        findTargets: reference => findSecretTargets(reference),
       });
       if (admission.status === 'consumed') {
         log.debug(
@@ -2234,15 +2257,15 @@ export async function startDaemon(options: {
     const secretErrors = secretResults.filter(r => !r.success).length;
     for (const result of secretResults) {
       if (result.success && result.version !== undefined) {
-        consumedSecretVersions.set(result.secretId, result.version);
+        consumedSecretVersions.set(secretTargetMutationKey(result), result.version);
       }
     }
     const successfulTargets = new Set(
-      secretResults.filter(result => result.success).map(result => result.secretId)
+      secretResults.filter(result => result.success).map(result => secretTargetMutationKey(result))
     );
     for (const match of listSecretRefreshMatches(secretTargets)) {
       const version = initialRefreshVersions.get(match.reference);
-      if (successfulTargets.has(match.target.secretId) && version !== undefined) {
+      if (successfulTargets.has(secretTargetMutationKey(match.target)) && version !== undefined) {
         consumedSecretRefreshVersions.set(match.key, version);
         refreshMetadataUnknown.delete(match.key);
       }
@@ -2409,14 +2432,15 @@ export async function startDaemon(options: {
     // Poll secrets
     for (const target of secretTargets) {
       if (isShutdownRequested()) break;
+      const targetKey = secretTargetMutationKey(target);
 
       try {
-        if (secretRetryQueue.isPending(target.secretId)) {
-          await secretRetryQueue.retryNow(target.secretId);
+        if (secretRetryQueue.isPending(targetKey)) {
+          await secretRetryQueue.retryNow(targetKey);
           continue;
         }
         await withActiveDeployment(async () => {
-          const consumedVersion = consumedSecretVersions.get(target.secretId);
+          const consumedVersion = consumedSecretVersions.get(targetKey);
           const result = await deploySecret({
             ...target,
             lastVersion: consumedVersion,
@@ -2431,7 +2455,7 @@ export async function startDaemon(options: {
               timestamp: new Date().toISOString(),
               tenantId: config.tenantId ?? '',
             };
-            secretRetryQueue.enqueue(target.secretId, generation, {
+            secretRetryQueue.enqueue(targetKey, generation, {
               event,
               target,
               restartReason: 'secret file updated during poll',
@@ -2458,7 +2482,7 @@ export async function startDaemon(options: {
           };
           const reconciliation = await reconcilePolledMutation({
             queue: secretRetryQueue,
-            key: target.secretId,
+            key: targetKey,
             generation: result.version,
             value: item,
             evidence: { version: result.version },

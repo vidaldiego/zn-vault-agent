@@ -115,9 +115,9 @@ export function getSecretTargets(): SecretTarget[] {
 /**
  * Update secret target version after successful sync
  */
-export function updateSecretTargetVersion(secretId: string, version: number): void {
+export function updateSecretTargetVersion(secretId: string, version: number, name?: string): void {
   const config = loadConfig();
-  const target = config.secretTargets?.find(t => t.secretId === secretId);
+  const target = config.secretTargets?.find(t => t.secretId === secretId && (name === undefined || t.name === name));
   if (target) {
     target.lastVersion = version;
     target.lastSync = new Date().toISOString();

@@ -56,6 +56,8 @@ export interface SecretTarget {
   name: string;
   /** Output format. Use 'none' for subscribe-only mode (no file output) */
   format: 'env' | 'json' | 'yaml' | 'raw' | 'template' | 'none';
+  /** For raw format only: strictly decode the selected Base64 key into binary bytes. */
+  encoding?: 'base64';
   /** Output file path (not required when format is 'none') */
   output?: string;
   /** For 'raw' format: which key from the secret data to extract */

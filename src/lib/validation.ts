@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { AgentConfig, CertTarget } from './config.js';
 import { configLogger as log } from './logger.js';
+import { validateSecretEncoding } from '../utils/binary-secret.js';
 
 export interface ValidationResult {
   valid: boolean;
@@ -232,6 +233,14 @@ export function validateConfig(config: Partial<AgentConfig>): ValidationResult {
       const targetValidation = validateTarget(config.targets[i], i);
       errors.push(...targetValidation.errors);
       warnings.push(...targetValidation.warnings);
+    }
+  }
+
+  for (const [index, target] of (config.secretTargets ?? []).entries()) {
+    try {
+      validateSecretEncoding(target.format, target.encoding, target.key);
+    } catch {
+      errors.push({ field: `secretTargets[${index}].encoding`, message: 'Encoding requires raw format, base64 encoding and a key' });
     }
   }
 
