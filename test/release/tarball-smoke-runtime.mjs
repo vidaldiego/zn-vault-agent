@@ -191,6 +191,8 @@ const payaraHome = join(fixtureRoot, 'payara');
 const domainRoot = join(payaraHome, 'glassfish', 'domains', domain);
 const asadminPath = join(payaraHome, 'bin', 'asadmin');
 const commandLogPath = join(fixtureRoot, 'asadmin.log');
+const fakeJavaPidPath = join(fixtureRoot, 'fake-java.pid');
+const stoppedMarkerPath = join(fixtureRoot, 'domain-stopped');
 const warPath = join(fixtureRoot, 'release-smoke.war');
 const controlTokenPath = join(fixtureRoot, 'payara-mutation-token');
 const sharedLockPath = '/var/lib/zn-vault-agent/znvault-deploy.lock';
@@ -246,7 +248,7 @@ printf '%s\\n' "$*" >> ${shellQuote(commandLogPath)}
 command_name=''
 for argument in "$@"; do
   case "$argument" in
-    list-domains|uptime|list-applications|list-application-refs)
+    list-domains|uptime|list-applications|list-application-refs|stop-domain)
       command_name="$argument"
       break
       ;;
@@ -254,9 +256,14 @@ for argument in "$@"; do
 done
 case "$command_name" in
   list-domains)
-    printf '%s running\\n' ${shellQuote(domain)}
+    if [[ -e ${shellQuote(stoppedMarkerPath)} ]]; then
+      printf '%s not running\\n' ${shellQuote(domain)}
+    else
+      printf '%s running\\n' ${shellQuote(domain)}
+    fi
     ;;
   uptime)
+    if [[ -e ${shellQuote(stoppedMarkerPath)} ]]; then exit 1; fi
     printf '%s\\n' 'Uptime: 0 days, 0 hours, 0 minutes, 1 seconds, Total milliseconds: 1000'
     ;;
   list-applications)
@@ -264,6 +271,13 @@ case "$command_name" in
     ;;
   list-application-refs)
     printf '%s\\n' ${shellQuote(appName)}
+    ;;
+  stop-domain)
+    pid=$(cat ${shellQuote(fakeJavaPidPath)})
+    [[ \"$pid\" =~ ^[1-9][0-9]*$ ]]
+    kill -TERM -- \"-$pid\"
+    touch ${shellQuote(stoppedMarkerPath)}
+    printf '%s\\n' 'Command stop-domain executed successfully.'
     ;;
   *)
     printf 'Unsupported mock asadmin command: %s\\n' "$*" >&2
@@ -295,6 +309,7 @@ esac
   );
   assert.ok(fakeJava.pid, 'Failed to start fake Payara JVM');
   await waitForFakeJava(fakeJava.pid, instanceRootArgument);
+  await writeFile(fakeJavaPidPath, `${fakeJava.pid}\n`, { mode: 0o600 });
 
   const config = {
     vaultUrl: 'http://127.0.0.1:1',
@@ -441,6 +456,14 @@ esac
 
   await loader.stopPlugins();
   assert.equal(loader.getPluginStatus('payara'), 'stopped');
+  assert.ok(await waitForChildExit(fakeJava, 2_000), 'Plugin shutdown left the exact fake DAS alive');
+  const shutdownCommandLog = await readFile(commandLogPath, 'utf8');
+  const stopCommands = shutdownCommandLog.split('\n').filter(line => /(^|\s)stop-domain(\s|$)/.test(line));
+  assert.equal(stopCommands.length, 1, 'Shutdown must dispatch exactly one guarded stop-domain');
+  assert.equal(await stat(sharedLockPath).catch(error => {
+    if (error?.code === 'ENOENT') return undefined;
+    throw error;
+  }), undefined, 'Shared mutation lock remained after shutdown');
 
   const receipt = {
     node: process.versions.node,
@@ -454,6 +477,7 @@ esac
       peerAgent: pluginManifest.peerDependencies[AGENT_PACKAGE],
     },
     loader: 'running_then_stopped',
+    shutdown: { stopCommands: stopCommands.length, processExited: true, mutationLockReleased: true },
     execFlags: ['--env-secret', '-e'],
     controlPlane: {
       publicHealth: publicHealthResponse.status,
