@@ -542,6 +542,9 @@ describe('WebSocket Communication', () => {
       daemon = await agent.startDaemon();
       await daemon.waitForReady();
 
+      // An open health listener precedes the server's subscription acknowledgement.
+      await waitForWebSocketEstablished(daemon);
+
       // Check health - managed key status should be visible
       const response = await fetch(`http://127.0.0.1:${daemon.healthPort}/health`);
       const health = await response.json();
