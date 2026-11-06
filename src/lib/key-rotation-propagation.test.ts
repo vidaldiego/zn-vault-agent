@@ -100,6 +100,40 @@ describe('createKeyRotationPropagator', () => {
     vi.clearAllMocks();
   });
 
+  it('keeps an accepted generation retryable when a later bind fails before providing evidence', async () => {
+    vi.useFakeTimers();
+    const bindManagedKey = vi.fn().mockResolvedValueOnce({
+      id: 'test-key-id', name: KEY_NAME, key: KEY_B, prefix: '[REDACTED]',
+      expiresAt: '2030-01-01T00:00:00.000Z', gracePeriod: '5m', rotationMode: 'scheduled', permissions: [],
+    }).mockRejectedValue(new Error('later read unavailable'));
+    const { deps, ctx } = makeDeps({ bindManagedKey, retryDelayMs: 1_000 });
+    ctx.dispatchEvent.mockResolvedValueOnce({ handlersInvoked: 1, handlersSucceeded: 0, handlersFailed: 1, handlersSkipped: 0 });
+    const propagator = createKeyRotationPropagator(deps);
+    try {
+      const current = await propagator.bindAndPropagate(KEY_NAME, 'ws_event', { persist: true });
+      expect(current.propagation.errors).toHaveLength(1);
+      await expect(propagator.bindAndPropagate(KEY_NAME, 'manual', { persist: true })).rejects.toThrow('unavailable');
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(ctx.dispatchEvent).toHaveBeenCalledTimes(2);
+      expect(ctx.config.auth.apiKey).toBe(KEY_B);
+    } finally { propagator.stop(); vi.useRealTimers(); }
+  });
+
+  it('never persists an in-flight bind after the shared observer stops', async () => {
+    let complete!: (response: unknown) => void;
+    const bindManagedKey = vi.fn(() => new Promise(resolve => { complete = resolve; }));
+    const { deps, ctx } = makeDeps({ bindManagedKey: bindManagedKey as KeyRotationPropagatorDeps['bindManagedKey'] });
+    const propagator = createKeyRotationPropagator(deps);
+    const observation = propagator.bindAndPropagate(KEY_NAME, 'manual', { persist: true });
+    propagator.stop();
+    complete({ id: 'test-key-id', name: KEY_NAME, key: KEY_B, prefix: '[REDACTED]', expiresAt: '2030-01-01T00:00:00.000Z', gracePeriod: '5m', rotationMode: 'scheduled', permissions: [] });
+    const result = await observation;
+    expect(result.response).toBeNull();
+    expect(ctx.config.auth.apiKey).toBe(KEY_A);
+    expect(ctx.persistManagedKey).not.toHaveBeenCalled();
+    expect(ctx.dispatchEvent).not.toHaveBeenCalled();
+  });
+
   it('should dispatch keyRotated to plugins when rotation detected via rails (the 2026-07-05 bug)', async () => {
     const { deps, ctx } = makeDeps();
     const propagator = createKeyRotationPropagator(deps);

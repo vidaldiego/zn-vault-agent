@@ -289,6 +289,20 @@ describe('NpmAutoUpdateService', () => {
   });
 
   describe('start/stop', () => {
+    it('does not repeat registry discovery after the initial enabled startup check', async () => {
+      vi.mocked(exec).mockImplementation((_cmd: unknown, opts: unknown, callback?: unknown) => {
+        const cb = (callback ?? opts) as (err: Error | null, result: { stdout: string; stderr: string }) => void;
+        cb(null, { stdout: '1.3.0\n', stderr: '' });
+        return {} as ReturnType<typeof exec>;
+      });
+      const service = new NpmAutoUpdateService({ enabled: true, stagedRolloutMaxDelayMs: 0 });
+      service.start();
+      await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
+      service.stop();
+      const registryReads = vi.mocked(exec).mock.calls.filter(([command]) => String(command).includes('npm view'));
+      expect(registryReads).toHaveLength(1);
+    });
+
     it('should not start if disabled', () => {
       const service = new NpmAutoUpdateService({ enabled: false });
       service.start();
@@ -333,6 +347,57 @@ describe('NpmAutoUpdateService', () => {
   });
 
   describe('staged rollout', () => {
+    it('applies one pinned candidate after staging without another registry discovery', async () => {
+      const service = new NpmAutoUpdateService({ enabled: true, stagedRolloutMaxDelayMs: 2000 });
+      const internal = service as unknown as {
+        checkAndUpdate(): Promise<void>;
+        acquireLock(): boolean;
+        releaseLock(): void;
+        performUpdate(target: string, previous: string): Promise<boolean>;
+      };
+      const discovery = vi.spyOn(service, 'checkForUpdates').mockResolvedValue({ current: '1.3.0', latest: '1.4.0', updateAvailable: true });
+      vi.spyOn(service, 'calculateStagedDelay').mockReturnValue(1000);
+      vi.spyOn(service, 'getCurrentVersion').mockReturnValue('1.3.0');
+      vi.spyOn(internal, 'acquireLock').mockReturnValue(true);
+      vi.spyOn(internal, 'releaseLock').mockImplementation(() => undefined);
+      const install = vi.spyOn(internal, 'performUpdate').mockResolvedValue(true);
+      const attempt = internal.checkAndUpdate();
+      await vi.advanceTimersByTimeAsync(1000);
+      await attempt;
+      expect(discovery).toHaveBeenCalledOnce();
+      expect(install).toHaveBeenCalledWith('1.4.0', '1.3.0');
+      service.stop();
+    });
+
+    it('aborts the pinned candidate when the locally installed version changes during staging', async () => {
+      const service = new NpmAutoUpdateService({ enabled: true, stagedRolloutMaxDelayMs: 2000 });
+      const internal = service as unknown as { checkAndUpdate(): Promise<void>; performUpdate(target: string, previous: string): Promise<boolean> };
+      vi.spyOn(service, 'checkForUpdates').mockResolvedValue({ current: '1.3.0', latest: '1.4.0', updateAvailable: true });
+      vi.spyOn(service, 'calculateStagedDelay').mockReturnValue(1000);
+      const current = vi.spyOn(service, 'getCurrentVersion').mockReturnValue('1.3.0');
+      const install = vi.spyOn(internal, 'performUpdate').mockResolvedValue(true);
+      const attempt = internal.checkAndUpdate();
+      await vi.advanceTimersByTimeAsync(0);
+      current.mockReturnValue('1.5.0');
+      await vi.advanceTimersByTimeAsync(1000);
+      await attempt;
+      expect(install).not.toHaveBeenCalled();
+      service.stop();
+    });
+
+    it('does not apply a discovery response that finishes after the updater stops', async () => {
+      const service = new NpmAutoUpdateService({ enabled: true, stagedRolloutMaxDelayMs: 0 });
+      const internal = service as unknown as { checkAndUpdate(): Promise<void>; performUpdate(target: string, previous: string): Promise<boolean> };
+      let resolveDiscovery!: (info: { current: string; latest: string; updateAvailable: boolean }) => void;
+      vi.spyOn(service, 'checkForUpdates').mockReturnValue(new Promise(resolve => { resolveDiscovery = resolve; }));
+      const install = vi.spyOn(internal, 'performUpdate').mockResolvedValue(true);
+      const attempt = internal.checkAndUpdate();
+      service.stop();
+      resolveDiscovery({ current: '1.3.0', latest: '1.4.0', updateAvailable: true });
+      await attempt;
+      expect(install).not.toHaveBeenCalled();
+    });
+
     it('should calculate random delay within max bounds', () => {
       const service = new NpmAutoUpdateService({
         enabled: false,

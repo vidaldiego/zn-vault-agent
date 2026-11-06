@@ -29,15 +29,6 @@ const log = createLogger({ module: 'tls-cert-manager' });
 // Constants
 // =============================================================================
 
-/** Default renewal check interval (12 hours) */
-const DEFAULT_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
-
-/** Retry delay on failure (5 minutes) */
-const RETRY_DELAY_MS = 5 * 60 * 1000;
-
-/** Max retry attempts before giving up */
-const MAX_RETRY_ATTEMPTS = 5;
-
 // =============================================================================
 // State Management
 // =============================================================================
@@ -166,32 +157,6 @@ async function certificateExists(certPath: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-/**
- * Parse expiry from config or calculate renewal time
- */
-function calculateNextCheckMs(tlsConfig: ReturnType<typeof getTLSConfig>): number {
-  if (!state.certExpiresAt) {
-    // No cert yet, check again in retry delay
-    return RETRY_DELAY_MS;
-  }
-
-  const now = Date.now();
-  const expiresAt = state.certExpiresAt.getTime();
-  const renewBeforeMs = (tlsConfig.renewBeforeDays ?? 7) * 24 * 60 * 60 * 1000;
-
-  // Time until we should renew
-  const renewAt = expiresAt - renewBeforeMs;
-  const timeUntilRenewal = renewAt - now;
-
-  if (timeUntilRenewal <= 0) {
-    // Already past renewal threshold, check soon
-    return 60 * 1000; // 1 minute
-  }
-
-  // Check halfway to renewal, or at default interval, whichever is sooner
-  return Math.min(timeUntilRenewal / 2, DEFAULT_CHECK_INTERVAL_MS);
 }
 
 /**
@@ -356,7 +321,7 @@ async function checkAndRenewIfNeeded(): Promise<void> {
   if (!certExists) {
     log.info('No TLS certificate found, requesting initial certificate');
     await requestCertificate();
-    scheduleNextCheck();
+    scheduleKnownRenewal();
     return;
   }
 
@@ -399,47 +364,30 @@ async function checkAndRenewIfNeeded(): Promise<void> {
     }
   }
 
-  scheduleNextCheck();
+  scheduleKnownRenewal();
 }
 
-/**
- * Schedule next certificate check
- */
-function scheduleNextCheck(): void {
+/** Schedule a known renewal mutation; never query status to discover changes. */
+function scheduleKnownRenewal(): void {
   checkTimer.clear();
-
-  if (!state.isRunning) {
-    return;
-  }
-
-  const tlsConfig = getTLSConfig();
-  let delay: number;
-
-  if (state.retryCount > 0 && state.retryCount < MAX_RETRY_ATTEMPTS) {
-    // Exponential backoff on failure
-    delay = Math.min(RETRY_DELAY_MS * Math.pow(2, state.retryCount - 1), DEFAULT_CHECK_INTERVAL_MS);
-    log.debug({
-      retryCount: state.retryCount,
-      delayMinutes: Math.round(delay / 60000),
-    }, 'Scheduling retry check');
-  } else if (state.retryCount >= MAX_RETRY_ATTEMPTS) {
-    // Give up retrying, check at normal interval
-    log.error({ maxRetries: MAX_RETRY_ATTEMPTS }, 'Max retry attempts reached, falling back to normal check interval');
-    state.retryCount = 0;
-    delay = DEFAULT_CHECK_INTERVAL_MS;
-  } else {
-    delay = calculateNextCheckMs(tlsConfig);
-  }
-
-  checkTimer.setTimeout(() => {
+  if (!state.isRunning || state.retryCount > 0 || !state.certExpiresAt) return;
+  const renewBeforeMs = (getTLSConfig().renewBeforeDays ?? 7) * 24 * 60 * 60 * 1000;
+  const renewAt = state.certExpiresAt.getTime() - renewBeforeMs;
+  if (!Number.isFinite(renewAt) || renewAt <= Date.now()) return;
+  const schedule = (): void => {
     if (!state.isRunning) return;
-    void checkAndRenewIfNeeded();
-  }, delay);
-
-  log.debug({
-    checkInMinutes: Math.round(delay / 60000),
-    checkAt: new Date(Date.now() + delay).toISOString(),
-  }, 'TLS certificate check scheduled');
+    const remaining = renewAt - Date.now();
+    // Node timers cannot represent >2^31-1ms. Chunks only wait for the known
+    // deadline and perform no certificate, authentication or business reads.
+    checkTimer.setTimeout(() => {
+      if (!state.isRunning) return;
+      if (Date.now() < renewAt) { schedule(); return; }
+      void renewCertificate().then(response => {
+        if (response) scheduleKnownRenewal();
+      });
+    }, Math.min(Math.max(1, remaining), 2_147_483_647));
+  };
+  schedule();
 }
 
 // =============================================================================
@@ -524,26 +472,13 @@ export async function ensureCertificateReady(): Promise<{
   // Start TLS certificate manager (this will fetch cert if needed)
   await startTLSCertificateManager();
 
-  // Wait for certificate to be available (max 30 seconds)
-  const maxWait = 30000;
-  const checkInterval = 500;
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < maxWait) {
-    if (existsSync(tlsConfig.certPath) && existsSync(tlsConfig.keyPath)) {
-      log.info({ certPath: tlsConfig.certPath, keyPath: tlsConfig.keyPath }, 'TLS certificate ready');
-      return {
-        certPath: tlsConfig.certPath,
-        keyPath: tlsConfig.keyPath,
-        httpsPort: tlsConfig.httpsPort,
-        keepHttpServer: tlsConfig.keepHttpServer,
-      };
-    }
-    await new Promise(resolve => setTimeout(resolve, checkInterval));
-  }
-
-  log.error('Timeout waiting for TLS certificate to be ready');
-  return null;
+  // Initial acquisition above already awaits every write. A failure remains
+  // explicit; no file-status loop or background acquisition retry is started.
+  if (!existsSync(tlsConfig.certPath) || !existsSync(tlsConfig.keyPath)) return null;
+  return {
+    certPath: tlsConfig.certPath, keyPath: tlsConfig.keyPath,
+    httpsPort: tlsConfig.httpsPort, keepHttpServer: tlsConfig.keepHttpServer,
+  };
 }
 
 /**
@@ -573,9 +508,16 @@ export async function forceRenewal(): Promise<AgentTLSCertificateResponse | null
 
   const response = await renewCertificate();
   if (state.isRunning) {
-    scheduleNextCheck();
+    scheduleKnownRenewal();
   }
   return response;
+}
+
+/** Initial, real-event, or explicit operator TLS reconciliation. */
+export async function synchronizeTLSCertificate(): Promise<void> {
+  if (!isTLSEnabled()) return;
+  await checkAndRenewIfNeeded();
+  if (state.retryCount > 0 || !state.certExpiresAt) throw new Error('TLS certificate synchronization incomplete');
 }
 
 /**
@@ -584,6 +526,7 @@ export async function forceRenewal(): Promise<AgentTLSCertificateResponse | null
 export function getTLSManagerStatus(): {
   isRunning: boolean;
   tlsEnabled: boolean;
+  renewalFailed: boolean;
   certExpiresAt: string | null;
   daysUntilExpiry: number | null;
   lastCheckAt: string | null;
@@ -602,6 +545,7 @@ export function getTLSManagerStatus(): {
   return {
     isRunning: state.isRunning,
     tlsEnabled: isTLSEnabled(),
+    renewalFailed: state.retryCount > 0,
     certExpiresAt: state.certExpiresAt?.toISOString() ?? null,
     daysUntilExpiry,
     lastCheckAt: state.lastCheckAt?.toISOString() ?? null,

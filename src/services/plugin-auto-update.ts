@@ -94,7 +94,6 @@ function asMessage(err: unknown): string {
 }
 
 export class PluginAutoUpdateService {
-  private checkInterval: NodeJS.Timeout | null = null;
   private initialCheckTimeout: NodeJS.Timeout | null = null;
   private stagedRolloutTimeout: NodeJS.Timeout | null = null;
   private readonly config: PluginAutoUpdateServiceConfig;
@@ -139,18 +138,13 @@ export class PluginAutoUpdateService {
         package: PAYARA_PLUGIN_PACKAGE,
         channel: PAYARA_PLUGIN_CHANNEL,
       },
-      'Starting exact Payara plugin update polling'
+      'Scheduling one initial exact Payara plugin update check'
     );
     this.initialCheckTimeout = setTimeout(() => {
       void this.checkAndUpdatePayara().catch((err: unknown) => {
         logger.error({ err }, 'Initial Payara plugin update check failed');
       });
     }, 2 * 60_000);
-    this.checkInterval = setInterval(() => {
-      void this.checkAndUpdatePayara().catch((err: unknown) => {
-        logger.error({ err }, 'Payara plugin update check failed');
-      });
-    }, this.config.checkIntervalMs);
   }
 
   stop(): void {
@@ -167,10 +161,8 @@ export class PluginAutoUpdateService {
   /** Disable only automatic polling; manual/recovery operations stay live. */
   disablePeriodicPolling(): void {
     if (this.initialCheckTimeout) clearTimeout(this.initialCheckTimeout);
-    if (this.checkInterval) clearInterval(this.checkInterval);
     if (this.stagedRolloutTimeout) clearTimeout(this.stagedRolloutTimeout);
     this.initialCheckTimeout = null;
-    this.checkInterval = null;
     this.stagedRolloutTimeout = null;
   }
 
@@ -648,17 +640,19 @@ export class PluginAutoUpdateService {
   }
 
   private async checkAndUpdatePayara(): Promise<void> {
-    let info = (await this.checkForUpdates())[0];
+    if (this.stopped) return;
+    const info = (await this.checkForUpdates())[0];
     if (!info?.updateAvailable) return;
     if (this.config.stagedRolloutMaxDelayMs > 0) {
       const delay = Math.floor(Math.random() * this.config.stagedRolloutMaxDelayMs);
       await new Promise<void>((resolve) => {
         this.stagedRolloutTimeout = setTimeout(resolve, delay);
       });
-      info = (await this.checkForUpdates())[0];
-      if (!info?.updateAvailable) return;
     }
+    if (this.stopped) return;
 
+    // Stage one immutable candidate. beginUpdate still validates its exact
+    // current/target CAS; drift aborts rather than selecting a new latest.
     const request: PluginUpdateRequest = {
       requestId: randomUUID(),
       package: PAYARA_PLUGIN_PACKAGE,
@@ -668,7 +662,7 @@ export class PluginAutoUpdateService {
     const status = await this.beginUpdate(request);
     logger.info(
       { requestId: request.requestId, status: status.status, targetVersion: request.expectedVersion },
-      'Periodic Payara plugin update delegated to exact root rail'
+      'Initial Payara plugin update delegated to exact root rail'
     );
   }
 

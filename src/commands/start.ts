@@ -599,7 +599,7 @@ Examples:
       }
       console.log(`  Certs:       ${targets.length} certificate(s)`);
       console.log(`  Secrets:     ${secretTargets.length} secret(s)`);
-      console.log(`  Poll:        every ${config.pollInterval ?? 3600}s`);
+      console.log('  Updates:     WebSocket events; explicit synchronization on delivery gaps');
       if (options.healthPort) {
         const healthHost = options.healthHost ?? '127.0.0.1';
         console.log(`  Health:      http://${healthHost}:${options.healthPort}/health`);

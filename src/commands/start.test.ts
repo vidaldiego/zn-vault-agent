@@ -134,6 +134,7 @@ describe('start command Payara recovery preflight', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubEnv('ZNVAULT_API_KEY', undefined);
     mocks.config = {
       vaultUrl: 'https://vault.example.test',
       tenantId: '',
@@ -170,6 +171,7 @@ describe('start command Payara recovery preflight', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     consoleLog.mockRestore();
     consoleError.mockRestore();
   });

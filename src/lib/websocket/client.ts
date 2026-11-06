@@ -6,7 +6,7 @@ import { loadConfig } from '../config.js';
 import { wsLogger as log } from '../logger.js';
 import { metrics } from '../metrics.js';
 import { setWebSocketStatus, setSecretWebSocketStatus } from '../health.js';
-import { onWebSocketReconnect as notifyManagedKeyReconnect, onWebSocketAuthFailure as notifyManagedKeyAuthFailure } from '../../services/managed-key-renewal.js';
+import { onWebSocketAuthFailure as notifyManagedKeyAuthFailure } from '../../services/managed-key-renewal.js';
 import { setWebSocket as setDynamicSecretsWebSocket } from '../../services/dynamic-secrets/index.js';
 
 import {
@@ -228,6 +228,9 @@ export function createUnifiedWebSocketClient(
       retireSocket(oldWs, 'terminate');
     }
 
+    // retireSocket removes the close listener, so publish the lost channel
+    // explicitly before transport recovery. This never reads application data.
+    publishDisconnected(reason);
     // Reset reconnect attempts for faster initial retry
     reconnectManager.forceReconnect();
   }
@@ -310,11 +313,7 @@ export function createUnifiedWebSocketClient(
     // Note: Registration with capabilities/publicKey is sent AFTER receiving
     // connection_established from the vault to ensure proper timing
 
-    // Notify managed key renewal service of reconnection (for connection loss recovery)
-    if (isReconnect && managedKeyNames.length > 0) {
-      log.debug('Notifying managed key renewal service of reconnection');
-      void notifyManagedKeyReconnect();
-    }
+
   }
 
   /**
@@ -347,10 +346,18 @@ export function createUnifiedWebSocketClient(
     }
   }
 
-  /**
-   * Handle WebSocket close event.
-   * For auth failures (4001), recovery is blocking to ensure proper credential refresh.
-   */
+  /** Publish loss of event delivery even when a retired socket cannot emit close. */
+  function publishDisconnected(reason: string): void {
+    resetHealthyTracking();
+    setWebSocketStatus(false);
+    setSecretWebSocketStatus(false);
+    metrics.wsDisconnected();
+    dispatcher.clearAgentId();
+    setDynamicSecretsWebSocket(null);
+    dispatcher.fireDisconnect(reason);
+  }
+
+  /** Auth-failure recovery waits for credential refresh before transport reconnect. */
   function handleClose(code: number, reason: Buffer): void {
     try {
       heartbeatManager.stop();
@@ -358,15 +365,9 @@ export function createUnifiedWebSocketClient(
       log.warn({ err }, 'Failed to stop heartbeat manager during close');
     }
 
-    resetHealthyTracking();
-    setWebSocketStatus(false);
-    setSecretWebSocketStatus(false);
-    metrics.wsDisconnected();
-    dispatcher.clearAgentId();
-
     const reasonStr = reason.length > 0 ? reason.toString() : `Code: ${code}`;
     log.warn({ ws: 'unified', code, reason: reasonStr }, 'WebSocket disconnected');
-    dispatcher.fireDisconnect(reasonStr);
+    publishDisconnected(reasonStr);
 
     // Auth-rejection close family (4000-4099): the server accepted the
     // socket but refused our credentials. These MUST count as failed

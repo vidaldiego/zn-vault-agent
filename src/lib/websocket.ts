@@ -23,6 +23,7 @@ import {
   startHTTPSHealthServer,
   stopHTTPSHealthServer,
   reloadHTTPSCertificate,
+  isHTTPSHealthServerRunning,
   updateCertStatus,
   updateSecretStatus,
   setChildProcessManager,
@@ -31,6 +32,8 @@ import {
   setNpmAutoUpdateService,
   setPendingMutationRetries,
   setPluginRecoveryRequired,
+  setSynchronizationHandler,
+  markEventDeliveryStale,
 } from './health.js';
 import {
   reconcilePolledMutation,
@@ -42,6 +45,7 @@ import {
   onCertificateUpdated,
   ensureCertificateReady,
   stopTLSCertificateManager,
+  synchronizeTLSCertificate,
 } from '../services/tls-certificate-manager.js';
 import { flushLogs, setupLogRotation } from './logger.js';
 import type { PluginAutoUpdateService } from '../services/plugin-auto-update.js';
@@ -50,9 +54,9 @@ import { startApiKeyRenewal, stopApiKeyRenewal } from '../services/api-key-renew
 import {
   startManagedKeyRenewal,
   stopManagedKeyRenewal,
-  onKeyChanged as onManagedKeyChanged,
+  setManagedKeyBinder,
 } from '../services/managed-key-renewal.js';
-import { TrackedKeyPoller } from '../services/managed-key/tracked-keys-poller.js';
+import { TrackedKeySynchronizer } from '../services/managed-key/tracked-keys.js';
 import { isManagedKeyMode } from './config.js';
 import { ChildProcessManager } from '../services/child-process-manager.js';
 import {
@@ -61,8 +65,8 @@ import {
   parseSecretMappingFromConfig,
   type SecretMapping,
 } from './secret-env.js';
-import { bindManagedApiKey, getSecretMetadata } from './api.js';
-import { createKeyRotationPropagator } from './key-rotation-propagation.js';
+import { getSecretMetadata } from './api.js';
+import { createKeyRotationPropagator, prepareKeyObservation, type KeyRotationSource } from './key-rotation-propagation.js';
 import {
   createPluginLoader,
   clearPluginLoader,
@@ -143,7 +147,7 @@ let activeDeployments = 0;
 
 /**
  * Account for any daemon mutation so shutdown cannot exit while it is active.
- * WebSocket handlers historically did this inline; polling must use the same
+ * WebSocket handlers historically did this inline; synchronization must use the same
  * accounting because it reaches the same certificate/secret deployers.
  */
 export async function withActiveDeployment<T>(
@@ -159,7 +163,7 @@ export async function withActiveDeployment<T>(
 
 /** Wait until every already-admitted daemon mutation has fully unwound. */
 export async function drainActiveDeployments(
-  timeoutMs = 14 * 60_000,
+  timeoutMs = 10 * 60_000,
   pollIntervalMs = 1_000
 ): Promise<number> {
   const startedAt = Date.now();
@@ -224,6 +228,11 @@ export class InitialChildStartBarrier {
     this.rejectCompletion(error instanceof Error ? error : new Error(String(error)));
   }
 
+  /** Only preparations made before initial admission may borrow this receipt. */
+  initialStartReceiptIfUnadmitted(): Promise<void> | null {
+    return this.state === 'closed' ? this.completion : null;
+  }
+
   async beforeRestart(): Promise<InitialChildRestartDisposition> {
     if (this.state !== 'closed') return 'restart-required';
     await this.completion;
@@ -235,22 +244,6 @@ export class InitialChildStartBarrier {
     if (this.state === 'closed') return 'covered-by-initial-start';
     return this.beforeRestart();
   }
-}
-
-/** Prevent timer callbacks from overlapping one asynchronous polling cycle. */
-export function createSingleFlightOperation(
-  operation: () => Promise<void>
-): () => Promise<void> {
-  let running = false;
-  return async (): Promise<void> => {
-    if (running) return;
-    running = true;
-    try {
-      await operation();
-    } finally {
-      running = false;
-    }
-  };
 }
 
 /** Monotonic generation guard used immediately before secret queue admission. */
@@ -622,7 +615,7 @@ export function acknowledgeSecretMutation(
  * first metadata response, while exact file targets are skipped without an
  * extra HTTP request.
  */
-export async function pollExecOnlySecretVersions(options: {
+export async function synchronizeExecOnlySecretVersions(options: {
   references: string[];
   fileTargetReferences: string[];
   identityByReference: Map<string, string>;
@@ -882,55 +875,28 @@ export function resolvePayaraRecoveryStartup(
   return { phase: 'legacy', version: manifest.version };
 }
 
-export const POST_UPDATE_AUTHORITY_RETRY_MS = 30_000;
-
-/**
- * Probe remote config authority without transitioning the synthetic recovery
- * process in-place. A successful full fetch requests one clean restart; failed
- * probes remain in the live status plane and cannot consume systemd's burst.
- */
-export function startPostUpdateAuthorityRetry(options: {
+/** Explicit recovery action. It cannot discover authority from an elapsed timer. */
+export function createPostUpdateAuthorityRecovery(options: {
   probe: () => Promise<boolean>;
   requestRestart: () => void;
-  retryMs?: number;
-}): () => void {
-  const retryMs = options.retryMs ?? POST_UPDATE_AUTHORITY_RETRY_MS;
+}): { synchronize: () => Promise<void>; stop: () => void } {
   let stopped = false;
-  let timeout: NodeJS.Timeout | null = null;
-
-  const schedule = (): void => {
-    if (stopped) return;
-    timeout = setTimeout(() => {
-      timeout = null;
-      void attempt();
-    }, retryMs);
-  };
-  const attempt = async (): Promise<void> => {
-    let authoritative = false;
-    try {
-      authoritative = await options.probe();
-    } catch (err) {
-      log.warn({ err }, 'Payara post-update authority probe failed');
-    }
-    if (stopped) return;
-    if (authoritative) {
-      stopped = true;
-      try {
+  let restarted = false;
+  let task: Promise<void> | null = null;
+  return {
+    synchronize: () => {
+      if (stopped) return Promise.reject(new Error('Recovery is stopped'));
+      if (restarted) return Promise.resolve();
+      if (task) return task;
+      task = (async () => {
+        if (!await options.probe()) throw new Error('Remote config authority remains unavailable');
+        if (stopped) throw new Error('Recovery stopped during authority check');
         options.requestRestart();
-        return;
-      } catch (err) {
-        stopped = false;
-        log.error({ err }, 'Could not restart after Payara config authority recovered');
-      }
-    }
-    schedule();
-  };
-
-  schedule();
-  return () => {
-    stopped = true;
-    if (timeout) clearTimeout(timeout);
-    timeout = null;
+        restarted = true;
+      })().finally(() => { task = null; });
+      return task;
+    },
+    stop: () => { stopped = true; },
   };
 }
 
@@ -968,6 +934,7 @@ export async function startDaemon(options: {
   const controlPlaneAuth = loadControlPlaneAuthenticator(
     options.controlPlaneTokenFile ?? process.env.ZNVAULT_CONTROL_TOKEN_FILE
   );
+  setSynchronizationHandler(null);
   const startupShutdownSequence = getDeferredShutdownSequence();
   let startupShutdownSignal: string | null = null;
   const deferredStartupShutdownSignal = (): string | null =>
@@ -1063,9 +1030,10 @@ export async function startDaemon(options: {
         )
         : undefined,
     });
-    let stopPostUpdateAuthorityRetry: (() => void) | undefined;
+    let authorityRecovery: ReturnType<typeof createPostUpdateAuthorityRecovery> | undefined;
     setupSignalHandlers(async () => {
-      stopPostUpdateAuthorityRetry?.();
+      authorityRecovery?.stop();
+      setSynchronizationHandler(null);
       options.pluginAutoUpdateService?.stop();
       options.npmAutoUpdateService?.stop();
       setNpmAutoUpdateService(null);
@@ -1075,13 +1043,14 @@ export async function startDaemon(options: {
       await stopHealthServer();
     });
     if (payaraRecovery.phase === 'post-update') {
-      stopPostUpdateAuthorityRetry = startPostUpdateAuthorityRetry({
+      authorityRecovery = createPostUpdateAuthorityRecovery({
         probe: options.postUpdateAuthorityProbe!,
         requestRestart: () => {
           log.info('Remote config authority recovered; restarting for Payara startup confirmation');
           process.kill(process.pid, 'SIGTERM');
         },
       });
+      setSynchronizationHandler(authorityRecovery.synchronize);
       log.error(
         { package: '@zincapp/znvault-plugin-payara', version: payaraRecovery.version },
         'STARTUP_CONFIRMATION_PENDING: root-attested Payara recovery daemon active'
@@ -1377,11 +1346,8 @@ export async function startDaemon(options: {
     }
   }
 
-  // Unified propagation of rotated managed keys to ALL consumers (live config,
-  // plugin keyRotated dispatch, exec env files, child restart). Both detection
-  // channels — the WebSocket rotation event AND the renewal service's polling
-  // rails — go through this one path, so a lost WebSocket event can no longer
-  // leave plugin-deployed key files stale (2026-07-05 incident).
+  // Every bind source shares pre-await request ordering and the same serialized
+  // persistence/consumer path; response arrival cannot grant stale authority.
   const childManagerForRestart = childManager;
   const keyRotationPropagator = createKeyRotationPropagator({
     config,
@@ -1389,22 +1355,22 @@ export async function startDaemon(options: {
     execOutputFile,
     execSecretMappings,
     isShuttingDown: isShutdownRequested,
-    restartChild: childManagerForRestart && options.exec?.restartOnChange !== false
+    prepareChildRestart: childManagerForRestart
       ? async (reason: string) => {
+          const initialReceipt = initialChildStartBarrier.initialStartReceiptIfUnadmitted();
+          if (initialReceipt) return { consumerReady: initialReceipt };
+          // A normal/recovery restart has its own terminal receipt. It must not
+          // borrow a historical failed initial-start promise.
           await restartChildAfterMutation?.(reason);
         }
       : undefined,
   });
 
-  // Polling rail for tracked managed keys BEYOND the agent's own auth key
-  // (exec/plugin `api-key:` mappings). The renewal service covers only the
-  // own key; without this poller, a lost WebSocket event would leave those
-  // keys' consumers stale until restart — the 2026-07-05 incident class.
-  // Started after plugins are running (so keyRotated dispatches reach them);
-  // unchanged polls are no-ops via the propagator's per-key dedup.
-  const trackedKeyPoller = new TrackedKeyPoller({
+  // Secondary consumer keys receive an initial read and explicit reconciliation.
+  // Their bind authority is coordinated with genuine push observations.
+  const trackedKeySynchronizer = new TrackedKeySynchronizer({
     keyNames: allManagedKeyNames.filter((name) => name !== config.managedKey?.name),
-    propagate: (newKey, meta, opts) => keyRotationPropagator.propagate(newKey, meta, opts),
+    observeKey: (name, isCancelled, onStaged) => observeManagedKey(name, 'manual', { isCancelled, onStaged }),
     isShuttingDown: isShutdownRequested,
   });
 
@@ -1549,6 +1515,20 @@ export async function startDaemon(options: {
   // Create unified WebSocket client with exec secret IDs and managed key names
   const unifiedClient = createUnifiedWebSocketClient(execSecretIds, allManagedKeyNames);
 
+  const observeManagedKey = async (
+    name: string,
+    source: KeyRotationSource,
+    options?: { persist?: boolean; isCancelled?: () => boolean; onStaged?: () => void }
+  ) => {
+    const observation = await keyRotationPropagator.bindAndPropagate(name, source, options);
+    if (observation.response && observation.propagation.propagated && config.managedKey?.name === name && !isShutdownRequested()) {
+      // Only an accepted own-key observation may replace transport credentials.
+      unifiedClient.disconnect();
+      setTimeout(() => { if (!isShutdownRequested()) unifiedClient.connect(); }, 500);
+    }
+    return observation;
+  };
+
   // Initialize degraded mode handler
   initDegradedModeHandler({
     onCredentialsUpdated: (_newKey) => {
@@ -1686,7 +1666,7 @@ export async function startDaemon(options: {
     onExhausted: (key, item, generation) => {
       log.error(
         { certId: key, name: item.target.name, generation },
-        'Certificate mutation retry exhausted; polling recovery required'
+        'Certificate mutation retry exhausted; synchronization recovery required'
       );
     },
   });
@@ -1822,7 +1802,7 @@ export async function startDaemon(options: {
     onExhausted: (key, item, generation) => {
       log.error(
         { secretId: key, name: item.target?.name, generation },
-        'Secret mutation retry exhausted; polling recovery required'
+        'Secret mutation retry exhausted; synchronization recovery required'
       );
     },
   });
@@ -1886,7 +1866,7 @@ export async function startDaemon(options: {
     onExhausted: (key, item, generation) => {
       log.error(
         { key, name: item.target.name, reference: item.reference, generation },
-        'Referenced secret refresh retry exhausted; polling recovery required'
+        'Referenced secret refresh retry exhausted; synchronization recovery required'
       );
     },
   });
@@ -1982,34 +1962,14 @@ export async function startDaemon(options: {
 
     await withActiveDeployment(async () => {
       try {
-      // Fetch the new key via bind
-      const bindResponse = await bindManagedApiKey(event.apiKeyName);
-      const newKey = bindResponse.key;
-
-      log.info({
-        keyName: event.apiKeyName,
-      }, 'Fetched new API key value');
-
-      // Propagate to ALL consumers: live config mutation (plugins read
-      // ctx.config), disk/env persistence, plugin keyRotated dispatch, exec
-      // env-file update, optional child restart. Shared with the renewal
-      // service's polling rails so both channels behave identically.
-      // Metadata comes from the authoritative bind response (the event may
-      // be older than the bind we just performed); detectedAt is when the
-      // bind resolved — the propagator uses it to discard stale detections.
-      await keyRotationPropagator.propagate(newKey, {
-        keyName: event.apiKeyName,
-        newPrefix: event.newPrefix ?? bindResponse.prefix,
-        nextRotationAt: bindResponse.nextRotationAt,
-        graceExpiresAt: bindResponse.graceExpiresAt ?? event.graceExpiresAt,
-        rotationMode: bindResponse.rotationMode ?? event.rotationMode,
-        source: 'ws_event',
-      }, { persist: true, detectedAt: Date.now() });
+        const { propagation } = await observeManagedKey(event.apiKeyName, 'ws_event', { persist: true });
+        if (propagation.errors.length > 0) markEventDeliveryStale();
       } catch (err) {
         log.error({
           err,
           keyName: event.apiKeyName,
         }, 'Failed to process API key rotation event');
+        markEventDeliveryStale();
       }
     });
   }
@@ -2073,6 +2033,7 @@ export async function startDaemon(options: {
           } : config.managedKey,
         };
         setConfigInMemory(updatedConfig);
+        markEventDeliveryStale(); // Runtime consumers require an explicit restart for new config.
 
         log.info({
           version: result.version,
@@ -2116,58 +2077,31 @@ export async function startDaemon(options: {
     log.error({ err }, 'WebSocket error');
   });
 
+  const initialKeyCompletions: Promise<unknown>[] = [];
+  let initialManagedKeyStaged: (() => void) | undefined;
   // Start API key renewal service (managed or standard)
   if (isManagedKeyMode() && !isShutdownRequested()) {
     log.info('Using managed API key mode');
 
-    // Set up callback for when managed key changes.
-    //
-    // 2026-07-05 incident fix: rotations detected by the renewal service's
-    // polling rails (scheduled refresh / grace poll / heartbeat / reconnect)
-    // previously only reconnected the WebSocket — the new key was never
-    // propagated to plugins or exec env files, so plugin-deployed key files
-    // (e.g. payara's ZINC_CONFIG_VAULT_API_KEY) stayed stale until an agent
-    // restart whenever the WebSocket rotation event was lost. Rail detections
-    // now run the same propagation path as the WebSocket event handler.
-    // The renewal service has already persisted the key (updateManagedKey),
-    // so the propagator is invoked without the persist option.
-    onManagedKeyChanged((newKey, meta) => {
-      if (isShutdownRequested()) {
-        log.debug({ keyName: meta.keyName }, 'Ignoring managed key change during shutdown');
-        return;
-      }
-      // The renewal service's bind resolved just before this callback fired.
-      const detectedAt = Date.now();
-      void (async () => {
-        // Count as an active deployment so graceful shutdown waits for the
-        // consumer updates (same invariant as the WebSocket rotation handler).
-        await withActiveDeployment(async () => {
-          try {
-          await keyRotationPropagator.propagate(newKey, meta, { detectedAt });
-          } catch (err) {
-            log.error({ err, keyName: meta.keyName }, 'Failed to propagate rail-detected key rotation');
-          }
-        });
-
-        log.info({ source: meta.source }, 'Managed key changed, reconnecting WebSocket');
-        // Reconnect WebSocket with new key
-        unifiedClient.disconnect();
-        // Small delay to allow config to be saved
-        setTimeout(() => {
-          if (!isShutdownRequested()) {
-            unifiedClient.connect();
-          }
-        }, 500);
-      })();
+    setManagedKeyBinder((name, source, isCancelled) => withActiveDeployment(async () => {
+      const observation = await observeManagedKey(name, source, { persist: true, isCancelled, onStaged: source === 'scheduled' ? initialManagedKeyStaged : undefined });
+      if (observation.propagation.errors.length > 0) markEventDeliveryStale();
+      return observation.response;
+    }));
+    // Persist/stage the initial key before continuing startup, but own the full
+    // consumer acknowledgement until the first child has actually started.
+    const initialManagedKey = prepareKeyObservation(onStaged => {
+      initialManagedKeyStaged = onStaged;
+      return startManagedKeyRenewal();
     });
-
-    // Start managed key renewal service and AWAIT initial bind
-    // This ensures the key is rotated BEFORE we connect WebSocket or start child process
-    try {
-      await startManagedKeyRenewal();
-    } catch (err) {
-      log.error({ err }, 'Failed to start managed key renewal service');
-    }
+    initialKeyCompletions.push(initialManagedKey.completed.then(result => {
+      if (!result) markEventDeliveryStale();
+    }).catch((err: unknown) => {
+      markEventDeliveryStale(); log.error({ err }, 'Initial managed key synchronization failed');
+    }));
+    await initialManagedKey.prepared.catch((err: unknown) => {
+      markEventDeliveryStale(); log.error({ err }, 'Initial managed key preparation failed');
+    });
   } else if (!isShutdownRequested()) {
     // Use standard API key renewal
     const allowStaticKey = process.env.ALLOW_STATIC_KEY === 'true';
@@ -2202,10 +2136,14 @@ export async function startDaemon(options: {
     }
   }
 
-  // Start the polling rail for non-own tracked keys AFTER plugins are running
-  // so their keyRotated handlers receive the dispatches.
   if (!isShutdownRequested()) {
-    trackedKeyPoller.start();
+    const initialTrackedKeys = trackedKeySynchronizer.prepareInitial();
+    initialKeyCompletions.push(withActiveDeployment(() => initialTrackedKeys.completed).catch((err: unknown) => {
+      markEventDeliveryStale(); log.error({ err }, 'Initial tracked key synchronization failed');
+    }));
+    await initialTrackedKeys.prepared.catch((err: unknown) => {
+      markEventDeliveryStale(); log.error({ err }, 'Initial tracked key preparation failed');
+    });
   }
 
   // Initial sync - certificates
@@ -2231,7 +2169,7 @@ export async function startDaemon(options: {
   // Initial sync - secrets
   if (secretTargets.length > 0 && !isStartupShutdownRequested()) {
     // Snapshot reference generations before rendering their parents. A later
-    // WebSocket event or poll with a higher child generation must refresh the
+    // WebSocket event or synchronization with a higher child generation must refresh the
     // parent even though the parent's own version remains unchanged.
     const initialRefreshVersions = new Map<string, number>();
     for (const match of listSecretRefreshMatches(secretTargets)) {
@@ -2294,13 +2232,15 @@ export async function startDaemon(options: {
     }
   }
 
-  // Set up polling interval as fallback
-  const pollInterval = (config.pollInterval ?? 3600) * 1000;
+  // Every staged initial observation is joined after admission/completion of
+  // the first child, before runtime startup can claim success.
+  await Promise.all(initialKeyCompletions);
 
-  const runPoll = async (): Promise<void> => {
-    if (isShutdownRequested()) return;
+  const runSynchronization = async (): Promise<void> => {
+    if (isShutdownRequested()) throw new Error('Agent is shutting down');
+    let failed = false;
 
-    log.debug('Starting periodic poll');
+    log.info('Starting explicit synchronization');
 
     // Poll certificates
     for (const target of config.targets) {
@@ -2308,8 +2248,7 @@ export async function startDaemon(options: {
 
       try {
         if (certificateRetryQueue.isPending(target.certId)) {
-          await certificateRetryQueue.retryNow(target.certId);
-          continue;
+          if (!await certificateRetryQueue.retryNow(target.certId)) throw new Error('Certificate mutation remains pending');
         }
         await withActiveDeployment(async () => {
           const consumedFingerprint = consumedCertificateFingerprints.get(target.certId);
@@ -2330,7 +2269,7 @@ export async function startDaemon(options: {
             certificateRetryQueue.enqueue(target.certId, generation, { event, target });
             log.error(
               { name: target.name, generation, error: result.message },
-              'Certificate poll deployment failed; mutation remains pending'
+              'Certificate synchronization deployment failed; mutation remains pending'
             );
             return;
           }
@@ -2353,15 +2292,16 @@ export async function startDaemon(options: {
             observedMarker: result.fingerprint,
           });
           if (reconciliation === 'resolved') {
-            log.info({ name: target.name, message: result.message }, 'Certificate updated and consumer restarted during poll');
+            log.info({ name: target.name, message: result.message }, 'Certificate updated and consumer restarted during synchronization');
           } else if (reconciliation === 'pending') {
-            log.error({ name: target.name, generation }, 'Certificate poll mutation remains pending consumer restart');
+            log.error({ name: target.name, generation }, 'Certificate synchronization mutation remains pending consumer restart');
           } else if (result.version !== undefined) {
             consumedCertificateVersions.set(target.certId, result.version);
           }
         });
       } catch (err) {
-        log.error({ name: target.name, err }, 'Error polling certificate');
+        failed = true;
+        log.error({ name: target.name, err }, 'Error synchronizing certificate');
       }
     }
 
@@ -2373,8 +2313,7 @@ export async function startDaemon(options: {
       if (isShutdownRequested()) break;
 
       if (secretRefreshRetryQueue.isPending(match.key)) {
-        await secretRefreshRetryQueue.retryNow(match.key);
-        continue;
+        if (!await secretRefreshRetryQueue.retryNow(match.key)) { failed = true; continue; }
       }
 
       let metadata = refreshMetadataByReference.get(match.reference);
@@ -2383,10 +2322,11 @@ export async function startDaemon(options: {
           metadata = await getSecretMetadata(match.reference);
           refreshMetadataByReference.set(match.reference, metadata);
         } catch (err) {
+        failed = true;
           failedRefreshReferences.add(match.reference);
           log.error(
             { err, reference: match.reference, name: match.target.name },
-            'Referenced secret metadata poll failed'
+            'Referenced secret metadata synchronization failed'
           );
         }
       }
@@ -2424,7 +2364,7 @@ export async function startDaemon(options: {
       if (!resolved) {
         log.error(
           { reference: match.reference, name: match.target.name, version: metadata.version },
-          'Referenced secret poll mutation remains pending'
+          'Referenced secret synchronization mutation remains pending'
         );
       }
     }
@@ -2436,8 +2376,7 @@ export async function startDaemon(options: {
 
       try {
         if (secretRetryQueue.isPending(targetKey)) {
-          await secretRetryQueue.retryNow(targetKey);
-          continue;
+          if (!await secretRetryQueue.retryNow(targetKey)) throw new Error('Secret mutation remains pending');
         }
         await withActiveDeployment(async () => {
           const consumedVersion = consumedSecretVersions.get(targetKey);
@@ -2458,11 +2397,11 @@ export async function startDaemon(options: {
             secretRetryQueue.enqueue(targetKey, generation, {
               event,
               target,
-              restartReason: 'secret file updated during poll',
+              restartReason: 'secret file updated during synchronization',
             });
             log.error(
               { name: target.name, generation, error: result.message },
-              'Secret poll deployment failed; mutation remains pending'
+              'Secret synchronization deployment failed; mutation remains pending'
             );
             return;
           }
@@ -2478,7 +2417,7 @@ export async function startDaemon(options: {
           const item: SecretRetryItem = {
             event,
             target,
-            restartReason: 'secret file updated during poll',
+            restartReason: 'secret file updated during synchronization',
           };
           const reconciliation = await reconcilePolledMutation({
             queue: secretRetryQueue,
@@ -2490,18 +2429,19 @@ export async function startDaemon(options: {
             observedMarker: result.version,
           });
           if (reconciliation === 'resolved') {
-            log.info({ name: target.name, message: result.message }, 'Secret updated and consumer restarted during poll');
+            log.info({ name: target.name, message: result.message }, 'Secret updated and consumer restarted during synchronization');
           } else if (reconciliation === 'pending') {
-            log.error({ name: target.name, version: result.version }, 'Secret poll mutation remains pending consumer restart');
+            log.error({ name: target.name, version: result.version }, 'Secret synchronization mutation remains pending consumer restart');
           }
         });
       } catch (err) {
-        log.error({ name: target.name, err }, 'Error polling secret');
+        failed = true;
+        log.error({ name: target.name, err }, 'Error synchronizing secret');
       }
     }
 
     if (!isShutdownRequested() && execSecretIds.length > 0) {
-      await withActiveDeployment(async () => pollExecOnlySecretVersions({
+      await withActiveDeployment(async () => synchronizeExecOnlySecretVersions({
         references: execSecretIds,
         fileTargetReferences: secretTargets.map(target => target.secretId),
         identityByReference: execSecretIdentityByReference,
@@ -2519,7 +2459,7 @@ export async function startDaemon(options: {
           };
           const item: SecretRetryItem = {
             event,
-            restartReason: 'exec secret updated during poll',
+            restartReason: 'exec secret updated during synchronization',
             execIdentity: identity,
             execPollReference: reference,
           };
@@ -2530,7 +2470,7 @@ export async function startDaemon(options: {
           if (!resolved) {
             log.error(
               { secretId: reference, version: metadata.version },
-              'Exec-only secret poll mutation remains pending consumer restart'
+              'Exec-only secret synchronization mutation remains pending consumer restart'
             );
           }
         },
@@ -2539,7 +2479,7 @@ export async function startDaemon(options: {
           publishPendingSecretHealth();
           log.error(
             { err, secretId: reference },
-            'Exec-only secret metadata poll failed; observation state is unknown'
+            'Exec-only secret metadata synchronization failed; observation state is unknown'
           );
         },
         onFetchSuccess: (reference, identity, metadata) => {
@@ -2558,53 +2498,37 @@ export async function startDaemon(options: {
         },
       }));
     }
+    if (failed || isShutdownRequested() || certificateRetryQueue.pendingCount > 0
+        || secretRetryQueue.pendingCount > 0 || secretRefreshRetryQueue.pendingCount > 0
+        || execMetadataUnknown.size > 0 || refreshMetadataUnknown.size > 0) {
+      throw new Error('Synchronization incomplete; consumer mutations remain pending');
+    }
   };
 
-  // setInterval does not await its callback. Keep the entire poll rail
-  // single-flight so two cycles cannot both deploy and enqueue the same lost
-  // mutation before either one publishes pending state.
-  const poll = createSingleFlightOperation(runPoll);
-
-  const pollTimer = setInterval(() => {
-    poll().catch((e: unknown) => { log.error({ err: e }, 'Poll error'); });
-  }, pollInterval);
-
-  // Periodic managed key file sync check (every 60 seconds)
-  // This catches cases where the file is overwritten/corrupted mid-run
-  let keySyncTimer: NodeJS.Timeout | null = null;
-  if (config.managedKey?.filePath) {
-    const KEY_SYNC_INTERVAL = 60_000; // 60 seconds
-    const managedKeyFilePath = config.managedKey.filePath;
-
-    keySyncTimer = setInterval(() => {
-      if (isShutdownRequested()) return;
-
-      void (async () => {
-        const syncResult = await syncManagedKeyFile();
-        if (syncResult.wasOutOfSync) {
-          if (syncResult.keptExistingFile) {
-            log.error({
-              filePath: managedKeyFilePath,
-            }, 'Periodic check: config key is STALE (failed vault auth) - kept existing key file');
-          } else if (syncResult.synced) {
-            log.warn({
-              filePath: managedKeyFilePath,
-            }, 'Periodic check: Managed key file was out of sync - auto-fixed');
-          } else {
-            log.error({
-              filePath: managedKeyFilePath,
-              error: syncResult.error,
-            }, 'Periodic check: CRITICAL - Managed key file sync failed');
-          }
-        }
-        // Don't log on success - too noisy
-      })().catch((err: unknown) => {
-        log.error({ err, filePath: managedKeyFilePath }, 'Periodic managed key sync check threw');
+  setSynchronizationHandler(async () => withActiveDeployment(async () => {
+    if (isShutdownRequested()) throw new Error('Agent is shutting down');
+    if (config.managedKey?.name) {
+      const observation = await observeManagedKey(config.managedKey.name, 'manual', { persist: true });
+      if (!observation.response || observation.propagation.errors.length > 0) throw new Error('Managed key synchronization incomplete or superseded');
+      const file = await syncManagedKeyFile();
+      if (file.error || file.keptExistingFile) throw new Error('Managed key file synchronization incomplete');
+    }
+    await trackedKeySynchronizer.synchronize();
+    if (options.configFromVault) {
+      const result = await fetchConfigFromVault({
+        vaultUrl: config.vaultUrl, apiKey: config.auth.apiKey ?? '', insecure: config.insecure,
+        agentId: config.agentId, hostConfigId: config.hostConfigId, configVersion: config.configVersion,
       });
-    }, KEY_SYNC_INTERVAL);
-
-    log.info({ intervalMs: KEY_SYNC_INTERVAL }, 'Periodic managed key file sync check enabled');
-  }
+      if (!result.success) throw new Error('Configuration authority unavailable');
+      if (result.modified) throw Object.assign(new Error('Configuration changed; an explicit agent restart is required'), { code: 'AGENT_RESTART_REQUIRED' });
+    }
+    await synchronizeTLSCertificate();
+    const tls = getTLSConfig();
+    if (isHTTPSHealthServerRunning() && !await reloadHTTPSCertificate(tls.certPath, tls.keyPath)) {
+      throw new Error('HTTPS certificate reload incomplete');
+    }
+    await runSynchronization();
+  }));
 
   // Graceful shutdown handler
   let markShutdownStarted!: () => void;
@@ -2629,9 +2553,9 @@ export async function startDaemon(options: {
     cleanupSignalHandlers();
 
     // Stop accepting new events
-    clearInterval(pollTimer);
-    if (keySyncTimer) clearInterval(keySyncTimer);
-    trackedKeyPoller.stop();
+    setSynchronizationHandler(null);
+    pluginLoader?.beginShutdown();
+    trackedKeySynchronizer.stop();
     keyRotationPropagator.stop();
     certificateRetryQueue.stop();
     secretRetryQueue.stop();
@@ -2646,7 +2570,7 @@ export async function startDaemon(options: {
       stopApiKeyRenewal();
     }
 
-    // Leave one minute of the systemd 900s stop budget for final teardown.
+    // Reserve 180s for plugin lifecycle stop and 120s for final teardown.
     // Plugin dispatch and child restart remain available until the mutation
     // that admitted them has completed; only then may those consumers stop.
     const remainingDeployments = await drainActiveDeployments();
@@ -2733,5 +2657,5 @@ export async function startDaemon(options: {
     return;
   }
 
-  log.info({ pollInterval: config.pollInterval ?? 3600 }, 'Agent running. Press Ctrl+C to stop.');
+  log.info('Agent running with event delivery. Press Ctrl+C to stop.');
 }

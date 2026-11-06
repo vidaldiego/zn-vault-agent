@@ -32,10 +32,6 @@ interface ApiKeyRotateResponse {
 // Renewal threshold (days before expiry to renew)
 const RENEWAL_THRESHOLD_DAYS = 30;
 
-// Check interval (once per day)
-const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
-
-let checkTimer: NodeJS.Timeout | null = null;
 let isRunning = false;
 
 /**
@@ -242,7 +238,6 @@ export function startApiKeyRenewal(): void {
 
   isRunning = true;
   log.info({
-    checkIntervalHours: CHECK_INTERVAL_MS / (60 * 60 * 1000),
     renewalThresholdDays: RENEWAL_THRESHOLD_DAYS,
   }, 'Starting API key renewal service');
 
@@ -251,22 +246,13 @@ export function startApiKeyRenewal(): void {
     log.error({ err }, 'Initial API key check failed');
   });
 
-  // Schedule periodic checks
-  checkTimer = setInterval(() => {
-    checkAndRenewApiKey().catch((err: unknown) => {
-      log.error({ err }, 'Periodic API key check failed');
-    });
-  }, CHECK_INTERVAL_MS);
+
 }
 
 /**
  * Stop the API key renewal service
  */
 export function stopApiKeyRenewal(): void {
-  if (checkTimer) {
-    clearInterval(checkTimer);
-    checkTimer = null;
-  }
   isRunning = false;
   log.debug('API key renewal service stopped');
 }

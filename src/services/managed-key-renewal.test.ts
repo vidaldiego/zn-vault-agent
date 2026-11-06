@@ -42,7 +42,12 @@ import {
   forceRefresh,
   getManagedKeyStatus,
   onKeyChanged,
+  onWebSocketReconnect,
+  onWebSocketRotationEvent,
+  onWebSocketAuthFailure,
+  setManagedKeyBinder,
 } from './managed-key-renewal.js';
+import { createKeyRotationPropagator } from '../lib/key-rotation-propagation.js';
 
 describe('Managed Key Renewal Service', () => {
   const mockConfig = {
@@ -257,72 +262,70 @@ describe('Managed Key Renewal Service', () => {
     });
   });
 
-  describe('refresh scheduling', () => {
-    it('should schedule refresh based on nextRotationAt', async () => {
-      // Set rotation time to 1 hour from now
-      const nextRotation = new Date(Date.now() + 3600000);
-      vi.mocked(loadConfig).mockReturnValue({
-        ...mockConfig,
-        managedKey: {
-          ...mockConfig.managedKey!,
-          nextRotationAt: nextRotation.toISOString(),
-        },
-      } as ReturnType<typeof loadConfig>);
+  it('does not turn repeated authentication rejections into bind polling', async () => {
+    await startManagedKeyRenewal();
+    vi.mocked(bindManagedApiKey).mockClear();
+    vi.mocked(bindManagedApiKey).mockRejectedValue(new Error('Unauthorized'));
+    await expect(onWebSocketAuthFailure()).resolves.toBe(false);
+    await expect(onWebSocketAuthFailure()).resolves.toBe(false);
+    expect(bindManagedApiKey).toHaveBeenCalledTimes(1);
+  });
 
-      // Mock bind response WITHOUT graceExpiresAt to avoid grace period poll
-      // interfering with refresh scheduling test
-      vi.mocked(bindManagedApiKey).mockResolvedValue({
-        ...mockBindResponse,
-        graceExpiresAt: undefined, // Disable grace period poll for this test
-        nextRotationAt: nextRotation.toISOString(),
-      });
+  it('does not persist credentials from a bind that completed after shutdown', async () => {
+    let complete!: (response: ManagedApiKeyBindResponse) => void;
+    vi.mocked(bindManagedApiKey).mockImplementation(() => new Promise(resolve => { complete = resolve; }));
+    const startup = startManagedKeyRenewal();
+    stopManagedKeyRenewal();
+    complete(mockBindResponse);
+    await expect(startup).resolves.toBeNull();
+    expect(updateManagedKey).not.toHaveBeenCalled();
+  });
 
+  it('delegates managed-event persistence to the shared observer and rejects an older manual response', async () => {
+    const config = { ...mockConfig, auth: { ...mockConfig.auth }, managedKey: { ...mockConfig.managedKey } };
+    vi.mocked(loadConfig).mockReturnValue(config as ReturnType<typeof loadConfig>);
+    let completeOld!: (response: ManagedApiKeyBindResponse) => void;
+    const oldResponse = new Promise<ManagedApiKeyBindResponse>(resolve => { completeOld = resolve; });
+    const bind = vi.fn()
+      .mockResolvedValueOnce({ ...mockBindResponse, key: config.auth.apiKey })
+      .mockImplementationOnce(async () => oldResponse)
+      .mockResolvedValue({ ...mockBindResponse, key: 'newer-event-key' });
+    const writes: string[] = [];
+    const observer = createKeyRotationPropagator({
+      config: config as ReturnType<typeof loadConfig>, bindManagedKey: bind,
+      getPluginLoader: () => null, persistManagedKey: value => { writes.push(value); },
+    });
+    setManagedKeyBinder(async (name, source, isCancelled) => (await observer.bindAndPropagate(name, source, { persist: true, isCancelled })).response);
+    await startManagedKeyRenewal();
+    writes.length = 0;
+    const manual = observer.bindAndPropagate(config.managedKey.name, 'manual', { persist: true });
+    await onWebSocketRotationEvent(config.managedKey.name);
+    completeOld({ ...mockBindResponse, key: 'older-manual-key' });
+    expect((await manual).response).toBeNull();
+    expect(config.auth.apiKey).toBe('newer-event-key');
+    expect(writes).toEqual(['newer-event-key']);
+    expect(updateManagedKey).not.toHaveBeenCalled();
+    expect(bindManagedApiKey).not.toHaveBeenCalled();
+    observer.stop();
+  });
+
+  describe('event-only refresh', () => {
+    it('never discovers keys from elapsed rotation/grace/heartbeat deadlines or reconnect', async () => {
       await startManagedKeyRenewal();
-
-      // Clear the initial bind call
       vi.mocked(bindManagedApiKey).mockClear();
-
-      // Advance time to just before refresh (30 seconds before rotation)
-      // Refresh should happen 30 seconds before rotation by default
-      vi.advanceTimersByTime(3600000 - 30000 - 1000); // 1 second before refresh
-
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+      const reconnect = onWebSocketReconnect();
+      await vi.advanceTimersByTimeAsync(10_000);
+      await reconnect;
       expect(bindManagedApiKey).not.toHaveBeenCalled();
-
-      // Advance past refresh time
-      vi.advanceTimersByTime(2000);
-
-      // Should have refreshed
-      expect(bindManagedApiKey).toHaveBeenCalled();
     });
 
-    it('should use fallback interval when no rotation time available', async () => {
-      vi.mocked(loadConfig).mockReturnValue({
-        ...mockConfig,
-        managedKey: {
-          name: 'test-managed-key',
-          // No nextRotationAt or graceExpiresAt
-        },
-      } as ReturnType<typeof loadConfig>);
-
-      vi.mocked(bindManagedApiKey).mockResolvedValue({
-        ...mockBindResponse,
-        nextRotationAt: undefined,
-        graceExpiresAt: undefined,
-      });
-
+    it('still binds a matching real server rotation event exactly once', async () => {
       await startManagedKeyRenewal();
-
-      // Clear initial bind
       vi.mocked(bindManagedApiKey).mockClear();
-
-      // Fallback interval is 5 minutes (300000ms)
-      vi.advanceTimersByTime(300000 - 1000);
-
-      expect(bindManagedApiKey).not.toHaveBeenCalled();
-
-      vi.advanceTimersByTime(2000);
-
-      expect(bindManagedApiKey).toHaveBeenCalled();
+      await onWebSocketRotationEvent('test-managed-key');
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+      expect(bindManagedApiKey).toHaveBeenCalledTimes(1);
     });
   });
 });

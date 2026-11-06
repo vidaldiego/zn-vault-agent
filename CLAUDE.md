@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ZnVault Agent (`@zincapp/zn-vault-agent`) is a TypeScript/Node.js daemon that synchronizes TLS certificates and secrets from ZnVault to target servers with zero-downtime deployments. It runs as a systemd service and provides real-time updates via WebSocket, falling back to HTTP polling when unavailable.
+ZnVault Agent (`@zincapp/zn-vault-agent`) is a TypeScript/Node.js daemon that synchronizes TLS certificates and secrets from ZnVault to target servers with zero-downtime deployments. It runs as a systemd service and provides real-time updates via WebSocket. Application state is never polled; disconnected or unreconciled delivery is exposed as stale.
 
 ### Independent workspace
 
@@ -150,7 +150,7 @@ src/
 
 1. **Event-Driven**: WebSocket events trigger certificate/secret deployments
 2. **Atomic Operations**: Temp file + rename prevents partial deployments
-3. **Graceful Degradation**: Falls back from WebSocket to HTTP polling
+3. **Explicit Recovery**: Preserve authorized content and expose stale delivery until an authenticated operator synchronization succeeds
 4. **Plugin Architecture**: Extensible via npm packages with lifecycle hooks
 5. **Unified Logging**: JSON structured logs with secret field redaction
 
@@ -484,8 +484,8 @@ OIDC publication; it does not create a GitHub Release.
    install, the next boot requires a full remote `200`, never `304`. If Vault is
    still down, only the matching active + successful root receipt + restart
    marker + installed 3.x target enters `STARTUP_CONFIRMATION_PENDING`; it keeps
-   GET at `202`, reloads persisted bootstrap/auth on each 30-second authority
-   probe, and requests one graceful restart only after the full config returns.
+   GET at `202`, reloads persisted bootstrap/auth only on authenticated `POST /synchronize`,
+   and requests one graceful restart only after a full authoritative config returns.
    Normal remote config must then start Payara 3 before the operation becomes
    terminal. Arbitrary missing, corrupt, 3.x, and future undeclared manifests
    cannot authorize fallback; invalid evidence fails closed only when remote
@@ -652,70 +652,71 @@ sudo sh -c '[ "$(cat /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY)"
 
 **Workaround (if upgrade not possible):** Restart the agent - it auto-fixes stale API key files on startup via `syncManagedKeyFile()`.
 
-### Rail-Detected Rotations Not Propagated to Consumers (Fixed in v1.23.0)
+### Plugin startup recovery and event delivery (2026-11-06)
 
-**Issue (2026-07-05 production incident):** When the WebSocket `apikey.rotated`
-event was lost, plugin-deployed API key files (payara's
-`ZINC_CONFIG_VAULT_API_KEY`) stayed stale for the whole grace period even
-though the agent itself kept working — consumers started failing with 401 when
-grace expired, and only an agent restart re-rendered the file.
+A failed plugin `onStart` rejects the aggregate startup result while leaving the
+control plane alive and unhealthy. Successful siblings remain running. Health
+reads never promote failed startup. `POST /agent/plugins/:name/start` uses the existing
+local Bearer credential and explicitly retries a successfully initialized plugin;
+uninitialized plugins and shutdown are fenced. Concurrent requests share one
+attempt. A timed-out hook remains tracked until the actual hook settles: no retry
+or cleanup can overlap that work. Actual successful late completion can confirm
+startup; health probes cannot.
 
-**Root Cause:** The plugin key file had exactly ONE runtime refresh path: the
-live WebSocket rotation event (`handleApiKeyRotationEvent` → bind → plugin
-`keyRotated` dispatch). The managed-key renewal service's polling safety rails
-(scheduled refresh at `nextRotationAt`−30s, grace poll, heartbeat, reconnect)
-DID detect the rotation and updated the agent's own credentials
-(config + `process.env`), but their `onKeyChanged` callback only reconnected
-the WebSocket — no plugin dispatch, no exec env-file update, and (in
-disk-config mode) no mutation of the live config object plugins read via
-`ctx.config`. The hourly "Secret sync complete ... success: N" poll is
-truthful but structurally blind: it only covers `secretTargets`, which the
-key file is not part of.
+Shutdown closes startup admission, drains admitted mutations for at most 600s,
+then allows at most 180s for all plugin cleanup (up to 120s initialization/startup settlement,
+up to 60s per stop hook within that total), leaving 120s of the systemd 900s budget
+for teardown. Every attempted initializer is tracked through actual settlement, including
+request timeout and partial failure. Cleanup waits for init/start settlement and
+runs once; hooks must tolerate resources never acquired. Failed or unresolved
+initialization never receives startup or credential authority. A timed-out init
+remains unhealthy even after late success and requires an explicit process
+restart, preserving the original failure while retaining cleanup ownership. Keep `KillMode=mixed` and `TimeoutStopSec=900`.
 
-**Fix Location:** `src/lib/key-rotation-propagation.ts` — a single propagator
-both channels go through (live config mutation, plugin `keyRotated` dispatch,
-exec env-file update, optional child restart, per-key serialized duplicate
-suppression, stale-detection guard, retry-on-partial-failure). Wired in
-`src/lib/websocket.ts` (`handleApiKeyRotationEvent` + the
-`onManagedKeyChanged` callback) and `src/commands/exec.ts` (watch mode). The
-renewal service's `onKeyChanged` callback now carries rotation metadata
-(`KeyChangeMeta`). Tracked keys BEYOND the agent's own (exec/plugin
-`api-key:` mappings) get their polling rail from
-`src/services/managed-key/tracked-keys-poller.ts`, which binds each such key
-on a per-key schedule and feeds the propagator.
+Secrets, certificate targets, own and secondary managed keys use initial reads,
+real WebSocket events, and explicit `POST /synchronize`. The old hourly fallback,
+key-file check, scheduled managed-key binds, grace polls, freshness polls and
+blind reconnect binds are removed from both daemon and standalone exec watch.
+All daemon/watch managed-key reads (initial, push, explicit sync, auth recovery)
+reserve per-key request ordering before awaiting the bind. Their common observer
+rejects older responses inside the consumer serialization chain before live or
+persisted authentication, plugin files or exec files can change. A failed read
+never supersedes an accepted generation; its pending application retries retain
+their original observation ID. This is a local request fence, not a fabricated
+server revision. Superseded explicit synchronization stays incomplete and stale.
 
-**Symptoms (if running < v1.23.0):**
-- Key file value differs from the agent's current managed-key value after a
-  rotation, while agent logs show hourly sync success
-- Journal shows `Managed key rotated` (source: scheduled/grace_poll/
-  heartbeat/reconnect) with NO subsequent plugin `keyRotated` log
-- Consumers (e.g. ZincAPI KMS calls) fail with 401 when grace expires
+Static key expiry is checked once initially; later checks require an explicit
+operator action. Transport ping/pong and reconnect backoff carry no business
+reads. An authentication rejection permits one bind per rejected credential;
+repeated transport failures do not become credential polling.
 
-**Verification (v1.23.0+):**
-```bash
-# Force a rotation, then watch for the propagation log WITHOUT restarting:
-sudo journalctl -u zn-vault-agent -o cat --no-pager | grep "Managed key rotation propagated to consumers"
-# Confirm the protected key file changed without printing any credential bytes:
-sudo stat -c '%y %n' /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY
-```
+Combined startup separates key preparation from successful-child acknowledgement.
+It awaits initial own/secondary config and env staging, admits the child, then
+joins every full key completion before reporting runtime startup. An early push
+releases the per-key preparation chain while its acknowledgement waits outside
+that chain. Only preparation made before child admission borrows the initial
+start receipt; later normal/recovery restarts supply their own terminal receipt,
+so a historical failed first start cannot permanently block explicit recovery.
+Superseded generations are checked again before acknowledgement.
 
-**Workaround (if upgrade not possible):** Restart the agent after rotations,
-or trigger rotations only when a restart window is available.
+There is no Vault resume cursor in the current agent protocol. A disconnect
+therefore latches `delivery.stale=true` even after server acknowledgement. The
+operator may invoke authenticated `POST /synchronize`; the full one-shot read
+clears the gap only when every required consumer acknowledgement succeeds and
+no newer disconnect occurred. A changed host configuration requires an explicit
+agent restart because runtime consumers cannot safely adopt that configuration
+in place. Recovery-only Payara startup confirmation exposes synchronization but
+keeps generic plugin/scheduler mutation routes absent. Standalone exec watch
+reports stale output and requires an explicit command restart to reconcile.
 
-**Status:** Fixed in v1.23.0, verified in production 2026-07-06 on the
-payara-staging fleet (.55–.58): forced rotation propagated to all four key
-files in seconds without agent restarts (source `ws_event`), and a
-rotation-while-agent-down test recovered at startup (source `scheduled`,
-redelivered events deduped).
-
-**Rollout gotchas (payara hosts):** `znvault agent update` needs the target
-IP + `znvault ssh config set user sysadmin`; an agent restart bounces Payara
-(aggressive-mode startup) and hits a pre-existing 30s plugin `onStart`
-timeout mid-deploy that self-heals via the health check ("Plugin recovered
-from error state"); `systemctl stop zn-vault-agent` also stops ZincAPI (the
-Payara JVM lives in the agent's cgroup).
-
-See `docs/POSTMORTEM-2026-07-05-MANAGED-KEY-ROTATION-PROPAGATION.md` for the
-full analysis, rollout record, and follow-ups.
+Agent HTTPS material reloads from real directory notifications (including atomic
+renames), with event debouncing and no stat-poll fallback. TLS renewal is a
+scheduled POST at the already-known expiry threshold, not a status check. Missing
+expiry or a failed renewal schedules no discovery/retry loop, appears in health,
+and can be retried with explicit synchronization. Mutation application retries
+retain a known event/generation and fail-closed pending acknowledgements; they do
+not discover changes from storage. Registry discovery also runs at most once initially when explicitly enabled;
+subsequent checks require a manual action or real server event. Root updater
+publication and durable release-rail contracts remain unchanged.
 
 See `docs/TROUBLESHOOTING.md` for more details.

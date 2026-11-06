@@ -1,22 +1,6 @@
 // Path: test/integration/rotation-propagation.test.ts
 
-/**
- * Managed key rotation propagation integration tests.
- *
- * Regression coverage for the 2026-07-05 production incident: a scheduled
- * managed-key rotation was not propagated to a plugin-deployed API key file
- * while the agent was running. The WebSocket rotation event was lost, and the
- * renewal service's polling rails — which did detect the rotation and refresh
- * the agent's own credentials — never dispatched the plugin `keyRotated`
- * event. The file stayed stale until the grace period expired (consumer 401s)
- * and only an agent restart re-rendered it.
- *
- * ROTATION-01 covers the normal push path (WebSocket event → plugin file
- * rewrite, no restart). ROTATION-02 reproduces the incident: WebSocket
- * 'apikeys' events are suppressed via ZNVAULT_TEST_SUPPRESS_WS_TOPICS, so the
- * file refresh must come from the polling-rail → propagation path within one
- * refresh cycle (~60s).
- */
+/** Managed key push delivery and explicit recovery after a missed event. */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { readFileSync, existsSync, mkdirSync, rmSync } from 'fs';
@@ -82,7 +66,7 @@ describe('Managed Key Rotation Propagation', () => {
       ],
       tenantId: TEST_ENV.tenantId,
       rotationMode: 'scheduled',
-      // 60s is the minimum; keeps the renewal service's scheduled-refresh rail
+      // 60s is the minimum server rotation interval; the initial bind
       // cycle short (refresh at nextRotationAt-30s, clamped to a 60s minimum).
       rotationInterval: '60s',
       // Long grace so the pre-rotation key stays valid for binds all test long.
@@ -171,10 +155,10 @@ describe('Managed Key Rotation Propagation', () => {
     }
   }, 120000);
 
-  it('ROTATION-02: plugin key file is rewritten even when the WebSocket rotation event is LOST (2026-07-05 incident)', async () => {
+  it('ROTATION-02: a missed rotation requires explicit authenticated synchronization', async () => {
     // Suppress all 'apikeys' WebSocket events in the daemon — the exact
     // production failure (the live event never processed, redelivery lost).
-    // The polling-rail → propagation path must refresh the file on its own.
+    // Recovery must remain an explicit action, even while the socket is open.
     const env = await setupAgentWithKeyFilePlugin('rail', {
       daemonEnv: { ZNVAULT_TEST_SUPPRESS_WS_TOPICS: 'apikeys' },
     });
@@ -186,17 +170,10 @@ describe('Managed Key Rotation Propagation', () => {
       const rightAfterRotate = readKeyFile(env.keyFilePath);
       expect(rightAfterRotate).toBe(env.initialKey);
 
-      // The renewal service's scheduled-refresh rail binds within ~60s
-      // (MIN_REFRESH_INTERVAL_MS) of daemon start, detects the rotation and —
-      // with the fix — propagates it to the plugin, which rewrites the file.
-      // Pre-fix this times out: the rail only reconnected the WebSocket.
-      // Note: with a 60s rotation interval the server's scheduled job may
-      // rotate again mid-wait, so assert "not the initial key" rather than a
-      // specific prefix.
-      await waitFor(() => {
-        const content = readKeyFile(env.keyFilePath);
-        return content !== null && content !== env.initialKey && content.startsWith('znv_');
-      }, 150000, 2000);
+      const synchronization = await fetch(`http://127.0.0.1:${env.daemon.healthPort}/synchronize`, {
+        method: 'POST', headers: env.agent.getControlPlaneHeaders(),
+      });
+      expect(synchronization.status).toBe(200);
 
       const finalKey = readKeyFile(env.keyFilePath);
       expect(finalKey).not.toBe(env.initialKey);
@@ -208,10 +185,9 @@ describe('Managed Key Rotation Propagation', () => {
     }
   }, 240000);
 
-  it('ROTATION-03: a tracked key that is NOT the agent`s own is refreshed via the polling rail when its WebSocket event is LOST', async () => {
+  it('ROTATION-03: explicit synchronization recovers a secondary tracked key without clobbering agent auth', async () => {
     // A second managed key consumed by the plugin (api-key: mapping) but not
-    // used for agent auth. The renewal service never binds it; only the
-    // TrackedKeyPoller can pick up its rotations when WS events are lost.
+    // used for agent auth. A manual synchronization reconciles both independently.
     const otherKey = await vault.createManagedApiKey({
       name: `rotation-prop-other-${Date.now()}`,
       permissions: ['secret:read:metadata'],
@@ -229,8 +205,7 @@ describe('Managed Key Rotation Propagation', () => {
       },
     });
     try {
-      // The poller's first poll dispatches a baseline keyRotated for the
-      // tracked key shortly after plugins start.
+      // The initial synchronization dispatches the baseline after plugin startup.
       await waitFor(() => {
         const log = readKeyFile(env.rotationLogPath);
         return log !== null && log.split('\n').includes(otherKey.name);
@@ -241,14 +216,13 @@ describe('Managed Key Rotation Propagation', () => {
         .filter((line) => line === otherKey.name).length;
       await vault.rotateManagedKey(otherKey.name, TEST_ENV.tenantId);
 
-      // WS events are suppressed; the poller's next bind (≤60s away) must
-      // detect the rotation and dispatch keyRotated again. Count dispatches
-      // without persisting any credential-derived fragment in the fixture.
-      await waitFor(() => {
-        const log = readKeyFile(env.rotationLogPath) ?? '';
-        return log.split('\n').filter((line) => line === otherKey.name).length
-          > dispatchCountBeforeRotation;
-      }, 150000, 2000);
+      const synchronization = await fetch(`http://127.0.0.1:${env.daemon.healthPort}/synchronize`, {
+        method: 'POST', headers: env.agent.getControlPlaneHeaders(),
+      });
+      expect(synchronization.status).toBe(200);
+      const dispatchCountAfterSynchronization = (readKeyFile(env.rotationLogPath) ?? '')
+        .split('\n').filter(line => line === otherKey.name).length;
+      expect(dispatchCountAfterSynchronization).toBeGreaterThan(dispatchCountBeforeRotation);
 
       // The agent's own key file must be untouched by the other key's
       // rotation (no credential clobber).

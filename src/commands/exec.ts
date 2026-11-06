@@ -20,14 +20,14 @@ import {
   type EnvFileMapping,
 } from '../lib/secret-env.js';
 import { createKeyRotationPropagator } from '../lib/key-rotation-propagation.js';
-import { TrackedKeyPoller } from '../services/managed-key/tracked-keys-poller.js';
+import { TrackedKeySynchronizer } from '../services/managed-key/tracked-keys.js';
 import { createUnifiedWebSocketClient, type ApiKeyRotationEvent, type SecretEvent } from '../lib/websocket.js';
-import { bindManagedApiKey, getSecret } from '../lib/api.js';
+import { getSecret } from '../lib/api.js';
 import { execLogger as log } from '../lib/logger.js';
 import {
   startManagedKeyRenewal,
   stopManagedKeyRenewal,
-  onKeyChanged as onManagedKeyChanged,
+  setManagedKeyBinder,
 } from '../services/managed-key-renewal.js';
 import type { ExecCommandOptions } from './types.js';
 
@@ -256,11 +256,8 @@ async function startWatchMode(
     apiKeyNames,
   }, 'Starting watch mode');
 
-  // Unified propagation of rotated keys to the env file (2026-07-05 incident
-  // fix): both detection channels — the WebSocket rotation event and the
-  // renewal service's polling rails — go through this one path, which
-  // serializes per key, deduplicates across channels, discards stale
-  // detections, and retries partial failures.
+  // Initial and real-event key observations share request ordering, persistence,
+  // environment delivery and the accepted-generation retry fence.
   const keyRotationPropagator = createKeyRotationPropagator({
     config: loadConfig(),
     getPluginLoader: () => null,
@@ -276,15 +273,10 @@ async function startWatchMode(
   // Start managed key renewal if in managed key mode
   if (isManagedKeyMode()) {
     log.info('Starting managed key renewal service');
-    // Rail-detected rotations (scheduled refresh, grace poll, heartbeat,
-    // reconnect) must update the env file just like the WebSocket rotation
-    // event handler below — otherwise a lost event leaves the output file
-    // stale until restart.
-    onManagedKeyChanged((newKey, meta) => {
-      const detectedAt = Date.now();
-      void keyRotationPropagator.propagate(newKey, meta, { detectedAt }).catch((err: unknown) => {
-        log.error({ err, keyName: meta.keyName }, 'Failed to propagate rail-detected key rotation');
-      });
+    setManagedKeyBinder(async (name, source, isCancelled) => {
+      const observation = await keyRotationPropagator.bindAndPropagate(name, source, { persist: true, isCancelled });
+      if (observation.propagation.errors.length > 0) log.error({ keyName: name }, 'Managed key consumer update incomplete');
+      return observation.response;
     });
     try {
       await startManagedKeyRenewal();
@@ -293,15 +285,13 @@ async function startWatchMode(
     }
   }
 
-  // Polling rail for tracked keys BEYOND the agent's own auth key: the
-  // renewal service above covers only config.managedKey.name; other
-  // `api-key:` mappings would otherwise depend solely on WebSocket events.
-  const trackedKeyPoller = new TrackedKeyPoller({
+  // One initial observation for secondary consumer keys; later changes use push.
+  const trackedKeySynchronizer = new TrackedKeySynchronizer({
     keyNames: apiKeyNames.filter((name) => name !== loadConfig().managedKey?.name),
-    propagate: (newKey, meta, opts) => keyRotationPropagator.propagate(newKey, meta, opts),
+    observeKey: (name, isCancelled) => keyRotationPropagator.bindAndPropagate(name, 'manual', { isCancelled }),
     isShuttingDown: () => isShuttingDown,
   });
-  trackedKeyPoller.start();
+  await trackedKeySynchronizer.synchronize().catch((err: unknown) => { log.error({ err }, 'Initial tracked key synchronization failed'); });
 
   // Create WebSocket client with subscriptions
   const wsClient = createUnifiedWebSocketClient(secretIds, apiKeyNames);
@@ -323,18 +313,11 @@ async function startWatchMode(
     }, 'API key rotation event received');
 
     try {
-      // Fetch the new key via bind, then propagate through the shared path
-      // (env-file update + currentEnv cache via onEnvVarUpdated; dedup with
-      // the rail callback above).
-      const bindResponse = await bindManagedApiKey(event.apiKeyName);
-      await keyRotationPropagator.propagate(bindResponse.key, {
-        keyName: event.apiKeyName,
-        newPrefix: event.newPrefix ?? bindResponse.prefix,
-        nextRotationAt: bindResponse.nextRotationAt,
-        graceExpiresAt: bindResponse.graceExpiresAt ?? event.graceExpiresAt,
-        rotationMode: bindResponse.rotationMode ?? event.rotationMode,
-        source: 'ws_event',
-      }, { detectedAt: Date.now() });
+      const observation = await keyRotationPropagator.bindAndPropagate(event.apiKeyName, 'ws_event', { persist: true });
+      if (observation.response && observation.propagation.propagated && loadConfig().managedKey?.name === event.apiKeyName && !isShuttingDown) {
+        wsClient.disconnect();
+        setTimeout(() => { if (!isShuttingDown) wsClient.connect(); }, 500);
+      }
     } catch (err) {
       log.error({ err, keyName: event.apiKeyName }, 'Failed to handle API key rotation');
       console.error(chalk.red('✗') + ` Failed to update API key ${event.apiKeyName}: ${err instanceof Error ? err.message : String(err)}`);
@@ -436,15 +419,19 @@ async function startWatchMode(
     })();
   });
 
+  let deliveryStale = false;
   // Handle connection events
   wsClient.onConnect((agentId) => {
     log.info({ agentId }, 'Connected to vault WebSocket');
-    console.log(chalk.green('✓') + ' Connected to vault (watching for changes)');
+    console.log(deliveryStale
+      ? chalk.yellow('⚠') + ' Connected; missed updates cannot be reconciled. Re-run this command explicitly to synchronize.'
+      : chalk.green('✓') + ' Connected to vault (watching for changes)');
   });
 
   wsClient.onDisconnect((reason) => {
     if (!isShuttingDown) {
-      log.warn({ reason }, 'Disconnected from vault WebSocket');
+      deliveryStale = true;
+      log.warn({ reason }, 'Disconnected from vault WebSocket; output remains stale until explicit synchronization');
       console.log(chalk.yellow('⚠') + ` Disconnected from vault: ${reason} (reconnecting...)`);
     }
   });
@@ -464,7 +451,7 @@ async function startWatchMode(
     console.log(chalk.blue('\nℹ') + ` Received ${signal}, shutting down...`);
 
     wsClient.disconnect();
-    trackedKeyPoller.stop();
+    trackedKeySynchronizer.stop();
 
     if (isManagedKeyMode()) {
       stopManagedKeyRenewal();

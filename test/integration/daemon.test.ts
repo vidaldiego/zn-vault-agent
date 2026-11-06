@@ -316,7 +316,7 @@ describe('Daemon Mode', () => {
       }
     });
 
-    it('DAEMON-06: should sync periodically based on poll interval', async () => {
+    it('DAEMON-06: keeps an unchanged target stable while idle', async () => {
       const outputPath = resolve(outputDir, 'poll-test.pem');
 
       await agent.addCertificate({
@@ -336,7 +336,7 @@ describe('Daemon Mode', () => {
 
       const initialContent = readFileSync(outputPath, 'utf-8');
 
-      // Wait for next poll cycle
+      // Wait finitely while idle; no refresh is required without a server event.
       await new Promise((r) => setTimeout(r, 3000));
 
       // File should still exist (re-synced or unchanged)

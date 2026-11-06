@@ -213,6 +213,7 @@ export interface AgentConfig {
   /** Global reload command (if not set per-target) */
   globalReloadCmd?: string;
   /** Polling interval in seconds (fallback if WebSocket disconnects) */
+  /** Legacy configuration accepted for compatibility; no polling is performed. */
   pollInterval?: number;
   /** Enable verbose logging */
   verbose?: boolean;

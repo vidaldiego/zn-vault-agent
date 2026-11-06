@@ -3,38 +3,6 @@
 
 import type { KeyRotationMeta, KeyRotationSource } from '../../lib/key-rotation-propagation.js';
 
-// ============================================================================
-// Configuration Constants
-// ============================================================================
-
-/** How early before rotation to refresh (30 seconds default) */
-export const DEFAULT_REFRESH_BEFORE_MS = 30 * 1000;
-
-/** Minimum refresh interval (don't refresh more than once per minute) */
-export const MIN_REFRESH_INTERVAL_MS = 60 * 1000;
-
-/** Fallback interval if no rotation time is known (5 minutes) */
-export const FALLBACK_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
-
-/** Grace period polling: poll at 50% of remaining grace time if no WS event */
-export const GRACE_PERIOD_POLL_RATIO = 0.5;
-
-/** Minimum grace period poll delay (10 seconds) */
-export const MIN_GRACE_POLL_DELAY_MS = 10 * 1000;
-
-/** Heartbeat freshness monitor interval (60 seconds) */
-export const HEARTBEAT_INTERVAL_MS = 60 * 1000;
-
-/** Connection recovery delay after reconnect (2 seconds) */
-export const RECONNECT_POLL_DELAY_MS = 2 * 1000;
-
-/** Maximum retry attempts for rotation handling */
-export const MAX_RETRY_ATTEMPTS = 5;
-
-// ============================================================================
-// Types
-// ============================================================================
-
 /** Rotation tracking state */
 export interface RotationTracking {
   /** When we last received a WS rotation event */

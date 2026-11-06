@@ -10,19 +10,20 @@ import {
   lstatSync,
   openSync,
   readFileSync,
-  unwatchFile,
-  watchFile,
+  watch,
+  type FSWatcher,
 } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import type { Server as HttpsServer } from 'node:https';
 import semver from 'semver';
 import { healthLogger as log } from './logger.js';
 import { exportMetrics } from './metrics.js';
 import { loadConfig, getTargets, isConfigured } from './config.js';
 import type { ChildProcessManager, ChildProcessState } from '../services/child-process-manager.js';
-import type { PluginLoader } from '../plugins/loader.js';
+import { PluginLifecycleError, type PluginLoader } from '../plugins/loader.js';
 import type { PluginHealthStatus } from '../plugins/types.js';
+import { getTLSManagerStatus } from '../services/tls-certificate-manager.js';
 import {
   PluginAutoUpdateService,
 } from '../services/plugin-auto-update.js';
@@ -90,6 +91,8 @@ export interface HealthStatus {
   };
   childProcess?: ChildProcessState;
   plugins?: PluginHealthStatus[];
+  delivery: { stale: boolean; recoveryAction: 'POST /synchronize' };
+  tls: ReturnType<typeof getTLSManagerStatus>;
 }
 
 // Track health state
@@ -98,6 +101,24 @@ let lastCertWsEvent: Date | null = null;
 let secretWsConnected = false;
 let lastSecretWsEvent: Date | null = null;
 let vaultReachable = false;
+let deliveryStale = false;
+let deliveryRevision = 0;
+let synchronizationHandler: (() => Promise<void>) | null = null;
+let synchronizationTask: Promise<void> | null = null;
+
+/** No server cursor is available: only an explicit full synchronization clears a gap. */
+export function setSynchronizationHandler(handler: (() => Promise<void>) | null): void {
+  synchronizationHandler = handler;
+  if (!handler) {
+    deliveryStale = false;
+    deliveryRevision++;
+  }
+}
+
+export function markEventDeliveryStale(): void {
+  deliveryStale = true;
+  deliveryRevision++;
+}
 let syncedCerts = 0;
 let certErrors = 0;
 let syncedSecrets = 0;
@@ -106,8 +127,8 @@ let pendingCertificateMutations = 0;
 let pendingSecretMutations = 0;
 let fastifyServer: FastifyInstance | null = null;
 let httpsServer: FastifyInstance | null = null;
-let tlsCertPath: string | null = null;
-let tlsKeyPath: string | null = null;
+const tlsFileWatchers: FSWatcher[] = [];
+let tlsReloadTimer: NodeJS.Timeout | null = null;
 let childProcessManager: ChildProcessManager | null = null;
 let pluginLoader: PluginLoader | null = null;
 let pluginAutoUpdateService: PluginAutoUpdateService | null = null;
@@ -119,6 +140,7 @@ let pluginRecoveryCode: HealthStatus['code'] | null = null;
  * Update WebSocket connection status for certificates
  */
 export function setWebSocketStatus(connected: boolean, eventTime?: Date): void {
+  if (!connected && certWsConnected) markEventDeliveryStale();
   certWsConnected = connected;
   if (eventTime) {
     lastCertWsEvent = eventTime;
@@ -129,6 +151,7 @@ export function setWebSocketStatus(connected: boolean, eventTime?: Date): void {
  * Update WebSocket connection status for secrets
  */
 export function setSecretWebSocketStatus(connected: boolean, eventTime?: Date): void {
+  if (!connected && secretWsConnected) markEventDeliveryStale();
   secretWsConnected = connected;
   if (eventTime) {
     lastSecretWsEvent = eventTime;
@@ -220,13 +243,16 @@ export async function getHealthStatus(): Promise<HealthStatus> {
   const secretTargets = config.secretTargets ?? [];
 
   let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
+  const tls = getTLSManagerStatus();
+  if (deliveryStale || (tls.tlsEnabled && (tls.renewalFailed || !tls.certExpiresAt || (tls.daysUntilExpiry ?? 0) <= 0))) status = 'degraded';
 
   // Determine overall status
   const hasTargets = targets.length > 0 || secretTargets.length > 0;
-  const wsConnected = (targets.length === 0 || certWsConnected) &&
-                      (secretTargets.length === 0 || secretWsConnected);
+  const hasRuntimeConsumers = (pluginLoader?.hasPlugins() ?? false) || synchronizationHandler !== null;
+  const wsConnected = (targets.length === 0 && !hasRuntimeConsumers || certWsConnected) &&
+                      (secretTargets.length === 0 && !hasRuntimeConsumers || secretWsConnected);
 
-  if (hasTargets && (!wsConnected || !vaultReachable)) {
+  if ((hasTargets || hasRuntimeConsumers) && (!wsConnected || !vaultReachable)) {
     status = 'degraded';
   }
   if (certErrors > 0 || secretErrors > 0) {
@@ -283,6 +309,8 @@ export async function getHealthStatus(): Promise<HealthStatus> {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     version: agentVersion,
+    delivery: { stale: deliveryStale, recoveryAction: 'POST /synchronize' },
+    tls,
     websocket: {
       certificates: {
         connected: certWsConnected,
@@ -561,9 +589,47 @@ function addHealthRoutes(
     }
   );
 
-  // Legacy Payara recovery exposes only monitoring plus the authenticated
-  // exact updater surface. Agent/scheduler/plugin mutation routes stay absent.
+  // Recovery exposes monitoring, exact updater and explicit authority sync.
+  // Generic agent/scheduler/plugin lifecycle mutations stay absent.
+  fastify.post('/synchronize', async (_request, reply) => {
+    const handler = synchronizationHandler;
+    if (!handler) return await reply.code(503).send({ error: 'SYNCHRONIZATION_UNAVAILABLE' });
+    if (!synchronizationTask) {
+      const revision = deliveryRevision;
+      const task = Promise.resolve().then(handler).then(() => {
+        if (deliveryRevision === revision && synchronizationHandler === handler) deliveryStale = false;
+      }).finally(() => {
+        if (synchronizationTask === task) synchronizationTask = null;
+      });
+      synchronizationTask = task;
+    }
+    try {
+      await synchronizationTask;
+      return await reply.send({ synchronized: true, stale: deliveryStale });
+    } catch (err) {
+      markEventDeliveryStale();
+      log.error({ err }, 'Explicit synchronization failed');
+      const restartRequired = err instanceof Error && 'code' in err && err.code === 'AGENT_RESTART_REQUIRED';
+      return await reply.code(restartRequired ? 409 : 503).send({
+        error: restartRequired ? 'AGENT_RESTART_REQUIRED' : 'SYNCHRONIZATION_FAILED', stale: true,
+      });
+    }
+  });
+
   if (recoveryOnly) return;
+
+  fastify.post<{ Params: { name: string } }>('/agent/plugins/:name/start', async (request, reply) => {
+    if (!pluginLoader) return await reply.code(503).send({ error: 'PLUGIN_LOADER_UNAVAILABLE' });
+    try {
+      await pluginLoader.startPlugin(request.params.name);
+      return await reply.send({ name: request.params.name, status: pluginLoader.getPluginStatus(request.params.name) });
+    } catch (err) {
+      const statusCode = err instanceof PluginLifecycleError
+        ? err.code === 'PLUGIN_NOT_FOUND' ? 404 : 409
+        : 503;
+      return await reply.code(statusCode).send({ error: err instanceof PluginLifecycleError ? err.code : 'PLUGIN_START_FAILED' });
+    }
+  });
 
   // Agent version check endpoint
   fastify.get('/agent/version', async (_request, reply) => {
@@ -855,8 +921,6 @@ export async function startHTTPSHealthServer(
     log.info({ port, host }, 'HTTPS health server started');
 
     // Set up certificate file watching for hot-reload
-    tlsCertPath = certPath;
-    tlsKeyPath = keyPath;
     if (!recoveryOnly) setupCertificateWatcher(certPath, keyPath);
 
     return candidate;
@@ -870,8 +934,6 @@ export async function startHTTPSHealthServer(
     if (httpsServer === candidate) {
       httpsServer = null;
     }
-    tlsCertPath = null;
-    tlsKeyPath = null;
     if (candidate) {
       try {
         await candidate.close();
@@ -944,9 +1006,20 @@ function setupCertificateWatcher(certPath: string, keyPath: string): void {
     }
   };
 
-  // Watch both cert and key files
-  watchFile(certPath, { interval: 1000 }, reloadCertificate);
-  watchFile(keyPath, { interval: 1000 }, reloadCertificate);
+  // Directory notifications survive atomic file replacement. Debounce only a
+  // real filesystem event; there is no stat-poll or fallback reload timer.
+  for (const directory of new Set([dirname(certPath), dirname(keyPath)])) {
+    const watcher = watch(directory, (_event, filename) => {
+      if (filename && ![basename(certPath), basename(keyPath)].includes(filename.toString())) return;
+      if (tlsReloadTimer) clearTimeout(tlsReloadTimer);
+      tlsReloadTimer = setTimeout(() => { tlsReloadTimer = null; void reloadCertificate(); }, 25);
+    });
+    watcher.on('error', (err) => {
+      markEventDeliveryStale();
+      log.error({ err }, 'TLS filesystem event delivery failed; explicit synchronization is required');
+    });
+    tlsFileWatchers.push(watcher);
+  }
 
   log.debug({ certPath, keyPath }, 'Certificate file watchers set up');
 }
@@ -997,18 +1070,12 @@ export async function stopHealthServer(): Promise<void> {
  * Stop the HTTPS health server
  */
 export async function stopHTTPSHealthServer(): Promise<void> {
-  // Clean up file watchers
-  if (tlsCertPath) {
-    unwatchFile(tlsCertPath);
-  }
-  if (tlsKeyPath) {
-    unwatchFile(tlsKeyPath);
-  }
+  for (const watcher of tlsFileWatchers.splice(0)) watcher.close();
+  if (tlsReloadTimer) clearTimeout(tlsReloadTimer);
+  tlsReloadTimer = null;
 
   const server = httpsServer;
   httpsServer = null;
-  tlsCertPath = null;
-  tlsKeyPath = null;
 
   if (!server) return;
 

@@ -2,35 +2,12 @@
 // Unified propagation of a rotated managed API key to ALL consumers
 
 /**
- * Single propagation path for a rotated managed API key.
- *
- * Background (2026-07-05 production incident): the agent had TWO ways to learn
- * about a managed-key rotation — the live WebSocket `apikey.rotated` event and
- * the renewal service's polling safety rails (scheduled refresh, grace poll,
- * heartbeat, reconnect). Only the WebSocket path propagated the new key to
- * consumers (plugin `keyRotated` dispatch, exec env-file update, live config
- * mutation). Rail-detected rotations updated the agent's own credentials and
- * reconnected the WebSocket — nothing else. When the WebSocket event was lost,
- * plugin-deployed key files (e.g. the payara plugin's
- * /var/lib/zn-vault-agent/secrets/ZINC_CONFIG_VAULT_API_KEY) stayed stale
- * until the agent was restarted, while sync logs reported success.
- *
- * This module is the one path both detection channels go through, so any
- * detection — push or poll — refreshes every consumer within one cycle.
- *
- * Concurrency model: both channels routinely fire for the same rotation (the
- * dispatcher notifies the renewal service AND runs the WebSocket handler), so
- * propagations are SERIALIZED per key name and deduplicated inside the
- * critical section:
- * - per-key value dedup: the last FULLY-successful propagated value is
- *   remembered; repeats are skipped. A partially-failed propagation (e.g. a
- *   plugin threw) is not recorded and is retried by an internal bounded
- *   retry timer — the polling rails cannot re-detect the same rotation
- *   (the renewal service's currentKey has already advanced).
- * - monotonicity: each propagation carries the time its bind RESOLVED
- *   (detectedAt); an older detection can never overwrite the result of a
- *   newer one (a slow, stale bind response must not revert consumers to a
- *   soon-revoked key).
+ * Initial, real-event and explicit managed-key observations share one coordinator.
+ * Reserve per-key request ordering before awaiting an authoritative bind. Inside
+ * the serialized consumer chain, reject superseded responses before touching
+ * live auth, persistent auth, plugin keys or exec environment files. Failed reads
+ * do not advance accepted authority. Known-generation application retries keep
+ * their original observation ID and cannot regain authority after a newer key.
  */
 
 import type { AgentConfig } from './config.js';
@@ -43,6 +20,7 @@ import type {
   PluginEventMap,
 } from '../plugins/types.js';
 import { createLogger } from './logger.js';
+import { bindManagedApiKey, type ManagedApiKeyBindResponse } from './api.js';
 
 /** Where a rotation was detected (mirrors the renewal service's RefreshSource). */
 export type KeyRotationSource =
@@ -83,6 +61,8 @@ export const PROPAGATION_RETRY_DELAY_MS = 30 * 1000;
 export const MAX_PROPAGATION_RETRIES = 5;
 
 export interface KeyRotationPropagatorDeps {
+  /** Authoritative read boundary; request ordering is reserved before awaiting it. */
+  bindManagedKey?: (name: string) => Promise<ManagedApiKeyBindResponse>;
   /**
    * The LIVE config object created at daemon startup — the same object plugins
    * read through ctx.config. Mutating it (not a loadConfig() copy) is what
@@ -99,6 +79,8 @@ export interface KeyRotationPropagatorDeps {
   onEnvVarUpdated?: (envVar: string, value: string) => void;
   /** Restart the child process after propagation (combined mode, restartOnChange). */
   restartChild?: (reason: string) => Promise<void>;
+  /** Stage pre-start changes without awaiting a child which has not been admitted. */
+  prepareChildRestart?: (reason: string) => Promise<{ consumerReady?: Promise<void> } | void>;
   /** Shutdown probe — suppresses propagation and retries during shutdown. */
   isShuttingDown?: () => boolean;
   /** Persist hook — defaults to updateManagedKey (injectable for tests). */
@@ -128,6 +110,11 @@ export interface PropagationResult {
 }
 
 export interface KeyRotationPropagator {
+  bindAndPropagate(
+    keyName: string,
+    source: KeyRotationSource,
+    options?: { persist?: boolean; isCancelled?: () => boolean; onStaged?: () => void }
+  ): Promise<KeyBindingObservation>;
   /**
    * Propagate a rotated key value to all consumers.
    *
@@ -140,8 +127,8 @@ export interface KeyRotationPropagator {
    * @param opts.persist - Also persist to config file/env (the WebSocket path
    *   persists here; the renewal-service path has already persisted before
    *   invoking the propagator and passes nothing)
-   * @param opts.detectedAt - When the bind carrying this value resolved
-   *   (defaults to now); used for the monotonicity guard
+   * @param opts.detectedAt - Legacy ordering for an already-bound value. New
+   *   reads must use bindAndPropagate so arrival time cannot grant authority.
    */
   propagate(
     newKey: string,
@@ -152,11 +139,54 @@ export interface KeyRotationPropagator {
   stop(): void;
 }
 
+export interface KeyBindingObservation {
+  /** Superseded/cancelled responses never leave the coordinator with authority. */
+  response: ManagedApiKeyBindResponse | null;
+  propagation: PropagationResult;
+}
+
+export interface KeyPreparation<Result> {
+  prepared: Promise<void>;
+  completed: Promise<Result>;
+}
+
+export function prepareKeyObservation<Result>(
+  operation: (onStaged: () => void) => Promise<Result>
+): KeyPreparation<Result> {
+  let resolvePrepared!: () => void;
+  let rejectPrepared!: (error: unknown) => void;
+  const prepared = new Promise<void>((resolve, reject) => { resolvePrepared = resolve; rejectPrepared = reject; });
+  const completed = operation(resolvePrepared).then(result => { resolvePrepared(); return result; }, (error: unknown) => { rejectPrepared(error); throw error; });
+  // Startup explicitly owns and joins completed later; an earlier failure must
+  // remain handled while its caller is still waiting for preparation.
+  void prepared.catch(() => undefined);
+  void completed.catch(() => undefined);
+  return { prepared, completed };
+}
+
+interface StagedPropagationResult extends PropagationResult {
+  /** Present only when this preparation is covered by a not-yet-admitted child. */
+  consumerReady?: Promise<void>;
+}
+
+interface OrderedPropagationOptions {
+  persist?: boolean;
+  detectedAt: number;
+  observationId: number;
+  isCancelled?: () => boolean;
+  useTimestampFence?: boolean;
+  onStaged?: () => void;
+}
+
 interface KeyPropagationState {
   /** Last FULLY-successfully propagated value for this key. */
   lastPropagatedValue: string | null;
   /** detectedAt of the newest propagation attempt (success or failure). */
   lastDetectedAt: number;
+  /** Latest read/event admitted, assigned before its asynchronous boundary. */
+  observationId: number;
+  /** Latest authoritative response admitted before consumer mutation. */
+  acceptedObservationId: number;
   /** Serialization chain — propagations for the same key run one at a time. */
   chain: Promise<unknown>;
   /** Pending retry timer for a partially-failed propagation. */
@@ -178,6 +208,7 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
   const retryDelayMs = deps.retryDelayMs ?? PROPAGATION_RETRY_DELAY_MS;
 
   const states = new Map<string, KeyPropagationState>();
+  let stopped = false;
 
   function getState(keyName: string): KeyPropagationState {
     let state = states.get(keyName);
@@ -188,6 +219,8 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
         lastPropagatedValue:
           deps.config.managedKey?.name === keyName ? (deps.config.auth.apiKey ?? null) : null,
         lastDetectedAt: 0,
+        observationId: 0,
+        acceptedObservationId: 0,
         chain: Promise.resolve(),
         retryTimer: null,
         retryAttempts: 0,
@@ -208,9 +241,9 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
     state: KeyPropagationState,
     newKey: string,
     meta: KeyRotationMeta,
-    opts: { persist?: boolean; detectedAt: number }
+    opts: OrderedPropagationOptions
   ): void {
-    if (deps.isShuttingDown?.()) return;
+    if (stopped || deps.isShuttingDown?.()) return;
     if (state.retryAttempts >= MAX_PROPAGATION_RETRIES) {
       log.error({
         keyName: meta.keyName,
@@ -228,7 +261,7 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
     const timer = setTimeout(() => {
       state.retryTimer = null;
       log.info({ keyName: meta.keyName, attempt }, 'Retrying key rotation propagation');
-      void propagate(newKey, meta, opts);
+      void enqueuePropagation(state, newKey, meta, opts);
     }, retryDelayMs);
     timer.unref?.();
     state.retryTimer = timer;
@@ -243,16 +276,16 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
     state: KeyPropagationState,
     newKey: string,
     meta: KeyRotationMeta,
-    opts?: { persist?: boolean; detectedAt?: number }
-  ): Promise<PropagationResult> {
-    const detectedAt = opts?.detectedAt ?? Date.now();
+    opts: OrderedPropagationOptions
+  ): Promise<StagedPropagationResult> {
+    const detectedAt = opts.detectedAt;
 
-    if (deps.isShuttingDown?.()) {
+    if (stopped || deps.isShuttingDown?.() || opts.isCancelled?.()) {
       return { propagated: false, skipped: 'shutting_down', pluginsNotified: 0, envVarsUpdated: [], errors: [] };
     }
 
     // Monotonicity: an older detection must never overwrite a newer one.
-    if (detectedAt < state.lastDetectedAt) {
+    if (opts.observationId < state.acceptedObservationId || (opts.useTimestampFence === true && detectedAt < state.lastDetectedAt)) {
       log.warn({
         keyName: meta.keyName,
         source: meta.source,
@@ -262,7 +295,12 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
       return { propagated: false, skipped: 'stale', pluginsNotified: 0, envVarsUpdated: [], errors: [] };
     }
 
-    if (newKey === state.lastPropagatedValue) {
+    // This synchronous admission is the CAS boundary. A failed/cancelled read
+    // never advances it, and an accepted newer response fences older reads and
+    // their retained retries before live auth, persistence or consumer writes.
+    state.acceptedObservationId = opts.observationId;
+
+    if (newKey === state.lastPropagatedValue && !opts.persist) {
       state.lastDetectedAt = detectedAt;
       log.debug({
         keyName: meta.keyName,
@@ -271,7 +309,6 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
       return { propagated: false, skipped: 'duplicate', pluginsNotified: 0, envVarsUpdated: [], errors: [] };
     }
 
-    const startTime = Date.now();
     // Keep the legacy plugin-event field without ever deriving it from the
     // credential locally. The server supplies it on every supported path.
     const newPrefix = meta.newPrefix || '[REDACTED]';
@@ -303,6 +340,12 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
           rotationMode: meta.rotationMode,
         });
       }
+    }
+
+    if (newKey === state.lastPropagatedValue) {
+      // A fresh accepted bind may update rotation metadata/file receipts even
+      // when its credential is unchanged. Consumer delivery stays deduplicated.
+      return { propagated: false, skipped: 'duplicate', pluginsNotified: 0, envVarsUpdated: [], errors: [] };
     }
 
     // 3. Dispatch keyRotated to plugins (e.g. payara rewrites its API key file).
@@ -367,39 +410,51 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
       }
     }
 
-    // 5. Restart child process if configured (combined mode restartOnChange).
-    if (deps.restartChild) {
-      try {
-        await deps.restartChild(`managed API key '${meta.keyName}' rotated`);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        errors.push(`child restart failed: ${message}`);
-        log.error({ err, keyName: meta.keyName }, 'Failed to restart child process after key rotation');
+    let consumerReady: Promise<void> | undefined;
+    try {
+      const reason = `managed API key '${meta.keyName}' rotated`;
+      if (deps.prepareChildRestart) {
+        consumerReady = (await deps.prepareChildRestart(reason))?.consumerReady;
+        if (consumerReady) void consumerReady.catch(() => undefined);
+      } else if (deps.restartChild) {
+        await deps.restartChild(reason);
       }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      errors.push(`child restart failed: ${message}`);
+      log.error({ err, keyName: meta.keyName }, 'Failed to restart child process after key rotation');
     }
+    return { propagated: true, pluginsNotified, envVarsUpdated, errors, ...(consumerReady ? { consumerReady } : {}) };
+  }
 
-    // Record only fully-successful propagations; retry the rest ourselves —
-    // no detection channel will re-fire for this rotation.
-    if (errors.length === 0) {
+  function finishPropagation(
+    state: KeyPropagationState,
+    newKey: string,
+    meta: KeyRotationMeta,
+    opts: OrderedPropagationOptions,
+    result: PropagationResult
+  ): PropagationResult {
+    if (!result.propagated) return result;
+    if (stopped || deps.isShuttingDown?.() || opts.isCancelled?.()) {
+      return { ...result, propagated: false, skipped: 'shutting_down' };
+    }
+    if (opts.observationId < state.acceptedObservationId) {
+      return { ...result, propagated: false, skipped: 'stale' };
+    }
+    if (result.errors.length === 0) {
       state.lastPropagatedValue = newKey;
       state.retryAttempts = 0;
       clearRetry(state);
     } else {
-      scheduleRetry(state, newKey, meta, { persist: opts?.persist, detectedAt });
+      scheduleRetry(state, newKey, meta, opts);
     }
-
-    log.info({
-      keyName: meta.keyName,
-      source: meta.source,
-      pluginsNotified,
-      envVarsUpdated,
-      errors: errors.length > 0 ? errors : undefined,
-      durationMs: Date.now() - startTime,
-    }, errors.length === 0
+    log.info({ keyName: meta.keyName, source: meta.source,
+      pluginsNotified: result.pluginsNotified, envVarsUpdated: result.envVarsUpdated,
+      errors: result.errors.length > 0 ? result.errors : undefined,
+    }, result.errors.length === 0
       ? 'Managed key rotation propagated to consumers'
       : 'Managed key rotation propagated with errors - retry scheduled');
-
-    return { propagated: true, pluginsNotified, envVarsUpdated, errors };
+    return result;
   }
 
   async function propagate(
@@ -411,22 +466,70 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
     // serialization chain does not make an older detection look newer.
     const detectedAt = opts?.detectedAt ?? Date.now();
     const state = getState(meta.keyName);
+    if (detectedAt < state.lastDetectedAt) {
+      return { propagated: false, skipped: 'stale', pluginsNotified: 0, envVarsUpdated: [], errors: [] };
+    }
+    return enqueuePropagation(state, newKey, meta, { ...opts, detectedAt, observationId: ++state.observationId, useTimestampFence: true });
+  }
 
-    // Serialize per key: both detection channels routinely fire for the same
-    // rotation; without this, two concurrent propagations pass the dedup
-    // check together and double-dispatch plugins / double-restart the child.
-    const run = state.chain.then(() => runPropagation(state, newKey, meta, { ...opts, detectedAt }));
-    // Keep the chain alive regardless of outcome (runPropagation contains its
-    // own error handling and never rejects in practice; be defensive anyway).
-    state.chain = run.catch(() => undefined);
-    return run;
+  function enqueuePropagation(
+    state: KeyPropagationState,
+    newKey: string,
+    meta: KeyRotationMeta,
+    opts: OrderedPropagationOptions
+  ): Promise<PropagationResult> {
+
+    const prepared = state.chain.then(async () => {
+      const result = await runPropagation(state, newKey, meta, opts);
+      if (!result.consumerReady) return finishPropagation(state, newKey, meta, opts, result);
+      return result;
+    });
+    // Initial-child acknowledgement must not hold the preparation chain: a
+    // genuine early event may precede an initializer for the very same key.
+    state.chain = prepared.catch(() => undefined);
+    return prepared.then(async staged => {
+      const { consumerReady, ...result } = staged as StagedPropagationResult;
+      opts.onStaged?.();
+      if (!result.propagated || !consumerReady) return result;
+      try { await consumerReady; }
+      catch (error) {
+        result.errors.push(`initial child acknowledgement failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      const completed = state.chain.then(() => finishPropagation(state, newKey, meta, opts, result));
+      state.chain = completed.catch(() => undefined);
+      return completed;
+    });
+  }
+
+  async function bindAndPropagate(
+    keyName: string,
+    source: KeyRotationSource,
+    options?: { persist?: boolean; isCancelled?: () => boolean; onStaged?: () => void }
+  ): Promise<KeyBindingObservation> {
+    const state = getState(keyName);
+    const observationId = ++state.observationId;
+    const detectedAt = Date.now();
+    if (stopped || deps.isShuttingDown?.() || options?.isCancelled?.()) {
+      return { response: null, propagation: { propagated: false, skipped: 'shutting_down', pluginsNotified: 0, envVarsUpdated: [], errors: [] } };
+    }
+    const response = await (deps.bindManagedKey ?? bindManagedApiKey)(keyName);
+    const propagation = await enqueuePropagation(state, response.key, {
+      keyName, source, newPrefix: response.prefix,
+      nextRotationAt: response.nextRotationAt, graceExpiresAt: response.graceExpiresAt,
+      rotationMode: response.rotationMode,
+    }, { ...options, detectedAt, observationId });
+    return {
+      response: propagation.skipped === 'stale' || propagation.skipped === 'shutting_down' ? null : response,
+      propagation,
+    };
   }
 
   function stop(): void {
+    stopped = true;
     for (const state of states.values()) {
       clearRetry(state);
     }
   }
 
-  return { propagate, stop };
+  return { propagate, bindAndPropagate, stop };
 }

@@ -297,9 +297,9 @@ export function publishSelfUpdateTriggerAtomically(
 }
 
 export class NpmAutoUpdateService {
-  private checkInterval: NodeJS.Timeout | null = null;
   private initialCheckTimeout: NodeJS.Timeout | null = null;
   private stagedRolloutTimeout: NodeJS.Timeout | null = null;
+  private stopped = false;
   private readonly config: UpdateConfig;
   private readonly triggerFile: string;
   private readonly stateDir: string;
@@ -318,9 +318,10 @@ export class NpmAutoUpdateService {
 
   /**
    * Start the auto-update service.
-   * Performs initial check after 1 minute, then checks periodically.
+   * Performs one initial check after 1 minute. Later discovery is explicit.
    */
   start(): void {
+    this.stopped = false;
     if (!this.config.enabled) {
       logger.debug('Auto-update disabled');
       return;
@@ -342,26 +343,16 @@ export class NpmAutoUpdateService {
         logger.error({ err }, 'Initial auto-update check failed');
       });
     }, 60_000);
-
-    // Then check periodically
-    this.checkInterval = setInterval(() => {
-      this.checkAndUpdate().catch((err: unknown) => {
-        logger.error({ err }, 'Auto-update check failed');
-      });
-    }, this.config.checkIntervalMs);
   }
 
   /**
    * Stop the auto-update service.
    */
   stop(): void {
+    this.stopped = true;
     if (this.initialCheckTimeout) {
       clearTimeout(this.initialCheckTimeout);
       this.initialCheckTimeout = null;
-    }
-    if (this.checkInterval) {
-      clearInterval(this.checkInterval);
-      this.checkInterval = null;
     }
     if (this.stagedRolloutTimeout) {
       clearTimeout(this.stagedRolloutTimeout);
@@ -707,7 +698,9 @@ export class NpmAutoUpdateService {
    */
   private async checkAndUpdate(): Promise<void> {
     try {
+      if (this.stopped) return;
       const info = await this.checkForUpdates();
+      if (this.stopped) return;
 
       if (!info.updateAvailable) {
         logger.debug({ current: info.current, latest: info.latest }, 'No update available');
@@ -724,13 +717,13 @@ export class NpmAutoUpdateService {
         const delay = this.calculateStagedDelay();
         logger.info({ delaySeconds: Math.round(delay / 1000) }, 'Staged rollout delay');
         await this.sleep(delay);
-
-        // Re-check after delay - another agent may have updated
-        const recheck = await this.checkForUpdates();
-        if (!recheck.updateAvailable) {
-          logger.info('Update no longer needed after staged delay');
-          return;
-        }
+      }
+      if (this.stopped) return;
+      // Validate the known candidate against local installation state without
+      // discovering a different registry target after the staging timer.
+      if (this.getCurrentVersion() !== info.current) {
+        logger.info('Installed version changed during staging; explicit update discovery is required');
+        return;
       }
 
       if (!this.isRoot()) {
@@ -744,7 +737,7 @@ export class NpmAutoUpdateService {
               targetVersion: accepted.targetVersion,
               finishedAt: accepted.finishedAt,
             },
-            'Periodic Agent update replayed a durable terminal receipt'
+            'Initial Agent update replayed a durable terminal receipt'
           );
           return;
         }
@@ -755,7 +748,7 @@ export class NpmAutoUpdateService {
             targetVersion: accepted.targetVersion,
             pollPath: accepted.pollPath,
           },
-          'Periodic Agent update accepted by durable root-owned rail'
+          'Initial Agent update accepted by durable root-owned rail'
         );
         return;
       }

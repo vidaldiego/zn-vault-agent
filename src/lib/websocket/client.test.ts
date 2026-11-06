@@ -107,7 +107,7 @@ const hoisted = vi.hoisted(() => {
     }
   }
 
-  const state = { instances: [] as InstanceType<typeof FakeWebSocket>[] };
+  const state = { instances: [] as InstanceType<typeof FakeWebSocket>[], staleConnection: undefined as (() => void) | undefined };
 
   return { FakeWebSocket, state };
 });
@@ -178,10 +178,11 @@ vi.mock('../../plugins/loader.js', () => ({
   getPluginLoader: () => null,
 }));
 
-// Heartbeat is irrelevant to these tests and its 15s ping interval would
-// otherwise fire while we advance fake timers past 30s.
+// Drive stale-heartbeat callbacks explicitly; real ping timers would otherwise
+// fire while reconnect tests advance fake time past 30 seconds.
 vi.mock('./heartbeat.js', () => ({
   HeartbeatManager: class {
+    constructor(options: { onStaleConnection: () => void }) { hoisted.state.staleConnection = options.onStaleConnection; }
     start(): void { /* no-op */ }
     stop(): void { /* no-op */ }
     onPongReceived(): void { /* no-op */ }
@@ -189,10 +190,11 @@ vi.mock('./heartbeat.js', () => ({
 }));
 
 import { createUnifiedWebSocketClient, setShuttingDown } from './client.js';
-import { onWebSocketAuthFailure } from '../../services/managed-key-renewal.js';
+import { onWebSocketAuthFailure, onWebSocketReconnect } from '../../services/managed-key-renewal.js';
 import { WS_CONSTANTS } from './types.js';
 import { setSecretWebSocketStatus, setWebSocketStatus } from '../health.js';
 import { metrics } from '../metrics.js';
+import { setWebSocket as setDynamicSecretSocket } from '../../services/dynamic-secrets/index.js';
 import { wsLogger } from '../logger.js';
 
 const { state } = hoisted;
@@ -230,6 +232,47 @@ describe('Unified WebSocket client reconnect behaviour', () => {
     setShuttingDown(true); // stop any pending reconnect loops
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it('publishes a lost delivery channel before a heartbeat reconnect can open', async () => {
+    const client = createUnifiedWebSocketClient([], ['tracked-key']);
+    let stale = false;
+    const disconnected = vi.fn(() => { stale = true; });
+    client.onDisconnect(disconnected);
+    client.connect();
+    const oldSocket = lastSocket();
+    oldSocket.simulateOpen();
+    oldSocket.simulateMessage({ type: 'connection_established', agentId: 'agent-ack' });
+    expect(setWebSocketStatus).toHaveBeenLastCalledWith(true, expect.any(Date));
+    state.staleConnection!();
+    expect(setWebSocketStatus).toHaveBeenLastCalledWith(false);
+    expect(setSecretWebSocketStatus).toHaveBeenLastCalledWith(false);
+    expect(setDynamicSecretSocket).toHaveBeenLastCalledWith(null);
+    expect(metrics.wsDisconnected).toHaveBeenCalledOnce();
+    expect(disconnected).toHaveBeenCalledExactlyOnceWith('pong_timeout');
+    expect(stale).toBe(true);
+    expect(client.isConnected()).toBe(false);
+    await expectReconnectAfter(500);
+    expect(lastSocket().readyState).toBe(hoisted.FakeWebSocket.CONNECTING);
+    expect(setWebSocketStatus).toHaveBeenLastCalledWith(false);
+    lastSocket().simulateOpen();
+    lastSocket().simulateMessage({ type: 'registered', agentId: 'replacement' });
+    expect(stale).toBe(true);
+    expect(disconnected).toHaveBeenCalledOnce();
+    expect(onWebSocketReconnect).not.toHaveBeenCalled();
+    client.disconnect();
+  });
+
+  it('reestablishes transport without blind key discovery on reconnect', async () => {
+    const client = createUnifiedWebSocketClient([], ['tracked-key']);
+    client.connect();
+    lastSocket().simulateOpen();
+    lastSocket().simulateServerClose(1006);
+    await expectReconnectAfter(500);
+    lastSocket().simulateOpen();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(onWebSocketReconnect).not.toHaveBeenCalled();
+    client.disconnect();
   });
 
   it('test_should_not_reset_attempts_when_close_code_is_4001', async () => {

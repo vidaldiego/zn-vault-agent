@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   resolvePayaraRecoveryStartup,
-  startPostUpdateAuthorityRetry,
+  createPostUpdateAuthorityRecovery,
   startRecoveryControlPlaneTransaction,
 } from './websocket.js';
 
@@ -119,51 +119,32 @@ describe('Payara recovery phase validation', () => {
   });
 });
 
-describe('Payara post-update authority retry', () => {
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it('stays live across failed probes and requests one restart after full authority returns', async () => {
+describe('Payara post-update explicit authority recovery', () => {
+  afterEach(() => { vi.useRealTimers(); });
+  it('never probes authority from elapsed time and restarts only after an explicit successful action', async () => {
     vi.useFakeTimers();
-    const probe = vi.fn()
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(true);
+    const probe = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     const requestRestart = vi.fn();
-    const stop = startPostUpdateAuthorityRetry({
-      probe,
-      requestRestart,
-      retryMs: 30_000,
-    });
-
-    await vi.advanceTimersByTimeAsync(29_999);
-    expect(probe).not.toHaveBeenCalled();
-    expect(requestRestart).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(1);
-    expect(probe).toHaveBeenCalledTimes(1);
-    expect(requestRestart).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(probe).toHaveBeenCalledTimes(2);
-    expect(requestRestart).toHaveBeenCalledOnce();
-
+    const recovery = createPostUpdateAuthorityRecovery({ probe, requestRestart });
     await vi.advanceTimersByTimeAsync(120_000);
+    expect(probe).not.toHaveBeenCalled();
+    await expect(recovery.synchronize()).rejects.toThrow('unavailable');
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(probe).toHaveBeenCalledTimes(1);
+    await recovery.synchronize();
+    await recovery.synchronize();
     expect(probe).toHaveBeenCalledTimes(2);
     expect(requestRestart).toHaveBeenCalledOnce();
-    stop();
   });
-
-  it('cancels a scheduled probe without requesting restart', async () => {
-    vi.useFakeTimers();
-    const probe = vi.fn().mockResolvedValue(true);
+  it('does not request a restart after shutdown wins an in-flight authority read', async () => {
+    let resolve!: (ready: boolean) => void;
+    const probe = () => new Promise<boolean>(done => { resolve = done; });
     const requestRestart = vi.fn();
-    const stop = startPostUpdateAuthorityRetry({ probe, requestRestart, retryMs: 30_000 });
-
-    stop();
-    await vi.advanceTimersByTimeAsync(60_000);
-
-    expect(probe).not.toHaveBeenCalled();
+    const recovery = createPostUpdateAuthorityRecovery({ probe, requestRestart });
+    const task = recovery.synchronize();
+    recovery.stop();
+    resolve(true);
+    await expect(task).rejects.toThrow('stopped');
     expect(requestRestart).not.toHaveBeenCalled();
   });
 });

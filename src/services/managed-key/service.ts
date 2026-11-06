@@ -10,7 +10,6 @@ import {
   incCounter,
   setGauge,
 } from '../../lib/metrics.js';
-import { ManagedTimer } from '../../utils/timer.js';
 
 import {
   type RotationTracking,
@@ -19,35 +18,29 @@ import {
   type KeyChangeMeta,
   createInitialRotationTracking,
   resetRotationTracking,
-  RECONNECT_POLL_DELAY_MS,
-  MAX_RETRY_ATTEMPTS,
 } from './types.js';
-import { calculateNextRefreshMs } from './scheduler.js';
-import {
-  GracePeriodPoller,
-  HeartbeatMonitor,
-  RotationRetryHandler,
-  updateGraceMetrics,
-} from './safety-rails.js';
-
 const log = createLogger({ module: 'managed-key-renewal' });
 
 // ============================================================================
 // State Management
 // ============================================================================
 
-const refreshTimer = new ManagedTimer();
 let isRunning = false;
+let serviceGeneration = 0;
 let currentKey: string | null = null;
 let staleKeyDetected = false;
 let onKeyChangedCallback: ((newKey: string, meta: KeyChangeMeta) => void) | null = null;
 
 const rotationTracking: RotationTracking = createInitialRotationTracking();
 
-// Safety rail instances (initialized on start)
-let gracePeriodPoller: GracePeriodPoller | null = null;
-let heartbeatMonitor: HeartbeatMonitor | null = null;
-let rotationRetryHandler: RotationRetryHandler | null = null;
+let lastRejectedCredential: string | null = null;
+type CoordinatedKeyBinder = (name: string, source: RefreshSource, isCancelled: () => boolean) => Promise<ManagedApiKeyBindResponse | null>;
+let coordinatedKeyBinder: CoordinatedKeyBinder | null = null;
+
+/** Runtime binds must share the consumer coordinator before any persistence. */
+export function setManagedKeyBinder(binder: CoordinatedKeyBinder): void {
+  coordinatedKeyBinder = binder;
+}
 
 // ============================================================================
 // Metrics Registration
@@ -62,10 +55,7 @@ function registerRotationMetrics(): void {
   // Counters
   registerCounter('znvault_agent_managed_key_rotations_total', 'Total managed key rotations detected');
   registerCounter('znvault_agent_managed_key_ws_events_total', 'Total WebSocket rotation events received');
-  registerCounter('znvault_agent_managed_key_poll_fallbacks_total', 'Total rotations detected via polling (WS missed)');
   registerCounter('znvault_agent_managed_key_refresh_failures_total', 'Total key refresh failures');
-  registerCounter('znvault_agent_managed_key_grace_polls_total', 'Total grace period safety polls');
-  registerCounter('znvault_agent_managed_key_heartbeat_checks_total', 'Total heartbeat freshness checks');
 
   // Gauges
   registerGauge('znvault_agent_managed_key_stale', 'Whether a stale key has been detected (1=stale, 0=fresh)');
@@ -99,7 +89,7 @@ export function onKeyChanged(callback: (newKey: string, meta: KeyChangeMeta) => 
  * @param source - The trigger source for logging/metrics
  */
 async function refreshManagedKey(
-  source: RefreshSource = 'scheduled'
+  source: RefreshSource = 'manual'
 ): Promise<ManagedApiKeyBindResponse | null> {
   const config = loadConfig();
 
@@ -113,10 +103,15 @@ async function refreshManagedKey(
     return null;
   }
 
+  const generation = serviceGeneration;
   try {
     log.debug({ name: config.managedKey.name, source }, 'Binding to managed key');
 
-    const bindResponse = await bindManagedApiKey(config.managedKey.name);
+    const binder = coordinatedKeyBinder;
+    const bindResponse = binder
+      ? await binder(config.managedKey.name, source, () => generation !== serviceGeneration)
+      : await bindManagedApiKey(config.managedKey.name);
+    if (!bindResponse || generation !== serviceGeneration) return null;
 
     const oldKey = currentKey;
     currentKey = bindResponse.key;
@@ -128,15 +123,17 @@ async function refreshManagedKey(
     }
     if (bindResponse.graceExpiresAt) {
       rotationTracking.graceExpiresAt = new Date(bindResponse.graceExpiresAt).getTime();
-      updateGraceMetrics(rotationTracking.graceExpiresAt);
+      setGauge('znvault_agent_managed_key_grace_remaining_seconds', Math.max(0, (rotationTracking.graceExpiresAt - Date.now()) / 1000));
     }
 
     // Update config with new key and metadata
-    updateManagedKey(bindResponse.key, {
-      nextRotationAt: bindResponse.nextRotationAt,
-      graceExpiresAt: bindResponse.graceExpiresAt,
-      rotationMode: bindResponse.rotationMode,
-    });
+    if (!binder) {
+      updateManagedKey(bindResponse.key, {
+        nextRotationAt: bindResponse.nextRotationAt,
+        graceExpiresAt: bindResponse.graceExpiresAt,
+        rotationMode: bindResponse.rotationMode,
+      });
+    }
 
     // Detect rotation
     if (oldKey && oldKey !== bindResponse.key) {
@@ -150,7 +147,7 @@ async function refreshManagedKey(
 
     return bindResponse;
   } catch (err) {
-    return handleRefreshError(err, source);
+    return generation === serviceGeneration ? handleRefreshError(err, source) : null;
   }
 }
 
@@ -159,7 +156,6 @@ function handleRotationDetected(
   source: RefreshSource
 ): void {
   const wasWsTriggered = source === 'ws_event';
-  const wasPollTriggered = source === 'grace_poll' || source === 'reconnect' || source === 'heartbeat';
 
   log.info({
     nextRotationAt: bindResponse.nextRotationAt,
@@ -172,16 +168,6 @@ function handleRotationDetected(
   setGauge('znvault_agent_managed_key_last_rotation_timestamp', Date.now() / 1000);
   setGauge('znvault_agent_managed_key_stale', 0);
   staleKeyDetected = false;
-
-  // Track if we detected rotation via polling (WS missed)
-  if (wasPollTriggered && !rotationTracking.wsEventReceived) {
-    rotationTracking.missedRotations++;
-    incCounter('znvault_agent_managed_key_poll_fallbacks_total', { source });
-    log.warn({
-      source,
-      missedRotations: rotationTracking.missedRotations,
-    }, 'Rotation detected via polling - WebSocket event may have been missed');
-  }
 
   // Reset WS event tracking for next rotation cycle
   rotationTracking.wsEventReceived = false;
@@ -228,75 +214,9 @@ function handleRefreshError(err: unknown, source: RefreshSource): null {
   return null;
 }
 
-// ============================================================================
-// Scheduling
-// ============================================================================
-
-function scheduleNextRefresh(bindResponse: ManagedApiKeyBindResponse | null): void {
-  refreshTimer.clear();
-
-  if (!isRunning) {
-    return;
-  }
-
-  const delay = calculateNextRefreshMs(bindResponse);
-
-  refreshTimer.setTimeout(() => {
-    if (!isRunning) return;
-
-    void (async () => {
-      try {
-        const response = await refreshManagedKey();
-        scheduleNextRefresh(response);
-      } catch (err) {
-        log.error({ err }, 'Managed key refresh failed, retrying in 1 minute');
-        // On error, retry in 1 minute
-        scheduleNextRefresh(null);
-      }
-    })();
-  }, delay);
-
-  log.info({
-    refreshInMinutes: Math.round(delay / 60000),
-    refreshAt: new Date(Date.now() + delay).toISOString(),
-  }, 'Managed key refresh scheduled');
-}
-
-function handleRefreshSchedule(response: { nextRotationAt?: string; graceExpiresAt?: string } | null): void {
-  scheduleNextRefresh(response as ManagedApiKeyBindResponse | null);
-  if (response?.graceExpiresAt) {
-    gracePeriodPoller?.schedule(new Date(response.graceExpiresAt));
-  }
-}
-
-// ============================================================================
-// Safety Rail Event Handlers
-// ============================================================================
-
-/**
- * Called when WebSocket reconnects after a disconnect.
- * Immediately polls to detect any rotations that may have been missed.
- */
-export async function onWebSocketReconnect(): Promise<void> {
-  if (!isRunning || !isManagedKeyMode()) return;
-
-  log.info('WebSocket reconnected - checking for missed rotations');
-
-  // Small delay to allow connection to stabilize
-  await new Promise(resolve => setTimeout(resolve, RECONNECT_POLL_DELAY_MS));
-
-  // Re-check after async pause (isRunning may have changed during await)
-   
-  if (!isRunning) return;
-
-  try {
-    const response = await refreshManagedKey('reconnect');
-    if (response) {
-      handleRefreshSchedule(response);
-    }
-  } catch (err) {
-    log.error({ err }, 'Reconnection poll failed');
-  }
+/** Transport reconnect never discovers business state without a server cursor. */
+export function onWebSocketReconnect(): Promise<void> {
+  return Promise.resolve();
 }
 
 /**
@@ -312,6 +232,10 @@ export async function onWebSocketAuthFailure(): Promise<boolean> {
     log.debug('Not in managed key mode, cannot recover from auth failure');
     return false;
   }
+
+  const rejectedCredential = loadConfig().auth.apiKey ?? null;
+  if (lastRejectedCredential === rejectedCredential) return false;
+  lastRejectedCredential = rejectedCredential;
 
   log.warn('WebSocket authentication failed - attempting managed key refresh');
 
@@ -333,7 +257,7 @@ export async function onWebSocketAuthFailure(): Promise<boolean> {
       setGauge('znvault_agent_managed_key_stale', 0);
 
       // Reschedule timers with new data
-      handleRefreshSchedule(response);
+
 
       return true;
     }
@@ -379,14 +303,10 @@ export async function onWebSocketRotationEvent(keyName: string): Promise<void> {
 
   // Immediately refresh to get the new key
   try {
-    const response = await refreshManagedKey('ws_event');
-    if (response) {
-      handleRefreshSchedule(response);
-    }
+    await refreshManagedKey('ws_event');
   } catch (err) {
     log.error({ err }, 'Failed to refresh after WebSocket rotation event');
-    // Schedule retry with exponential backoff
-    rotationRetryHandler?.schedule(keyName, 1);
+    // Keep the failure visible; another real event or explicit action may retry.
   }
 }
 
@@ -422,45 +342,10 @@ export async function startManagedKeyRenewal(): Promise<ManagedApiKeyBindRespons
   log.info({
     managedKeyName: config.managedKey?.name,
     rotationMode: config.managedKey?.rotationMode,
-  }, 'Starting managed key renewal service with safety rails');
+  }, 'Starting event-driven managed key service');
 
-  // Initialize safety rails
-  gracePeriodPoller = new GracePeriodPoller({
-    isRunning: () => isRunning,
-    getTracking: () => rotationTracking,
-    onPoll: () => refreshManagedKey('grace_poll'),
-  });
-
-  heartbeatMonitor = new HeartbeatMonitor({
-    isRunning: () => isRunning,
-    getTracking: () => rotationTracking,
-    onStale: () => refreshManagedKey('heartbeat'),
-    onRefreshSchedule: handleRefreshSchedule,
-  });
-
-  rotationRetryHandler = new RotationRetryHandler({
-    isRunning: () => isRunning,
-    onRetry: () => refreshManagedKey('ws_event'),
-    onSuccess: handleRefreshSchedule,
-    maxAttempts: MAX_RETRY_ATTEMPTS,
-  });
-
-  // Perform initial bind
+  // Exactly one initial authoritative bind; runtime updates require real events.
   const bindResponse = await refreshManagedKey('scheduled');
-
-  // Schedule next refresh (proactive pre-rotation polling)
-  scheduleNextRefresh(bindResponse);
-
-  // Start safety rails
-  if (bindResponse?.graceExpiresAt) {
-    gracePeriodPoller.schedule(new Date(bindResponse.graceExpiresAt));
-  }
-  heartbeatMonitor.start();
-
-  log.info({
-    nextRotationAt: bindResponse?.nextRotationAt,
-    graceExpiresAt: bindResponse?.graceExpiresAt,
-  }, 'Safety rails initialized');
 
   return bindResponse;
 }
@@ -469,18 +354,12 @@ export async function startManagedKeyRenewal(): Promise<ManagedApiKeyBindRespons
  * Stop the managed key renewal service.
  */
 export function stopManagedKeyRenewal(): void {
-  // Stop all timers and safety rails
-  refreshTimer.clear();
-  gracePeriodPoller?.stop();
-  heartbeatMonitor?.stop();
-
-  gracePeriodPoller = null;
-  heartbeatMonitor = null;
-  rotationRetryHandler = null;
-
+  serviceGeneration++;
+  coordinatedKeyBinder = null;
   // Reset state
   isRunning = false;
   currentKey = null;
+  lastRejectedCredential = null;
   staleKeyDetected = false;
   onKeyChangedCallback = null;
 
@@ -500,9 +379,6 @@ export async function forceRefresh(): Promise<ManagedApiKeyBindResponse | null> 
   }
 
   const response = await refreshManagedKey('manual');
-  if (isRunning && response) {
-    handleRefreshSchedule(response);
-  }
   return response;
 }
 

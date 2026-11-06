@@ -8,6 +8,7 @@ export {
   forceRefresh,
   getManagedKeyStatus,
   onKeyChanged,
+  setManagedKeyBinder,
   onWebSocketReconnect,
   onWebSocketAuthFailure,
   onWebSocketRotationEvent,
@@ -19,18 +20,3 @@ export type {
   RefreshSource,
   ManagedKeyStatus,
 } from './types.js';
-
-// Constants (for testing/external use)
-export {
-  DEFAULT_REFRESH_BEFORE_MS,
-  MIN_REFRESH_INTERVAL_MS,
-  FALLBACK_REFRESH_INTERVAL_MS,
-  GRACE_PERIOD_POLL_RATIO,
-  MIN_GRACE_POLL_DELAY_MS,
-  HEARTBEAT_INTERVAL_MS,
-  RECONNECT_POLL_DELAY_MS,
-  MAX_RETRY_ATTEMPTS,
-} from './types.js';
-
-// Scheduler (for testing/external use)
-export { calculateNextRefreshMs } from './scheduler.js';

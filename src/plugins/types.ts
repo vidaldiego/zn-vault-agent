@@ -33,7 +33,9 @@ export interface AgentPlugin {
 
   /**
    * Called when daemon is shutting down.
-   * Use for cleanup, closing connections, etc.
+   * Use for cleanup, closing connections, etc. The loader calls this after any
+   * settled initialization attempt, including partial failure; tolerate resources
+   * that were never acquired. Cleanup never overlaps an unsettled init/start hook.
    */
   onStop?(ctx: PluginContext): Promise<void>;
 

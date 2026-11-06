@@ -4,13 +4,12 @@ import {
   admitSecretRefreshEventsToRetryQueue,
   admitSecretMutationAfterAwait,
   admitSecretEventToRetryQueue,
-  createSingleFlightOperation,
   drainActiveDeployments,
   InitialChildStartBarrier,
   initializeExecSecretIdentity,
   isSecretVersionConsumed,
   findSecretRefreshMatches,
-  pollExecOnlySecretVersions,
+  synchronizeExecOnlySecretVersions,
   runAdmittedChildRestart,
   type SecretMutationEvidence,
   type SecretRefreshRetryItem,
@@ -399,25 +398,6 @@ describe('daemon mutation drain', () => {
     ]);
   });
 
-  it('keeps polling single-flight across overlapping timer callbacks', async () => {
-    let releasePoll!: () => void;
-    const pollGate = new Promise<void>(resolve => {
-      releasePoll = resolve;
-    });
-    const operation = vi.fn(async () => pollGate);
-    const poll = createSingleFlightOperation(operation);
-
-    const first = poll();
-    await poll();
-    await poll();
-    expect(operation).toHaveBeenCalledTimes(1);
-
-    releasePoll();
-    await first;
-    await poll();
-    expect(operation).toHaveBeenCalledTimes(2);
-  });
-
   it('recovers a lost exec-only event once across alias and UUID references', async () => {
     const identityByReference = new Map<string, string>();
     const consumedVersions = new Map<string, number>([['alias:example/prod', 1]]);
@@ -442,7 +422,7 @@ describe('daemon mutation drain', () => {
       }
       return { id: 'secret-uuid', alias: 'example/prod', version: 2 };
     });
-    const runExecPoll = async (): Promise<void> => pollExecOnlySecretVersions({
+    const runExecPoll = async (): Promise<void> => synchronizeExecOnlySecretVersions({
       references: ['alias:example/prod', 'secret-uuid', 'file-secret'],
       fileTargetReferences: ['file-secret'],
       identityByReference,
@@ -499,7 +479,7 @@ describe('daemon mutation drain', () => {
     }>>()
       .mockRejectedValueOnce(new Error('metadata temporarily unavailable'))
       .mockRejectedValueOnce(new Error('metadata temporarily unavailable'));
-    const runPoll = async (): Promise<void> => pollExecOnlySecretVersions({
+    const runPoll = async (): Promise<void> => synchronizeExecOnlySecretVersions({
       references: ['alias:example/prod', 'secret-uuid'],
       fileTargetReferences: [],
       identityByReference,

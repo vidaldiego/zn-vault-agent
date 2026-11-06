@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:net';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -79,6 +79,23 @@ describe('control-plane listener startup', () => {
     for (const directory of tempDirectories.splice(0)) {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it('hot-reloads an atomically replaced TLS file from a filesystem event', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'znvault-health-event-'));
+    tempDirectories.push(directory);
+    const certPath = join(directory, 'cert.pem');
+    const keyPath = join(directory, 'key.pem');
+    writeFileSync(certPath, TEST_CERTIFICATE, { mode: 0o600 });
+    writeFileSync(keyPath, TEST_PRIVATE_KEY, { mode: 0o600 });
+    const server = await startHTTPSHealthServer(0, certPath, keyPath, undefined, '127.0.0.1', TEST_AUTH);
+    const reload = vi.spyOn(server.server as import('node:https').Server, 'setSecureContext');
+    await new Promise(resolve => setTimeout(resolve, 30));
+    writeFileSync(join(directory, 'replacement.pem'), TEST_CERTIFICATE, { mode: 0o600 });
+    renameSync(join(directory, 'replacement.pem'), certPath);
+    await new Promise(resolve => setTimeout(resolve, 250));
+    expect(reload).toHaveBeenCalled();
+    reload.mockRestore();
   });
 
   it('fails closed on an occupied HTTP port and releases the failed candidate for retry', async () => {

@@ -335,6 +335,13 @@ export interface PluginLoaderOptions {
   globalNodeModulesDir?: string;
 }
 
+export class PluginLifecycleError extends Error {
+  constructor(readonly code: 'PLUGIN_NOT_FOUND' | 'PLUGIN_NOT_INITIALIZED' | 'PLUGIN_START_IN_PROGRESS' | 'PLUGIN_SHUTTING_DOWN', message: string) {
+    super(message);
+    this.name = 'PluginLifecycleError';
+  }
+}
+
 /**
  * Manages plugin discovery, loading, and lifecycle
  */
@@ -342,7 +349,15 @@ export class PluginLoader extends EventEmitter {
   private readonly plugins = new Map<string, LoadedPlugin>();
   private agentInternals: AgentInternals;
   private readonly options: PluginLoaderOptions;
-  private isStarted = false;
+  private readonly initializedPlugins = new Set<string>();
+  private readonly attemptedInitializations = new Set<string>();
+  private readonly initializationTasks = new Map<string, Promise<void>>();
+  private readonly initializationRequests = new Map<string, Promise<void>>();
+  private readonly attemptedStarts = new Set<string>();
+  private readonly startupTasks = new Map<string, Promise<void>>();
+  private readonly startupRequests = new Map<string, Promise<void>>();
+  private isStopping = false;
+  private stopTask: Promise<void> | null = null;
 
   constructor(agentInternals: AgentInternals, options: PluginLoaderOptions = {}) {
     super();
@@ -559,114 +574,143 @@ export class PluginLoader extends EventEmitter {
    */
   async initializePlugins(): Promise<void> {
     log.debug('Initializing plugins');
-
     for (const [name, loaded] of this.plugins) {
+      if (this.isStopping) break;
       if (loaded.status !== 'loaded') continue;
-
-      const ctx = createPluginContext(name, this.agentInternals, this);
-
-      if (loaded.plugin.onInit) {
-        try {
-          await withTimeout(
-            loaded.plugin.onInit(ctx),
-            PLUGIN_HOOK_TIMEOUT_MS,
-            name,
-            'onInit'
-          );
-          loaded.status = 'initialized';
-          log.debug({ name }, 'Plugin initialized');
-        } catch (err) {
-          const error = err instanceof Error ? err : new Error(String(err));
-          log.error({ err: error, name }, 'Plugin initialization failed');
-          loaded.status = 'error';
-          loaded.error = error;
-        }
-      } else {
-        // No init hook - mark as initialized
-        loaded.status = 'initialized';
-      }
+      await this.initializePlugin(name, loaded);
     }
+  }
+
+  private initializePlugin(name: string, loaded: LoadedPlugin): Promise<void> {
+    const existing = this.initializationRequests.get(name);
+    if (existing) return existing;
+    this.attemptedInitializations.add(name);
+    const ctx = createPluginContext(name, this.agentInternals, this);
+    const task = Promise.resolve().then(async () => loaded.plugin.onInit?.(ctx));
+    this.initializationTasks.set(name, task);
+    // Successful raw settlement owns cleanup even if the request timed out.
+    // It does not erase a timeout or grant startup/credential authority.
+    void task.then(() => undefined, () => undefined)
+      .finally(() => { if (this.initializationTasks.get(name) === task) this.initializationTasks.delete(name); });
+    const request = withTimeout(task, PLUGIN_HOOK_TIMEOUT_MS, name, 'onInit')
+      .then(() => {
+        if (!this.isStopping) {
+          loaded.status = 'initialized';
+          this.initializedPlugins.add(name);
+        }
+      }, (err: unknown) => {
+        loaded.status = 'error';
+        loaded.error = err instanceof Error ? err : new Error(String(err));
+        log.error({ err: loaded.error, name }, 'Plugin initialization failed');
+      }).finally(() => {
+        if (this.initializationRequests.get(name) === request) this.initializationRequests.delete(name);
+      });
+    this.initializationRequests.set(name, request);
+    return request;
   }
 
   /**
    * Start all initialized plugins
    */
   async startPlugins(): Promise<void> {
-    if (this.isStarted) {
-      log.warn('Plugins already started');
-      return;
-    }
-
-    log.debug('Starting plugins');
-
+    const failures: Error[] = [];
     for (const [name, loaded] of this.plugins) {
+      if (loaded.status === 'error') {
+        failures.push(new Error(`Plugin '${name}' lifecycle failed`, { cause: loaded.error }));
+        continue;
+      }
       if (loaded.status !== 'initialized') continue;
-
-      const ctx = createPluginContext(name, this.agentInternals, this);
-
-      if (loaded.plugin.onStart) {
-        try {
-          await withTimeout(
-            loaded.plugin.onStart(ctx),
-            PLUGIN_START_TIMEOUT_MS,
-            name,
-            'onStart'
-          );
-          loaded.status = 'running';
-          log.debug({ name }, 'Plugin started');
-        } catch (err) {
-          const error = err instanceof Error ? err : new Error(String(err));
-          log.error({ err: error, name }, 'Plugin start failed');
-          loaded.status = 'error';
-          loaded.error = error;
-        }
-      } else {
-        // No start hook - mark as running
-        loaded.status = 'running';
+      try {
+        await this.beginPluginStart(name, loaded);
+      } catch (err) {
+        failures.push(new Error(`Plugin '${name}' startup failed`, { cause: err }));
       }
     }
-
-    this.isStarted = true;
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `Plugin startup failed: ${failures.map(error => error.message).join(', ')}`);
+    }
   }
 
-  /**
-   * Stop all running plugins
-   */
-  async stopPlugins(): Promise<void> {
-    if (!this.isStarted) {
-      return;
+  /** Explicit operator recovery; never starts an uninitialized consumer. */
+  startPlugin(name: string): Promise<void> {
+    if (this.isStopping) return Promise.reject(new PluginLifecycleError('PLUGIN_SHUTTING_DOWN', 'Agent is shutting down'));
+    const loaded = this.plugins.get(name);
+    if (!loaded) return Promise.reject(new PluginLifecycleError('PLUGIN_NOT_FOUND', `Plugin '${name}' is not loaded`));
+    if (!this.initializedPlugins.has(name) || !this.attemptedStarts.has(name)) {
+      return Promise.reject(new PluginLifecycleError('PLUGIN_NOT_INITIALIZED', `Plugin '${name}' has not initialized and attempted startup`));
     }
+    if (loaded.status === 'running') return Promise.resolve();
+    const request = this.startupRequests.get(name);
+    if (request) return request;
+    if (this.startupTasks.has(name)) {
+      return Promise.reject(new PluginLifecycleError('PLUGIN_START_IN_PROGRESS', `Plugin '${name}' startup is still in progress after timeout`));
+    }
+    return this.beginPluginStart(name, loaded);
+  }
 
-    log.debug('Stopping plugins');
-
-    // Stop in reverse order
-    const plugins = Array.from(this.plugins.entries()).reverse();
-
-    for (const [name, loaded] of plugins) {
-      if (loaded.status !== 'running') continue;
-
-      const ctx = createPluginContext(name, this.agentInternals, this);
-
-      if (loaded.plugin.onStop) {
-        try {
-          await withTimeout(
-            loaded.plugin.onStop(ctx),
-            PLUGIN_HOOK_TIMEOUT_MS,
-            name,
-            'onStop'
-          );
-          loaded.status = 'stopped';
-          log.debug({ name }, 'Plugin stopped');
-        } catch (err) {
-          log.warn({ err, name }, 'Plugin stop error (continuing shutdown)');
-          loaded.status = 'stopped';
-        }
-      } else {
-        loaded.status = 'stopped';
+  private beginPluginStart(name: string, loaded: LoadedPlugin): Promise<void> {
+    if (this.isStopping) return Promise.reject(new PluginLifecycleError('PLUGIN_SHUTTING_DOWN', 'Agent is shutting down'));
+    const existing = this.startupRequests.get(name);
+    if (existing) return existing;
+    this.attemptedStarts.add(name);
+    const ctx = createPluginContext(name, this.agentInternals, this);
+    // Track the actual hook separately: a timeout cannot cancel plugin work.
+    const task = Promise.resolve().then(async () => loaded.plugin.onStart?.(ctx));
+    this.startupTasks.set(name, task);
+    void task.then(() => {
+      if (!this.isStopping) {
+        loaded.status = 'running';
+        loaded.error = undefined;
       }
-    }
+    }, (err: unknown) => {
+      loaded.status = 'error';
+      loaded.error = err instanceof Error ? err : new Error(String(err));
+    }).finally(() => {
+      if (this.startupTasks.get(name) === task) this.startupTasks.delete(name);
+    });
+    const request = withTimeout(task, PLUGIN_START_TIMEOUT_MS, name, 'onStart')
+      .catch((err: unknown) => {
+        loaded.status = 'error';
+        loaded.error = err instanceof Error ? err : new Error(String(err));
+        log.error({ err: loaded.error, name }, 'Plugin start failed');
+        throw loaded.error;
+      }).finally(() => {
+        if (this.startupRequests.get(name) === request) this.startupRequests.delete(name);
+      });
+    this.startupRequests.set(name, request);
+    return request;
+  }
 
-    this.isStarted = false;
+  /** Close manual startup admission before mutation drain begins. */
+  beginShutdown(): void { this.isStopping = true; }
+
+  async stopPlugins(): Promise<void> {
+    this.isStopping = true;
+    this.stopTask ??= (async () => {
+      // 600s mutation drain + 180s lifecycle stop + 120s final teardown <= 900s.
+      const deadline = performance.now() + 180_000;
+      const failures: Error[] = [];
+      for (const [name, loaded] of Array.from(this.plugins.entries()).reverse()) {
+        if (!this.attemptedInitializations.has(name)) continue;
+        try {
+          const initialization = this.initializationTasks.get(name);
+          if (initialization) await withTimeout(initialization.catch(() => undefined), Math.max(1, Math.min(120_000, deadline - performance.now())), name, 'initialization settlement before stop');
+          const startup = this.startupTasks.get(name);
+          if (startup) await withTimeout(startup.catch(() => undefined), Math.max(1, Math.min(120_000, deadline - performance.now())), name, 'startup settlement before stop');
+          if (performance.now() >= deadline) throw new Error('Plugin shutdown budget exhausted');
+          const ctx = createPluginContext(name, this.agentInternals, this);
+          await withTimeout(Promise.resolve().then(async () => loaded.plugin.onStop?.(ctx)), Math.min(60_000, deadline - performance.now()), name, 'onStop');
+          loaded.status = 'stopped';
+        } catch (err) {
+          loaded.status = 'error';
+          loaded.error = err instanceof Error ? err : new Error(String(err));
+          failures.push(loaded.error);
+          log.warn({ err, name }, 'Plugin stop failed');
+        }
+      }
+      if (failures.length > 0) throw new AggregateError(failures, 'Plugin shutdown failed');
+    })();
+    return this.stopTask;
   }
 
   /**
@@ -720,7 +764,7 @@ export class PluginLoader extends EventEmitter {
       // hook timed out may have completed its uncancellable work after the
       // loader marked it as errored. It must still receive the fresh key.
       const canDispatch = loaded.status === 'running'
-        || (eventType === 'keyRotated' && loaded.status === 'error');
+        || (eventType === 'keyRotated' && loaded.status === 'error' && this.initializedPlugins.has(name));
 
       if (!canDispatch) {
         result.handlersSkipped += 1;
@@ -769,6 +813,11 @@ export class PluginLoader extends EventEmitter {
     const statuses: PluginHealthStatus[] = [];
 
     for (const [name, loaded] of this.plugins) {
+      if (loaded.status === 'error') {
+        statuses.push({ name: loaded.plugin.name, version: loaded.plugin.version,
+          status: 'unhealthy', message: loaded.error?.message ?? 'Plugin lifecycle failed' });
+        continue;
+      }
       // If plugin has healthCheck, always call it (even if status is 'error')
       // This allows plugins to recover from transient startup failures
       if (loaded.plugin.healthCheck) {
@@ -782,12 +831,6 @@ export class PluginLoader extends EventEmitter {
             version: loaded.plugin.version,
           });
 
-          // If health check returns healthy and plugin was in error state, recover it
-          if (status.status === 'healthy' && loaded.status === 'error') {
-            log.info({ name }, 'Plugin recovered from error state');
-            loaded.status = 'running';
-            loaded.error = undefined;
-          }
         } catch (err) {
           const error = err instanceof Error ? err : new Error(String(err));
           statuses.push({
@@ -800,15 +843,8 @@ export class PluginLoader extends EventEmitter {
         continue;
       }
 
-      // No healthCheck method - report based on plugin status
-      if (loaded.status === 'error') {
-        statuses.push({
-          name: loaded.plugin.name,
-          version: loaded.plugin.version,
-          status: 'unhealthy',
-          message: loaded.error?.message ?? 'Plugin failed to load',
-        });
-      } else if (loaded.status === 'running') {
+      // No healthCheck method - report based on successful lifecycle.
+      if (loaded.status === 'running') {
         // Running but no health check - assume healthy
         statuses.push({
           name: loaded.plugin.name,

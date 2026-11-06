@@ -584,7 +584,14 @@ describe('WebSocket Communication', () => {
       }, { timeout: 10000, interval: 200 });
 
       const healthAfter = await (await fetch(`http://127.0.0.1:${daemon.healthPort}/health`)).json();
-      expect(healthAfter.status).toBe('healthy');
+      // The auth rotation reconnect has no resume cursor. Its delivery gap
+      // stays visible until an explicit, authenticated reconciliation.
+      expect(healthAfter.status).toBe('degraded');
+      expect(healthAfter.delivery.stale).toBe(true);
+      const synchronized = await fetch(`http://127.0.0.1:${daemon.healthPort}/synchronize`, {
+        method: 'POST', headers: agent.getControlPlaneHeaders(),
+      });
+      expect(synchronized.status).toBe(200);
     }, 30000);
 
     it('WS-16: should track WebSocket rotation event metrics', async () => {

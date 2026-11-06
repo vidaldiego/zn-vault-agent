@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { PluginAutoUpdateService } from './plugin-auto-update.js';
 import {
   resolvePayaraRecoveryStartup,
-  startPostUpdateAuthorityRetry,
+  createPostUpdateAuthorityRecovery,
 } from '../lib/websocket.js';
 import {
   PAYARA_PLUGIN_CHANNEL,
@@ -44,7 +44,7 @@ interface Internals {
 const roots: string[] = [];
 const services: PluginAutoUpdateService[] = [];
 
-function createService(): { service: PluginAutoUpdateService; rail: PluginUpdateRail; root: string } {
+function createService(automaticEnabled = false): { service: PluginAutoUpdateService; rail: PluginUpdateRail; root: string } {
   const root = mkdtempSync(join(tmpdir(), 'znvault-plugin-rail-'));
   roots.push(root);
   const data = join(root, 'data');
@@ -65,9 +65,9 @@ function createService(): { service: PluginAutoUpdateService; rail: PluginUpdate
     execFileRunner: async () => ({ stdout: '', stderr: '' }),
   });
   const service = new PluginAutoUpdateService([
-    { package: PAYARA_PLUGIN_PACKAGE, enabled: true, autoUpdate: { enabled: false } },
+    { package: PAYARA_PLUGIN_PACKAGE, enabled: true, autoUpdate: { enabled: automaticEnabled } },
     { package: '@scope/unrelated', enabled: true, autoUpdate: { enabled: true } },
-  ], { enabled: false, stagedRolloutMaxDelayMs: 0 }, rail);
+  ], { enabled: automaticEnabled, stagedRolloutMaxDelayMs: 0 }, rail);
   services.push(service);
   const internal = service as unknown as Internals;
   internal.installedVersions.set(PAYARA_PLUGIN_PACKAGE, REQUEST.expectedCurrentVersion);
@@ -100,6 +100,55 @@ afterEach(() => {
 });
 
 describe('PluginAutoUpdateService exact durable operation', () => {
+  it('stages the initially observed exact candidate without rediscovering latest after its timer', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const { service } = createService(true);
+    const internal = service as unknown as Internals & { config: { stagedRolloutMaxDelayMs: number } };
+    internal.config.stagedRolloutMaxDelayMs = 2000;
+    const discovery = vi.spyOn(service, 'checkForUpdates');
+    const admission = vi.spyOn(service, 'beginUpdate').mockRejectedValue(new Error('test ends before host update'));
+    const attempt = internal.checkAndUpdatePayara().catch(error => error);
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(internal.getLatestVersion).mockResolvedValue('3.0.2');
+    await vi.advanceTimersByTimeAsync(1000);
+    await attempt;
+    expect(discovery).toHaveBeenCalledOnce();
+    expect(admission).toHaveBeenCalledWith(expect.objectContaining({
+      expectedCurrentVersion: REQUEST.expectedCurrentVersion, expectedVersion: REQUEST.expectedVersion,
+    }));
+  });
+
+  it('aborts exact staged admission when the advertised target drifts instead of replacing the candidate', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const { service, rail } = createService(true);
+    const internal = service as unknown as Internals & { config: { stagedRolloutMaxDelayMs: number } };
+    internal.config.stagedRolloutMaxDelayMs = 2000;
+    const discovery = vi.spyOn(service, 'checkForUpdates');
+    const attempt = internal.checkAndUpdatePayara().catch(error => error);
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(internal.getLatestVersion).mockResolvedValue('3.0.2');
+    await vi.advanceTimersByTimeAsync(1000);
+    await expect(attempt).resolves.toMatchObject({ code: 'TARGET_VERSION_MISMATCH' });
+    expect(discovery).toHaveBeenCalledOnce();
+    expect(internal.getLatestVersion).toHaveBeenCalledTimes(2); // discovery + exact-candidate CAS
+    expect(rail.readActive()).toBeNull();
+    expect(rail.readTrigger()).toBeNull();
+  });
+
+  it('does not repeat registry discovery after the initial enabled startup check', async () => {
+    vi.useFakeTimers();
+    const { service } = createService(true);
+    const internal = service as unknown as Internals;
+    vi.mocked(internal.getLatestVersion).mockResolvedValue(REQUEST.expectedCurrentVersion);
+    service.start();
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
+    expect(internal.getLatestVersion).toHaveBeenCalledTimes(1);
+    await service.checkForUpdates();
+    expect(internal.getLatestVersion).toHaveBeenCalledTimes(2);
+  });
+
   it('recovers committed nlink=2 boundaries for every Agent-owned rail record', async () => {
     const { service, rail } = createService();
     await service.beginUpdate(REQUEST);
@@ -343,18 +392,17 @@ describe('PluginAutoUpdateService exact durable operation', () => {
       .mockResolvedValueOnce(false)
       .mockResolvedValueOnce(true);
     const authorityRestart = vi.fn();
-    const stopAuthorityRetry = startPostUpdateAuthorityRetry({
+    const authorityRecovery = createPostUpdateAuthorityRecovery({
       probe: authorityProbe,
       requestRestart: authorityRestart,
-      retryMs: 30_000,
     });
-    await vi.advanceTimersByTimeAsync(30_000);
+    await expect(authorityRecovery.synchronize()).rejects.toThrow('unavailable');
     await expect(service.getUpdateStatus(REQUEST.requestId)).resolves.toMatchObject({
       status: 'pending',
       code: 'RESTART_PENDING',
     });
     expect(authorityRestart).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(30_000);
+    await authorityRecovery.synchronize();
     expect(authorityRestart).toHaveBeenCalledOnce();
 
     service.confirmPluginStartup(REQUEST.expectedVersion, true);
@@ -366,7 +414,7 @@ describe('PluginAutoUpdateService exact durable operation', () => {
     });
     expect(existsSync(rail.activeFile)).toBe(false);
     expect(inspectPayaraPostUpdateRecoveryEvidence(rail)).toBeNull();
-    stopAuthorityRetry();
+    authorityRecovery.stop();
   });
 
   it('rejects a receipt/request mismatch and never schedules restart', async () => {

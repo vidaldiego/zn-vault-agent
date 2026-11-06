@@ -45,6 +45,7 @@ import { loadConfig, saveConfig } from '../lib/config.js';
 import {
   requestAgentTLSCertificate,
   renewAgentTLSCertificate,
+  getAgentTLSCertificate,
   activateAgentTLSCertificate,
 } from '../lib/api.js';
 import type { AgentTLSCertificateResponse } from '../lib/api.js';
@@ -130,6 +131,34 @@ describe('TLS Certificate Manager', () => {
   // ===========================================================================
   // isTLSEnabled Tests
   // ===========================================================================
+
+  it('never schedules another certificate status check after the initial metadata lookup fails', async () => {
+    writeFileSync(certPath, '-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----');
+    vi.mocked(loadConfig).mockReturnValue({
+      vaultUrl: 'https://vault.test', auth: { apiKey: 'synthetic-key' }, targets: [], agentId: 'synthetic-agent',
+      tls: { enabled: true, certPath, keyPath },
+    } as ReturnType<typeof loadConfig>);
+    vi.mocked(getAgentTLSCertificate).mockRejectedValue(new Error('synthetic outage'));
+    await startTLSCertificateManager();
+    const initialCheck = getTLSManagerStatus().lastCheckAt;
+    await vi.advanceTimersByTimeAsync(20 * 60 * 1000);
+    expect(getTLSManagerStatus().lastCheckAt).toBe(initialCheck);
+    expect(getAgentTLSCertificate).toHaveBeenCalledTimes(1);
+  });
+
+  it('finishes a failed initial certificate request without a file-status polling loop', async () => {
+    vi.useFakeTimers();
+    vi.mocked(loadConfig).mockReturnValue({
+      vaultUrl: 'https://vault.test', auth: { apiKey: 'synthetic-key' }, targets: [], agentId: 'synthetic-agent',
+      tls: { enabled: true, certPath, keyPath },
+    } as ReturnType<typeof loadConfig>);
+    vi.mocked(requestAgentTLSCertificate).mockRejectedValue(new Error('synthetic outage'));
+    let settled = false;
+    const ready = ensureCertificateReady().then(value => { settled = true; return value; });
+    for (let step = 0; step < 20; step++) await Promise.resolve();
+    try { expect(settled).toBe(true); }
+    finally { await vi.advanceTimersByTimeAsync(30_000); await ready; }
+  });
 
   describe('isTLSEnabled', () => {
     it('should return false when TLS is not configured', () => {
@@ -339,7 +368,7 @@ describe('TLS Certificate Manager', () => {
       });
     });
 
-    it('should wait for certificate to be ready with timeout', async () => {
+    it('returns unavailable after a failed initial request without delaying recovery', async () => {
       vi.mocked(loadConfig).mockReturnValue({
         vaultUrl: 'https://vault.example.com',
         tenantId: 'test',
@@ -361,8 +390,7 @@ describe('TLS Certificate Manager', () => {
 
       // Should timeout after ~30 seconds (give some buffer)
       expect(result).toBeNull();
-      expect(elapsed).toBeGreaterThanOrEqual(29000);
-      expect(elapsed).toBeLessThan(35000);
+      expect(elapsed).toBeLessThan(1000);
     }, 40000); // Increase test timeout
 
     it('should return immediately when certificate files already exist', async () => {

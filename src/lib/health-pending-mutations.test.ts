@@ -13,6 +13,7 @@ import {
   setPendingMutationRetries,
   setPluginLoader,
   setWebSocketStatus,
+  setSynchronizationHandler,
 } from './health.js';
 import { CoalescingRetryQueue } from './coalescing-retry-queue.js';
 import type { ChildProcessManager } from '../services/child-process-manager.js';
@@ -24,6 +25,7 @@ afterEach(() => {
   setChildProcessManager(null);
   setPluginLoader(null);
   setWebSocketStatus(false);
+  setSynchronizationHandler(null);
 });
 
 describe('pending mutation health', () => {

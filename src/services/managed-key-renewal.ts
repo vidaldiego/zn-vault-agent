@@ -8,6 +8,7 @@ export {
   forceRefresh,
   getManagedKeyStatus,
   onKeyChanged,
+  setManagedKeyBinder,
   onWebSocketReconnect,
   onWebSocketAuthFailure,
   onWebSocketRotationEvent,

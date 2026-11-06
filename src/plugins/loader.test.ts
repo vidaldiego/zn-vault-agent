@@ -523,6 +523,80 @@ describe('PluginLoader', () => {
 
       expect(loader.getPluginStatus('error-test')).toBe('error');
     });
+
+    it('retains cleanup ownership when an initialization succeeds after its request timeout', async () => {
+      vi.useFakeTimers();
+      try {
+        const pluginPath = writeTestPlugin(testDir, 'late-init', `
+          export default { name: 'late-init', version: '1.0.0' };
+        `);
+        const plugin = await loader.loadPlugin({ path: pluginPath });
+        let complete!: () => void;
+        plugin!.onInit = () => new Promise<void>(resolve => { complete = resolve; });
+        const cleanup = vi.fn(async () => undefined);
+        const rotation = vi.fn(async () => undefined);
+        plugin!.onStop = cleanup;
+        plugin!.onKeyRotated = rotation;
+        const initialized = loader.initializePlugins();
+        await vi.advanceTimersByTimeAsync(30_000);
+        await initialized;
+        expect(loader.getPluginStatus('late-init')).toBe('error');
+        complete();
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(loader.getPluginStatus('late-init')).toBe('error');
+        await loader.dispatchEvent('keyRotated', { keyName: 'test', newPrefix: '[REDACTED]', rotationMode: 'scheduled' });
+        expect(rotation).not.toHaveBeenCalled();
+        await expect(loader.startPlugin('late-init')).rejects.toThrow('initialized');
+        await loader.stopPlugins();
+        expect(cleanup).toHaveBeenCalledOnce();
+        expect(loader.getPluginStatus('late-init')).toBe('stopped');
+      } finally { vi.useRealTimers(); }
+    });
+
+    it('waits for active initialization before shutdown cleanup and fences early recovery', async () => {
+      vi.useFakeTimers();
+      try {
+        const pluginPath = writeTestPlugin(testDir, 'active-init', `
+          export default { name: 'active-init', version: '1.0.0' };
+        `);
+        const plugin = await loader.loadPlugin({ path: pluginPath });
+        let complete!: () => void;
+        plugin!.onInit = () => new Promise<void>(resolve => { complete = resolve; });
+        const cleanup = vi.fn(async () => undefined);
+        const rotation = vi.fn(async () => undefined);
+        plugin!.onStop = cleanup;
+        plugin!.onKeyRotated = rotation;
+        const initialized = loader.initializePlugins();
+        await Promise.resolve();
+        const stop = loader.stopPlugins();
+        await Promise.resolve();
+        expect(cleanup).not.toHaveBeenCalled();
+        await expect(loader.startPlugin('active-init')).rejects.toThrow('shutting down');
+        complete();
+        await vi.advanceTimersByTimeAsync(0);
+        await Promise.all([stop, initialized]);
+        expect(cleanup).toHaveBeenCalledOnce();
+        expect(rotation).not.toHaveBeenCalled();
+        expect(loader.getPluginStatus('active-init')).toBe('stopped');
+      } finally { vi.useRealTimers(); }
+    });
+
+    it('gives a failed partial initializer one cleanup attempt without authorizing credentials', async () => {
+      const pluginPath = writeTestPlugin(testDir, 'partial-init', `
+        export default { name: 'partial-init', version: '1.0.0' };
+      `);
+      const plugin = await loader.loadPlugin({ path: pluginPath });
+      plugin!.onInit = async () => { throw new Error('partial resource acquisition failed'); };
+      const cleanup = vi.fn(async () => undefined);
+      const rotation = vi.fn(async () => undefined);
+      plugin!.onStop = cleanup;
+      plugin!.onKeyRotated = rotation;
+      await loader.initializePlugins();
+      await loader.dispatchEvent('keyRotated', { keyName: 'test', newPrefix: '[REDACTED]', rotationMode: 'scheduled' });
+      expect(rotation).not.toHaveBeenCalled();
+      await loader.stopPlugins();
+      expect(cleanup).toHaveBeenCalledOnce();
+    });
   });
 
   describe('startPlugins / stopPlugins', () => {
@@ -609,6 +683,160 @@ describe('PluginLoader', () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+
+    it('rejects failed startup while retaining healthy siblings and the startup error', async () => {
+      const pluginPath = writeTestPlugin(testDir, 'startup-failure', `
+        export default {
+          name: 'startup-failure', version: '1.0.0',
+          async onStart() { throw new Error('process identity unavailable'); },
+          async healthCheck() { return { status: 'healthy' }; }
+        };
+      `);
+      const siblingPath = writeTestPlugin(testDir, 'startup-sibling', `
+        export default { name: 'startup-sibling', version: '1.0.0' };
+      `);
+      await loader.loadPlugin({ path: pluginPath });
+      await loader.loadPlugin({ path: siblingPath });
+      await loader.initializePlugins();
+
+      await expect(loader.startPlugins()).rejects.toThrow('startup-failure');
+      expect(loader.getPluginStatus('startup-sibling')).toBe('running');
+      const health = await loader.collectHealthStatus();
+      expect(health.find(status => status.name === 'startup-failure')).toMatchObject({
+        status: 'unhealthy', message: expect.stringContaining('process identity unavailable'),
+      });
+      expect(loader.getPluginStatus('startup-failure')).toBe('error');
+    });
+
+    it('cleans a partially started plugin during shutdown', async () => {
+      const pluginPath = writeTestPlugin(testDir, 'partial-start', `
+        export default { name: 'partial-start', version: '1.0.0' };
+      `);
+      const plugin = await loader.loadPlugin({ path: pluginPath });
+      const cleanup = vi.fn(async () => undefined);
+      plugin!.onStart = async () => { throw new Error('partial startup'); };
+      plugin!.onStop = cleanup;
+      await loader.initializePlugins();
+      await loader.startPlugins().catch(() => undefined);
+
+      await loader.stopPlugins();
+
+      expect(cleanup).toHaveBeenCalledOnce();
+      expect(loader.getPluginStatus('partial-start')).toBe('stopped');
+    });
+
+    it('recovers only on explicit retry and shares concurrent retry work', async () => {
+      const pluginPath = writeTestPlugin(testDir, 'retry-start', `
+        export default { name: 'retry-start', version: '1.0.0' };
+      `);
+      const plugin = await loader.loadPlugin({ path: pluginPath });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const startup = vi.fn().mockRejectedValueOnce(new Error('transient identity failure'))
+        .mockImplementation(async () => gate);
+      plugin!.onStart = startup;
+      await loader.initializePlugins();
+      await loader.startPlugins().catch(() => undefined);
+      const first = loader.startPlugin('retry-start');
+      const second = loader.startPlugin('retry-start');
+      await Promise.resolve();
+      release();
+      await Promise.all([first, second]);
+      expect(startup).toHaveBeenCalledTimes(2);
+      expect(loader.getPluginStatus('retry-start')).toBe('running');
+      expect(loader.getAllPluginStatuses()[0]?.error).toBeUndefined();
+    });
+
+    it('keeps timed-out startup fenced until its underlying work ends and shutdown cleans it', async () => {
+      vi.useFakeTimers();
+      try {
+        const pluginPath = writeTestPlugin(testDir, 'timeout-start', `
+          export default { name: 'timeout-start', version: '1.0.0' };
+        `);
+        const plugin = await loader.loadPlugin({ path: pluginPath });
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        const startup = vi.fn(async () => gate);
+        const cleanup = vi.fn(async () => undefined);
+        plugin!.onStart = startup;
+        plugin!.onStop = cleanup;
+        await loader.initializePlugins();
+        const result = loader.startPlugins().catch(error => error as Error);
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(await result).toBeInstanceOf(AggregateError);
+        await expect(loader.startPlugin('timeout-start')).rejects.toThrow('in progress');
+        const stop = loader.stopPlugins();
+        await Promise.resolve();
+        expect(cleanup).not.toHaveBeenCalled();
+        release();
+        await stop;
+        expect(startup).toHaveBeenCalledOnce();
+        expect(cleanup).toHaveBeenCalledOnce();
+        expect(loader.getPluginStatus('timeout-start')).toBe('stopped');
+        await expect(loader.startPlugin('timeout-start')).rejects.toThrow('shutting down');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('never retries or dispatches credentials to a plugin whose initialization failed', async () => {
+      const pluginPath = writeTestPlugin(testDir, 'init-failed', `
+        export default { name: 'init-failed', version: '1.0.0',
+          async onInit() { throw new Error('invalid configuration'); } };
+      `);
+      const plugin = await loader.loadPlugin({ path: pluginPath });
+      const startup = vi.fn(async () => undefined);
+      const rotation = vi.fn(async () => undefined);
+      plugin!.onStart = startup;
+      plugin!.onKeyRotated = rotation;
+      await loader.initializePlugins();
+      await expect(loader.startPlugins()).rejects.toThrow('init-failed');
+      await expect(loader.startPlugin('init-failed')).rejects.toThrow('initialized');
+      const result = await loader.dispatchEvent('keyRotated', {
+        keyName: 'test-key', newPrefix: 'test-prefix', rotationMode: 'scheduled',
+      });
+      expect(result.handlersSkipped).toBe(1);
+      expect(startup).not.toHaveBeenCalled();
+      expect(rotation).not.toHaveBeenCalled();
+    });
+
+    it('releases initialized resources even when listener startup fails before onStart', async () => {
+      const pluginPath = writeTestPlugin(testDir, 'initialized-cleanup', `
+        export default { name: 'initialized-cleanup', version: '1.0.0' };
+      `);
+      const plugin = await loader.loadPlugin({ path: pluginPath });
+      const cleanup = vi.fn(async () => undefined);
+      plugin!.onStop = cleanup;
+      await loader.initializePlugins();
+      await loader.stopPlugins();
+      expect(cleanup).toHaveBeenCalledOnce();
+      expect(loader.getPluginStatus('initialized-cleanup')).toBe('stopped');
+    });
+
+    it('bounds shutdown of an uncooperative startup and never promotes its later completion', async () => {
+      vi.useFakeTimers();
+      try {
+        const pluginPath = writeTestPlugin(testDir, 'uncooperative-start', `
+          export default { name: 'uncooperative-start', version: '1.0.0' };
+        `);
+        const plugin = await loader.loadPlugin({ path: pluginPath });
+        let release!: () => void;
+        plugin!.onStart = () => new Promise<void>(resolve => { release = resolve; });
+        const cleanup = vi.fn(async () => undefined);
+        plugin!.onStop = cleanup;
+        await loader.initializePlugins();
+        const start = loader.startPlugins().catch(error => error as Error);
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(await start).toBeInstanceOf(AggregateError);
+        const stop = loader.stopPlugins().catch(error => error as Error);
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(await stop).toBeInstanceOf(AggregateError);
+        expect(cleanup).not.toHaveBeenCalled();
+        release();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(loader.getPluginStatus('uncooperative-start')).toBe('error');
+      } finally { vi.useRealTimers(); }
     });
   });
 
@@ -716,7 +944,7 @@ describe('PluginLoader', () => {
 
       await loader.loadPlugin({ path: pluginPath });
       await loader.initializePlugins();
-      await loader.startPlugins();
+      await expect(loader.startPlugins()).rejects.toThrow('errored-key-plugin');
       expect(loader.getPluginStatus('errored-key-plugin')).toBe('error');
 
       const result = await loader.dispatchEvent('keyRotated', {
