@@ -110,15 +110,16 @@ export class ManagedKeyTargets {
       // Own authority metadata fences all target work before any asynchronous reload/bind.
       if (response.ownChanged && this.own && response.ownChanged.keyId !== this.own.keyId) { this.setOwnAuthorization(new Date(0).toISOString()); return; }
       if (response.ownChanged && !this.observeOwnRevision(response.ownChanged)) return;
-      if (response.configChanged || response.targetConfigVersion !== identity.version) {
-        this.requireConfiguration(response.targetConfigVersion); await this.deps.configChanged?.(); return;
-      }
-      if (!this.configurationCurrent()) return;
-      // Admit all target limits now, before a possible asynchronous own material refresh.
+      // Matching identity limits constrain installed material even while a newer configuration loads.
+      // Admission may tighten/retire existing files; material writes remain behind the config fence.
       const admitted = response.changed.filter(change => {
         const state = this.states.get(change.targetId);
         return state?.target.keyId === change.keyId && this.observeRevision(state, change.rotationCount, change);
       });
+      if (response.configChanged || response.targetConfigVersion !== identity.version) {
+        this.requireConfiguration(response.targetConfigVersion); await this.deps.configChanged?.(); return;
+      }
+      if (!this.configurationCurrent()) return;
       if (response.ownChanged && (!this.own || response.ownChanged.rotationCount > this.own.rotationCount) && this.deps.ownBind && this.deps.ownMaterial) {
         if (this.own && (this.own.keyId !== response.ownChanged.keyId || this.own.rotationCount < response.ownChanged.rotationCount - 1)) { this.setOwnAuthorization(new Date(0).toISOString()); return; }
         const material = await this.deps.ownBind();

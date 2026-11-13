@@ -39,3 +39,15 @@ integration coverage. Unit fixtures use synthetic material and temporary files.
 Final local gates on Node20.20.2: focal4 files43 tests PASS; full unit30 files489
 tests PASS; tsc --noEmit PASS; tsc build PASS; ESLint0 errors /14 unchanged
 warnings in child-process-manager.test.ts and dynamic-secrets/handler.test.ts.
+
+Review follow-up: a reconnect announcing a newer config generation previously
+returned into configChanged before target deadline admission. The exact RED
+fixture installed a target with expiry+100s, received same-ID/key/count metadata
+with expiry+1s and blocked reload: the file survived+1.001s and the old snapshot
+remained. Matching target limits now admit synchronously before config reload;
+the existing config fence still blocks all binds/material writes. The regression
+checks removal while reload is pending, exact persisted snapshot and no extra
+bind/self-bind or fabricated ACK. No wire or authority-extension change.
+
+Review-fix gates on Node20.20.2: focal4 files44 tests PASS; full unit30 files490
+tests PASS; typecheck/build PASS; lint0 errors /14 unchanged baseline warnings.

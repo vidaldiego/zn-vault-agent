@@ -15,6 +15,7 @@ function setup(initial?: ManagedKeyTargetState) {
   const ownKeys: string[] = [];
   const ownMaterial: ManagedKeyMaterial = { tenantId: 'tenant', keyId: 'key-agent', name: 'agent', key: 'synthetic-own-new', rotationCount: 2, expiresAt: expiry() };
   let ownBind = async (): Promise<ManagedKeyMaterial> => ownMaterial;
+  let configChanged = async (): Promise<void> => {};
   let bind = async () => ({ hostConfigId: 'host', targetId: 'reader', targetConfigVersion: 14, material });
   let reconcile = async (request: ManagedKeyTargetsReconcileRequest): Promise<ManagedKeyTargetsReconcileResponse> => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [], changed: request.applied.length ? [] : [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 1, reason: 'initial', expiresAt: material.expiresAt, authorizedUntil: material.authorizedUntil ?? material.expiresAt }] });
   const saved: ManagedKeyTargetState[] = [];
@@ -24,12 +25,12 @@ function setup(initial?: ManagedKeyTargetState) {
     writer: new ManagedKeyTargetWriter(root),
     reconcile: async request => { reads++; return await reconcile(request); },
     persist: state => { saved.push(structuredClone(state)); },
-    configChanged: async () => {},
+    configChanged: async () => { await configChanged(); },
     ownBind: async () => await ownBind(), ownMaterial: async material => { ownKeys.push(material.key); },
     bind: async () => { reads++; return await bind(); }, acknowledge: ack => { acks.push(ack); return true; },
   });
   const event = (rotationCount = 2): ManagedKeyTargetEvent => ({ event: 'managed-key-target.changed', deliveryId: `delivery-${rotationCount}`, tenantId: 'tenant', hostConfigId: 'host', targetId: 'reader', targetConfigVersion: 14, keyId: 'key-reader', rotationCount });
-  return { target, service, acks, event, ownKeys, saved, setOwnBind: (value: typeof ownBind) => { ownBind = value; }, setReconcile: (value: typeof reconcile) => { reconcile = value; }, reads: () => reads, setMaterial: (value: ManagedKeyMaterial) => { material = value; }, setBind: (value: typeof bind) => { bind = value; } };
+  return { target, service, acks, event, ownKeys, saved, setConfigChanged: (value: typeof configChanged) => { configChanged = value; }, setOwnBind: (value: typeof ownBind) => { ownBind = value; }, setReconcile: (value: typeof reconcile) => { reconcile = value; }, reads: () => reads, setMaterial: (value: ManagedKeyMaterial) => { material = value; }, setBind: (value: typeof bind) => { bind = value; } };
 }
 
 describe('event-driven target delivery', () => {
@@ -327,4 +328,25 @@ it('binds a full own DTO within predecessor grace and never applies that grace t
   await f.service.handleEvent({ ...f.event(2),targetId:'$self',keyId:'key-agent',expiresAt:expiry(),authorizedUntil:expiry(),graceExpiresAt:grace });
   expect(f.ownKeys).toEqual(['synthetic-full-own']);
   await vi.advanceTimersByTimeAsync(1001); expect(fs.existsSync(f.target.output)).toBe(true); f.service.stop();
+});
+
+it('review: admits a matching target deadline before a future-config reload blocks', async () => {
+  const f = setup(); const previous = new Date(Date.now() + 100000).toISOString();
+  f.setMaterial({ tenantId:'tenant',keyId:'key-reader',name:'reader',key:'synthetic-current',rotationCount:1,expiresAt:previous,authorizedUntil:previous });
+  await f.service.connected(['managed-key-targets-v1']);
+  f.service.ownApplied({ keyId:'key-agent',rotationCount:1,expiresAt:previous });
+  const deadline = new Date(Date.now()+1000).toISOString(); const before = f.reads();
+  let finishReload!: () => void;
+  f.setConfigChanged(() => new Promise(resolve => { finishReload=resolve; }));
+  f.setReconcile(async () => ({ tenantId:'tenant',hostConfigId:'host',targetConfigVersion:15,configChanged:true,removed:[],
+    ownChanged:{keyId:'key-agent',rotationCount:1,reason:'metadata_changed',expiresAt:previous,authorizedUntil:previous},
+    changed:[{targetId:'reader',keyId:'key-reader',rotationCount:1,reason:'metadata_changed',expiresAt:deadline,authorizedUntil:deadline}] }));
+  f.service.disconnected(); const pending = f.service.connected(['managed-key-targets-v1']);
+  await vi.waitFor(() => expect(finishReload).toBeTypeOf('function'));
+  const savedBeforeReload = structuredClone(f.saved.at(-1));
+  await vi.advanceTimersByTimeAsync(1001); const existsWhileReloadPending=fs.existsSync(f.target.output);
+  finishReload(); await pending;
+  expect.soft(existsWhileReloadPending).toBe(false);
+  expect.soft(savedBeforeReload?.applied[0].serverSnapshot).toEqual({rotationCount:1,expiresAt:deadline,authorizedUntil:deadline});
+  expect(f.reads()).toBe(before+1); expect(f.ownKeys).toEqual([]); expect(f.acks).toEqual([]); f.service.stop();
 });
