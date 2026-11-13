@@ -1,3 +1,8 @@
+import { ManagedKeyTargets } from '../services/managed-key-targets.js';
+import { ManagedKeyTargetWriter } from './managed-key-target-writer.js';
+import { loadManagedKeyTargetState, saveManagedKeyTargetState } from './managed-key-target-state.js';
+import { validateConfig } from './validation.js';
+import { setManagedKeyTargetsHealth } from './health.js';
 // Path: zn-vault-agent/src/lib/websocket.ts
 // WebSocket client for real-time certificate and secret updates (unified mode)
 // This file re-exports from the websocket/ module and provides the startDaemon function
@@ -42,13 +47,13 @@ import {
 import { flushLogs, setupLogRotation } from './logger.js';
 import type { PluginAutoUpdateService } from '../services/plugin-auto-update.js';
 import type { NpmAutoUpdateService } from '../services/npm-auto-update.js';
-import { startApiKeyRenewal, stopApiKeyRenewal } from '../services/api-key-renewal.js';
 import {
   startManagedKeyRenewal,
   stopManagedKeyRenewal,
   onKeyChanged as onManagedKeyChanged,
+  onWebSocketRotationEvent,
+  acceptHostManagedKey,
 } from '../services/managed-key-renewal.js';
-import { TrackedKeyPoller } from '../services/managed-key/tracked-keys-poller.js';
 import { isManagedKeyMode } from './config.js';
 import { ChildProcessManager } from '../services/child-process-manager.js';
 import {
@@ -57,7 +62,7 @@ import {
   parseSecretMappingFromConfig,
   type SecretMapping,
 } from './secret-env.js';
-import { bindManagedApiKey, getSecretMetadata } from './api.js';
+import { bindManagedApiKey, bindHostManagedKey, bindManagedKeyTarget, reconcileManagedKeyTargets, getSecretMetadata } from './api.js';
 import { createKeyRotationPropagator } from './key-rotation-propagation.js';
 import {
   createPluginLoader,
@@ -188,7 +193,8 @@ export async function startDaemon(options: {
   tls?: TLSConfig;
 } = {}): Promise<void> {
   const config = loadConfig();
-  const secretTargets = config.secretTargets ?? [];
+  if ((config.managedKeyTargets?.length ?? 0) > 0 && !validateConfig(config).valid) throw new Error('Invalid managed key target configuration');
+  let secretTargets = config.secretTargets ?? [];
   const consumedSecretRefreshVersions = new Map<string, number>();
 
   // Initialize plugin loader
@@ -437,18 +443,6 @@ export async function startDaemon(options: {
       : undefined,
   });
 
-  // Polling rail for tracked managed keys BEYOND the agent's own auth key
-  // (exec/plugin `api-key:` mappings). The renewal service covers only the
-  // own key; without this poller, a lost WebSocket event would leave those
-  // keys' consumers stale until restart — the 2026-07-05 incident class.
-  // Started after plugins are running (so keyRotated dispatches reach them);
-  // unchanged polls are no-ops via the propagator's per-key dedup.
-  const trackedKeyPoller = new TrackedKeyPoller({
-    keyNames: allManagedKeyNames.filter((name) => name !== config.managedKey?.name),
-    propagate: (newKey, meta, opts) => keyRotationPropagator.propagate(newKey, meta, opts),
-    isShuttingDown: getIsShuttingDown,
-  });
-
   // Register plugin auto-update service with health module for HTTP endpoints
   if (options.pluginAutoUpdateService) {
     setPluginAutoUpdateService(options.pluginAutoUpdateService);
@@ -529,11 +523,36 @@ export async function startDaemon(options: {
 
   // Create unified WebSocket client with exec secret IDs and managed key names
   const unifiedClient = createUnifiedWebSocketClient(execSecretIds, allManagedKeyNames);
+  let negotiatedCapabilities: string[] = [];
+  const managedTargets = config.hostConfigId && config.agentId ? new ManagedKeyTargets({
+    config,
+    writer: new ManagedKeyTargetWriter(),
+    initial: loadManagedKeyTargetState(config.hostConfigId),
+    persist: state => { saveManagedKeyTargetState(config.hostConfigId as string, state); },
+    reconcile: async request => await reconcileManagedKeyTargets(config.hostConfigId as string, request),
+    bind: async (targetId, request) => await bindManagedKeyTarget(config.hostConfigId as string, targetId, request),
+    acknowledge: ack => unifiedClient.acknowledgeTarget(ack),
+    ownBind: async () => await bindHostManagedKey(config.hostConfigId as string, config.agentId as string),
+    ownMaterial: async material => { acceptHostManagedKey(material); },
+    configChanged: async () => { await handleHostConfigEvent({ event: 'config.updated', hostname: '', version: (config.configVersion ?? 0) + 1, tenantId: config.tenantId ?? '', timestamp: new Date().toISOString() }); },
+  }) : undefined;
+  setManagedKeyTargetsHealth(() => managedTargets?.status() ?? []);
+  unifiedClient.onTargetEvent(event => { void managedTargets?.handleEvent(event); });
+  unifiedClient.onReady((agentId, capabilities) => {
+    negotiatedCapabilities = capabilities;
+    if (config.agentId && agentId !== config.agentId) {
+      managedTargets?.setOwnAuthorization(new Date(0).toISOString());
+      log.error({}, 'REENROLLMENT_REQUIRED: server agent identity differs'); return;
+    }
+    if (config.managedKey?.keyId && config.managedKey.rotationCount !== undefined && config.managedKey.expiresAt) managedTargets?.ownApplied({ keyId: config.managedKey.keyId, rotationCount: config.managedKey.rotationCount, expiresAt: config.managedKey.expiresAt });
+    void managedTargets?.connected(capabilities);
+  });
+
 
   // Initialize degraded mode handler
   initDegradedModeHandler({
-    onCredentialsUpdated: (newKey) => {
-      log.info({ keyPrefix: newKey.substring(0, 8) }, 'Credentials updated via reprovision, reconnecting');
+    onCredentialsUpdated: (_newKey) => {
+      log.info({}, 'Credentials updated via reprovision, reconnecting');
       // Reconnect with new credentials
       unifiedClient.disconnect();
       setTimeout(() => {
@@ -553,12 +572,17 @@ export async function startDaemon(options: {
 
   // Handle degraded connection notifications
   unifiedClient.onDegradedConnection((info) => {
+    if (config.hostConfigId) {
+      managedTargets?.setOwnAuthorization(new Date(0).toISOString());
+      log.error({}, 'REENROLLMENT_REQUIRED: own identity is no longer authorized');
+      return;
+    }
     handleDegradedConnection(info);
   });
 
   // Handle reprovision available notifications
   unifiedClient.onReprovisionAvailable((expiresAt) => {
-    handleReprovisionAvailable(expiresAt);
+    if (!config.hostConfigId) handleReprovisionAvailable(expiresAt);
   });
 
   // Handle certificate events
@@ -782,6 +806,9 @@ export async function startDaemon(options: {
       return;
     }
 
+    // Enrolled own identity uses native $self events and revision reconciliation.
+    if (config.hostConfigId && event.apiKeyName === config.managedKey?.name) return;
+
     // Check if this key is one we're using (exec mode, plugins, or agent's own key)
     if (!allManagedKeyNames.includes(event.apiKeyName)) {
       log.debug({ keyName: event.apiKeyName, tracked: allManagedKeyNames }, 'Received rotation event for untracked managed key');
@@ -798,12 +825,17 @@ export async function startDaemon(options: {
     activeDeployments++;
     try {
       // Fetch the new key via bind
+      if (event.apiKeyName === config.managedKey?.name) {
+        if (config.managedKey.rotationCount !== undefined && event.rotationCount > config.managedKey.rotationCount) managedTargets?.setOwnAuthorization(event.graceExpiresAt);
+        await onWebSocketRotationEvent(event.apiKeyName);
+        if (config.managedKey.keyId && config.managedKey.rotationCount !== undefined && config.managedKey.rotationCount >= event.rotationCount && config.managedKey.expiresAt) managedTargets?.ownApplied({ keyId: config.managedKey.keyId, rotationCount: config.managedKey.rotationCount, expiresAt: config.managedKey.expiresAt });
+        return;
+      }
       const bindResponse = await bindManagedApiKey(event.apiKeyName);
       const newKey = bindResponse.key;
 
       log.info({
         keyName: event.apiKeyName,
-        keyPrefix: newKey.substring(0, 8),
       }, 'Fetched new API key value');
 
       // Propagate to ALL consumers: live config mutation (plugins read
@@ -889,7 +921,12 @@ export async function startDaemon(options: {
             ...result.config.managedKey,  // Vault settings (name, rotation metadata)
           } : config.managedKey,
         };
-        setConfigInMemory(updatedConfig);
+        if ((updatedConfig.managedKeyTargets?.length ?? 0) > 0 && !validateConfig(updatedConfig).valid) throw new Error('Invalid managed key target configuration');
+        managedTargets?.reconfigure(updatedConfig);
+        Object.assign(config, updatedConfig);
+        secretTargets = config.secretTargets ?? [];
+        setConfigInMemory(config);
+        await managedTargets?.connected(negotiatedCapabilities);
 
         log.info({
           version: result.version,
@@ -925,7 +962,9 @@ export async function startDaemon(options: {
     setAgentId(agentId);
   });
 
-  unifiedClient.onDisconnect((reason) => {
+  unifiedClient.onDisconnect((reason, code) => {
+    managedTargets?.disconnected();
+    if (code === 4001) managedTargets?.setOwnAuthorization(new Date(0).toISOString());
     log.warn({ reason }, 'Disconnected from vault');
   });
 
@@ -967,7 +1006,7 @@ export async function startDaemon(options: {
           activeDeployments--;
         }
 
-        log.info({ newKeyPrefix: newKey.substring(0, 8), source: meta.source }, 'Managed key changed, reconnecting WebSocket');
+        log.info({ source: meta.source }, 'Managed key changed, reconnecting WebSocket');
         // Reconnect WebSocket with new key
         unifiedClient.disconnect();
         // Small delay to allow config to be saved
@@ -996,7 +1035,7 @@ export async function startDaemon(options: {
           'To suppress this warning, set ALLOW_STATIC_KEY=true or migrate to a managed key.'
       );
     }
-    startApiKeyRenewal();
+    // Static identities require explicit renewal; no discovery or lifetime-extension timer.
   }
 
   // Connect unified WebSocket
@@ -1011,10 +1050,6 @@ export async function startDaemon(options: {
       log.error({ err }, 'Failed to start plugins');
     }
   }
-
-  // Start the polling rail for non-own tracked keys AFTER plugins are running
-  // so their keyRotated handlers receive the dispatches.
-  trackedKeyPoller.start();
 
   // Initial sync - certificates
   if (config.targets.length > 0) {
@@ -1073,134 +1108,6 @@ export async function startDaemon(options: {
     }
   }
 
-  // Set up polling interval as fallback
-  const pollInterval = (config.pollInterval ?? 3600) * 1000;
-
-  const poll = async (): Promise<void> => {
-    if (getIsShuttingDown()) return;
-
-    log.debug('Starting periodic poll');
-
-    // Poll certificates
-    for (const target of config.targets) {
-      if (getIsShuttingDown()) break;
-
-      try {
-        const result = await deployCertificate(target, false);
-        if (result.fingerprint !== target.lastFingerprint) {
-          log.info({ name: target.name, message: result.message }, 'Certificate updated during poll');
-        }
-      } catch (err) {
-        log.error({ name: target.name, err }, 'Error polling certificate');
-      }
-    }
-
-    // Poll secrets
-    for (const target of secretTargets) {
-      if (getIsShuttingDown()) break;
-
-      try {
-        const result = await deploySecret(target, false);
-        if (result.version !== target.lastVersion) {
-          log.info({ name: target.name, message: result.message }, 'Secret updated during poll');
-        }
-      } catch (err) {
-        log.error({ name: target.name, err }, 'Error polling secret');
-      }
-    }
-
-    // Poll child generations independently. The parent version is unchanged
-    // when a server-resolved reference rotates, so normal target polling alone
-    // cannot detect this class of update.
-    const refreshMetadataByReference = new Map<string, Awaited<ReturnType<typeof getSecretMetadata>>>();
-    const failedRefreshReferences = new Set<string>();
-    for (const refresh of listSecretRefreshTargets(secretTargets)) {
-      if (getIsShuttingDown()) break;
-
-      let metadata = refreshMetadataByReference.get(refresh.reference);
-      if (!metadata && !failedRefreshReferences.has(refresh.reference)) {
-        try {
-          metadata = await getSecretMetadata(refresh.reference);
-          refreshMetadataByReference.set(refresh.reference, metadata);
-        } catch (err) {
-          failedRefreshReferences.add(refresh.reference);
-          log.error(
-            { err, reference: refresh.reference, name: refresh.target.name },
-            'Referenced secret metadata poll failed'
-          );
-        }
-      }
-      if (!metadata) continue;
-
-      const consumedVersion = consumedSecretRefreshVersions.get(refresh.key);
-      if (consumedVersion !== undefined && metadata.version <= consumedVersion) {
-        continue;
-      }
-
-      try {
-        const result = await deploySecret(refresh.target, true);
-        if (result.success) {
-          consumedSecretRefreshVersions.set(refresh.key, metadata.version);
-          log.info(
-            { name: refresh.target.name, reference: refresh.reference, version: metadata.version },
-            'Referenced secret target refreshed during poll'
-          );
-        } else {
-          log.error(
-            { name: refresh.target.name, reference: refresh.reference, error: result.message },
-            'Referenced secret target poll refresh failed'
-          );
-        }
-      } catch (err) {
-        log.error(
-          { name: refresh.target.name, reference: refresh.reference, err },
-          'Error refreshing referenced secret target during poll'
-        );
-      }
-    }
-  };
-
-  const pollTimer = setInterval(() => {
-    poll().catch((e: unknown) => { log.error({ err: e }, 'Poll error'); });
-  }, pollInterval);
-
-  // Periodic managed key file sync check (every 60 seconds)
-  // This catches cases where the file is overwritten/corrupted mid-run
-  let keySyncTimer: NodeJS.Timeout | null = null;
-  if (config.managedKey?.filePath) {
-    const KEY_SYNC_INTERVAL = 60_000; // 60 seconds
-    const managedKeyFilePath = config.managedKey.filePath;
-
-    keySyncTimer = setInterval(() => {
-      if (getIsShuttingDown()) return;
-
-      void (async () => {
-        const syncResult = await syncManagedKeyFile();
-        if (syncResult.wasOutOfSync) {
-          if (syncResult.keptExistingFile) {
-            log.error({
-              filePath: managedKeyFilePath,
-            }, 'Periodic check: config key is STALE (failed vault auth) - kept existing key file');
-          } else if (syncResult.synced) {
-            log.warn({
-              filePath: managedKeyFilePath,
-            }, 'Periodic check: Managed key file was out of sync - auto-fixed');
-          } else {
-            log.error({
-              filePath: managedKeyFilePath,
-              error: syncResult.error,
-            }, 'Periodic check: CRITICAL - Managed key file sync failed');
-          }
-        }
-        // Don't log on success - too noisy
-      })().catch((err: unknown) => {
-        log.error({ err, filePath: managedKeyFilePath }, 'Periodic managed key sync check threw');
-      });
-    }, KEY_SYNC_INTERVAL);
-
-    log.info({ intervalMs: KEY_SYNC_INTERVAL }, 'Periodic managed key file sync check enabled');
-  }
-
   // Graceful shutdown handler
   const shutdown = async (signal: string): Promise<void> => {
     if (getIsShuttingDown()) {
@@ -1215,17 +1122,13 @@ export async function startDaemon(options: {
     cleanupSignalHandlers();
 
     // Stop accepting new events
-    clearInterval(pollTimer);
-    if (keySyncTimer) clearInterval(keySyncTimer);
-    trackedKeyPoller.stop();
+    managedTargets?.stop();
     keyRotationPropagator.stop();
     unifiedClient.disconnect();
 
     // Stop API key renewal service (managed or standard)
     if (isManagedKeyMode()) {
       stopManagedKeyRenewal();
-    } else {
-      stopApiKeyRenewal();
     }
 
     // Cleanup degraded mode handler
@@ -1287,5 +1190,5 @@ export async function startDaemon(options: {
   // Handle shutdown signals (using tracked handlers to prevent memory leak)
   setupSignalHandlers(shutdown);
 
-  log.info({ pollInterval: config.pollInterval ?? 3600 }, 'Agent running. Press Ctrl+C to stop.');
+  log.info({}, 'Agent running. Press Ctrl+C to stop.');
 }

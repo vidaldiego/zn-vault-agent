@@ -1,3 +1,4 @@
+import type { ManagedKeyTargetEvent, ManagedKeyTargetAck } from '../../types/managed-key-targets.js';
 // Path: src/lib/websocket/client.ts
 // Unified WebSocket client implementation
 
@@ -6,7 +7,7 @@ import { loadConfig } from '../config.js';
 import { wsLogger as log } from '../logger.js';
 import { metrics } from '../metrics.js';
 import { setWebSocketStatus, setSecretWebSocketStatus } from '../health.js';
-import { onWebSocketReconnect as notifyManagedKeyReconnect, onWebSocketAuthFailure as notifyManagedKeyAuthFailure } from '../../services/managed-key-renewal.js';
+import { onWebSocketAuthFailure as notifyManagedKeyAuthFailure } from '../../services/managed-key-renewal.js';
 import { setWebSocket as setDynamicSecretsWebSocket } from '../../services/dynamic-secrets/index.js';
 
 import {
@@ -274,11 +275,7 @@ export function createUnifiedWebSocketClient(
     // Note: Registration with capabilities/publicKey is sent AFTER receiving
     // connection_established from the vault to ensure proper timing
 
-    // Notify managed key renewal service of reconnection (for connection loss recovery)
-    if (isReconnect && managedKeyNames.length > 0) {
-      log.debug('Notifying managed key renewal service of reconnection');
-      void notifyManagedKeyReconnect();
-    }
+
   }
 
   /**
@@ -323,7 +320,7 @@ export function createUnifiedWebSocketClient(
 
     const reasonStr = reason.length > 0 ? reason.toString() : `Code: ${code}`;
     log.warn({ ws: 'unified', code, reason: reasonStr }, 'WebSocket disconnected');
-    dispatcher.fireDisconnect(reasonStr);
+    dispatcher.fireDisconnect(reasonStr, code);
 
     // Auth-rejection close family (4000-4099): the server accepted the
     // socket but refused our credentials. These MUST count as failed
@@ -334,7 +331,11 @@ export function createUnifiedWebSocketClient(
 
     // Check for authentication failure (code 4001 = Unauthorized)
     // This happens when the agent's API key is stale/expired/revoked
-    if (code === 4001 && managedKeyNames.length > 0) {
+    if (code === 4001 && loadConfig().hostConfigId) {
+      reconnectManager.disable();
+      void notifyManagedKeyAuthFailure();
+      log.error({}, 'REENROLLMENT_REQUIRED: host authority rejected');
+    } else if (code === 4001 && managedKeyNames.length > 0) {
       log.warn({ ws: 'unified' }, 'WebSocket closed with 4001 (Unauthorized) - attempting managed key recovery');
 
       // BLOCKING recovery - await the result before scheduling reconnect
@@ -458,8 +459,11 @@ export function createUnifiedWebSocketClient(
     onHostConfigEvent: (handler: (event: HostConfigEvent) => void) => { dispatcher.onHostConfigEvent(handler); },
     onDegradedConnection: (handler: (info: DegradedConnectionInfo) => void) => { dispatcher.onDegradedConnection(handler); },
     onReprovisionAvailable: (handler: (expiresAt: string) => void) => { dispatcher.onReprovisionAvailable(handler); },
+    onTargetEvent: (handler: (event: ManagedKeyTargetEvent) => void) => { dispatcher.onTargetEvent(handler); },
+    onReady: (handler: (agentId: string, capabilities: string[]) => void) => { dispatcher.onReady(handler); },
+    acknowledgeTarget: (ack: ManagedKeyTargetAck) => { if (ws?.readyState !== WebSocket.OPEN) return false; ws.send(JSON.stringify(ack)); return true; },
     onConnect: (handler: (agentId: string) => void) => { dispatcher.onConnect(handler); },
-    onDisconnect: (handler: (reason: string) => void) => { dispatcher.onDisconnect(handler); },
+    onDisconnect: (handler: (reason: string, code?: number) => void) => { dispatcher.onDisconnect(handler); },
     onError: (handler: (error: Error) => void) => { dispatcher.onError(handler); },
     updateSubscriptions: (subs: SubscriptionUpdate) => { updateSubscriptions(subs); },
     // Handler removal for cleanup (Phase 8 improvement)

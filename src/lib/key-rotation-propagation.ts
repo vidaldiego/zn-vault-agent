@@ -267,14 +267,12 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
       log.debug({
         keyName: meta.keyName,
         source: meta.source,
-        keyPrefix: newKey.substring(0, 8),
       }, 'Key already propagated - skipping duplicate rotation propagation');
       return { propagated: false, skipped: 'duplicate', pluginsNotified: 0, envVarsUpdated: [], errors: [] };
     }
 
     const startTime = Date.now();
-    const oldPrefix = deps.config.auth.apiKey?.substring(0, 8) ?? '(none)';
-    const newPrefix = meta.newPrefix ?? newKey.substring(0, 8);
+    const newPrefix = meta.newPrefix ?? '[REDACTED]';
     const errors: string[] = [];
     state.lastDetectedAt = detectedAt;
 
@@ -391,8 +389,6 @@ export function createKeyRotationPropagator(deps: KeyRotationPropagatorDeps): Ke
     log.info({
       keyName: meta.keyName,
       source: meta.source,
-      oldPrefix,
-      newPrefix: newKey.substring(0, 8),
       pluginsNotified,
       envVarsUpdated,
       errors: errors.length > 0 ? errors : undefined,

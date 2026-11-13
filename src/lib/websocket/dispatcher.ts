@@ -1,3 +1,4 @@
+import { MANAGED_KEY_TARGET_CAPABILITY, type ManagedKeyTargetEvent } from '../../types/managed-key-targets.js';
 // Path: src/lib/websocket/dispatcher.ts
 // WebSocket message routing and event dispatch
 
@@ -15,9 +16,7 @@ import {
 } from './types.js';
 import { wsLogger as log } from '../logger.js';
 import { setWebSocketStatus, setSecretWebSocketStatus } from '../health.js';
-import { onWebSocketRotationEvent as notifyManagedKeyRotationEvent } from '../../services/managed-key-renewal.js';
 import {
-  isDynamicSecretsEnabled,
   getDynamicSecretsMetadata,
   getDynamicSecretsCapabilities,
   handleIncomingMessage as handleDynamicSecretsIncoming,
@@ -118,6 +117,14 @@ class DeliveryIdDedup {
  * Routes messages to appropriate handlers based on message type.
  */
 export class MessageDispatcher {
+  private serverCapabilities: string[] = [];
+  private nativeSubscribed = false;
+  private readyNotified = false;
+  private targetHandlers: ((event: ManagedKeyTargetEvent) => void)[] = [];
+  private readyHandlers: ((agentId: string, capabilities: string[]) => void)[] = [];
+  onTargetEvent(handler: (event: ManagedKeyTargetEvent) => void): void { this.targetHandlers.push(handler); }
+  onReady(handler: (agentId: string, capabilities: string[]) => void): void { this.readyHandlers.push(handler); }
+
   private readonly handlers: EventHandlers = {
     certificate: [],
     secret: [],
@@ -155,17 +162,20 @@ export class MessageDispatcher {
   handleMessage(ws: WebSocket | null, message: UnifiedAgentEvent): void {
     switch (message.type) {
       case 'registered': {
-        this.registeredAgentId = message.agentId ?? null;
+        this.registeredAgentId = message.agentId ?? (message.data && 'agentId' in message.data ? String(message.data.agentId) : null);
         log.info({ agentId: this.registeredAgentId }, 'Agent registered with vault');
         // Fire connect handlers when we get registered
         const agentId = this.registeredAgentId;
         if (agentId) {
           this.handlers.connect.forEach(h => { h(agentId); });
         }
+        this.notifyReady();
         break;
       }
 
       case 'subscribed':
+        if (message.subscriptions?.managedKeyTargets === true) this.nativeSubscribed = true;
+        this.notifyReady();
         log.info({ subscriptions: message.subscriptions }, 'Subscriptions updated');
         break;
 
@@ -238,7 +248,9 @@ export class MessageDispatcher {
       return;
     }
 
-    if (message.topic === 'certificates' && message.data) {
+    if (message.topic === 'managed-key-targets' && message.data) {
+      this.targetHandlers.forEach(handler => { handler(message.data as ManagedKeyTargetEvent); });
+    } else if (message.topic === 'certificates' && message.data) {
       const event = message.data as CertificateEvent;
       log.info({ event: event.event, certId: event.certificateId }, 'Received certificate event');
       setWebSocketStatus(true, new Date());
@@ -273,14 +285,13 @@ export class MessageDispatcher {
       log.info({
         event: event.event,
         keyName: event.apiKeyName,
-        newPrefix: event.newPrefix,
         graceExpiresAt: event.graceExpiresAt,
         deliveryId,
       }, 'Received API key rotation event');
 
       // Notify managed key renewal service (for safety rail tracking)
       // This must be called BEFORE the handlers to properly mark WS event received
-      void notifyManagedKeyRotationEvent(event.apiKeyName);
+
 
       this.handlers.apiKeyRotation.forEach(h => { h(event); });
     } else if (message.topic === 'hostconfig' && message.data) {
@@ -296,36 +307,30 @@ export class MessageDispatcher {
   }
 
   private handleConnectionEstablished(ws: WebSocket | null, message: UnifiedAgentEvent): void {
-    // Vault sends connection_established with agentId after connection setup is complete
+    this.serverCapabilities = message.capabilities ?? [];
     this.registeredAgentId = message.agentId ?? null;
     log.info({ agentId: this.registeredAgentId }, 'Connection established with server');
-
-    // Now that connection is fully established, send registration with capabilities/publicKey/plugins
-    // This must happen AFTER connection_established to ensure vault has ws.agentId set
     if (ws && ws.readyState === ws.OPEN) {
       const dynamicSecretsMetadata = getDynamicSecretsMetadata();
-      const pluginLoader = getPluginLoader();
-      const plugins = pluginLoader?.getPluginInfo() ?? [];
+      const plugins = getPluginLoader()?.getPluginInfo() ?? [];
+      ws.send(JSON.stringify({
+        type: 'register', metadata: {
+          hostname: getHostname(), version: getAgentVersion(), platform: process.platform,
+          capabilities: [MANAGED_KEY_TARGET_CAPABILITY, 'secrets', 'certificates', ...getDynamicSecretsCapabilities()],
+          publicKey: dynamicSecretsMetadata.publicKey, plugins: plugins.length > 0 ? plugins : undefined,
+        },
+      }));
+      if (this.serverCapabilities.includes(MANAGED_KEY_TARGET_CAPABILITY)) ws.send(JSON.stringify({ type: 'subscribe', topics: ['managed-key-targets'] }));
+    }
+    this.notifyReady();
+  }
 
-      // Always send registration if we have plugins or dynamic secrets
-      if (dynamicSecretsMetadata.publicKey || isDynamicSecretsEnabled() || plugins.length > 0) {
-        const registerMessage = {
-          type: 'register',
-          metadata: {
-            hostname: getHostname(),
-            version: getAgentVersion(),
-            platform: process.platform,
-            capabilities: ['secrets', 'certificates', ...getDynamicSecretsCapabilities()],
-            publicKey: dynamicSecretsMetadata.publicKey,
-            plugins: plugins.length > 0 ? plugins : undefined,
-          },
-        };
-        ws.send(JSON.stringify(registerMessage));
-        log.debug({
-          hasPublicKey: !!dynamicSecretsMetadata.publicKey,
-          pluginCount: plugins.length,
-        }, 'Sent registration with capabilities and plugins');
-      }
+  private notifyReady(): void {
+    if (this.serverCapabilities.includes(MANAGED_KEY_TARGET_CAPABILITY) && !this.nativeSubscribed) return;
+    if (this.registeredAgentId && !this.readyNotified) {
+      this.readyNotified = true;
+      const agentId = this.registeredAgentId;
+      this.readyHandlers.forEach(handler => { handler(agentId, this.serverCapabilities); });
     }
   }
 
@@ -389,7 +394,7 @@ export class MessageDispatcher {
    * Clear the registered agent ID.
    */
   clearAgentId(): void {
-    this.registeredAgentId = null;
+    this.registeredAgentId = null; this.readyNotified = false; this.nativeSubscribed = false; this.serverCapabilities = [];
   }
 
   // Handler registration methods
@@ -425,7 +430,7 @@ export class MessageDispatcher {
     this.handlers.connect.push(handler);
   }
 
-  onDisconnect(handler: (reason: string) => void): void {
+  onDisconnect(handler: (reason: string, code?: number) => void): void {
     this.handlers.disconnect.push(handler);
   }
 
@@ -448,6 +453,7 @@ export class MessageDispatcher {
    * Remove all handlers.
    */
   removeAllHandlers(): void {
+    this.targetHandlers = []; this.readyHandlers = [];
     this.handlers.certificate = [];
     this.handlers.secret = [];
     this.handlers.update = [];
@@ -463,8 +469,8 @@ export class MessageDispatcher {
   /**
    * Fire disconnect handlers.
    */
-  fireDisconnect(reason: string): void {
-    this.handlers.disconnect.forEach(h => { h(reason); });
+  fireDisconnect(reason: string, code?: number): void {
+    this.handlers.disconnect.forEach(h => { h(reason, code); });
   }
 
   /**

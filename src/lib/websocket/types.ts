@@ -1,3 +1,4 @@
+import type { ManagedKeyTargetEvent, ManagedKeyTargetAck } from '../../types/managed-key-targets.js';
 // Path: src/lib/websocket/types.ts
 // WebSocket event types and interfaces
 
@@ -98,10 +99,11 @@ export interface HostConfigEvent {
  * Unified agent event (from /v1/ws/agent)
  */
 export interface UnifiedAgentEvent {
+  capabilities?: string[];
   type: 'pong' | 'event' | 'subscribed' | 'registered' | 'error' | 'connection_established' | 'degraded_connection' | 'reprovision_available' | 'dynamic-secrets' | 'update-available';
-  topic?: 'certificates' | 'secrets' | 'updates' | 'apikeys' | 'reprovision' | 'dynamic-secrets' | 'hostconfig';
-  data?: CertificateEvent | SecretEvent | AgentUpdateEvent | ApiKeyRotationEvent | ReprovisionEvent | DegradedConnectionInfo | HostConfigEvent;
-  subscriptions?: { certificates: string[]; secrets: string[]; managedKeys: string[]; updates: string | null };
+  topic?: 'certificates' | 'secrets' | 'updates' | 'apikeys' | 'reprovision' | 'dynamic-secrets' | 'hostconfig' | 'managed-key-targets';
+  data?: { agentId: string } | ManagedKeyTargetEvent | CertificateEvent | SecretEvent | AgentUpdateEvent | ApiKeyRotationEvent | ReprovisionEvent | DegradedConnectionInfo | HostConfigEvent;
+  subscriptions?: { certificates: string[]; secrets: string[]; managedKeys: string[]; updates: string | null; managedKeyTargets?: boolean };
   agentId?: string;
   message?: string;
   timestamp?: string;
@@ -144,8 +146,11 @@ export interface UnifiedWebSocketClient {
   onHostConfigEvent(handler: (event: HostConfigEvent) => void): void;
   onDegradedConnection(handler: (info: DegradedConnectionInfo) => void): void;
   onReprovisionAvailable(handler: (expiresAt: string) => void): void;
+  onTargetEvent(handler: (event: ManagedKeyTargetEvent) => void): void;
+  onReady(handler: (agentId: string, capabilities: string[]) => void): void;
+  acknowledgeTarget(ack: ManagedKeyTargetAck): boolean;
   onConnect(handler: (agentId: string) => void): void;
-  onDisconnect(handler: (reason: string) => void): void;
+  onDisconnect(handler: (reason: string, code?: number) => void): void;
   onError(handler: (error: Error) => void): void;
   updateSubscriptions(subs: SubscriptionUpdate): void;
   // Handler removal for cleanup
@@ -196,6 +201,6 @@ export interface EventHandlers {
   degradedConnection: ((info: DegradedConnectionInfo) => void)[];
   reprovisionAvailable: ((expiresAt: string) => void)[];
   connect: ((agentId: string) => void)[];
-  disconnect: ((reason: string) => void)[];
+  disconnect: ((reason: string, code?: number) => void)[];
   error: ((error: Error) => void)[];
 }

@@ -72,7 +72,7 @@ zn-vault-agent exec \
 
 ### Certificate Sync
 - **Real-time updates**: WebSocket connection for instant certificate rotation
-- **Fallback polling**: Periodic sync when WebSocket is unavailable
+- **Event-driven delivery**: WebSocket updates with scoped revision reconciliation after reconnect
 - **Atomic deployments**: Uses temp files and rename for safe updates
 - **Automatic rollback**: Reverts on reload or health check failure
 - **Multiple output formats**: Combined (HAProxy), separate cert/key/chain, fullchain (Nginx)
@@ -463,10 +463,10 @@ When using managed keys, the agent automatically persists new keys to the config
    └── Reads /etc/zn-vault-agent/config.json
        └── Contains: auth.apiKey + managedKey.name
 
-2. BIND TO MANAGED KEY
-   │   POST /auth/api-keys/managed/{name}/bind
-   │   Auth: Bearer <stored-api-key>
-   │   └── Returns current valid key (same or rotated)
+2. AUTHENTICATE AND RECONCILE OWN REVISION
+   │   Enrolled hosts authenticate WebSocket using their stored API key
+   │   Reconcile metadata, then use host-scoped self-bind only if changed
+   │   └── Unenrolled legacy mode performs its initial managed bind
    │
    ▼
 3. UPDATE CONFIG (if key changed)
@@ -485,9 +485,9 @@ When using managed keys, the agent automatically persists new keys to the config
    │   Subscribe to real-time rotation events
    │
    ▼
-7. SCHEDULE NEXT REFRESH
-       ├── Proactive: 30s before nextRotationAt
-       └── Safety poll: 50% into grace period
+7. RECEIVE COMMITTED EVENTS
+       ├── Fetch only the changed identity/revision
+       └── Reconcile missed revisions after reconnect; no data discovery timer
 ```
 
 **What's stored in config.json:**
@@ -647,60 +647,34 @@ Password auth stores credentials in the config file. **Not recommended for produ
 }
 ```
 
-## Connection Modes
+## Update delivery
 
-The agent supports two connection modes. **WebSocket is recommended** for production deployments.
+The daemon receives committed changes through WebSocket. It performs an initial
+read and reconciles native managed-key revisions once the authenticated channel
+reconnects. It does not discover changes through periodic HTTP requests. A lost
+channel is reported as stale; existing authorized material remains until its known
+deadline. Transport heartbeats and reconnect backoff carry no business reads.
 
-### WebSocket Mode (Recommended)
+### Native managed-key targets
 
-WebSocket provides real-time push notifications when certificates or secrets are rotated:
+An enrolled host can configure `managedKeyTargets` with `{id,keyId,output,owner,mode}`.
+Each target references an exact managed-key identity, writes only within
+`/run/zn-vault-agent/secrets`, and must have an exclusive output path. Modes are
+`0400`, `0440`, `0600`, or `0640`. Provision the runtime directory and consumer
+traversal permissions through installation/systemd; the agent does not elevate
+itself to create a privileged ownership arrangement. The agent owns that directory,
+which must not allow group or world writes.
 
-```json
-{
-  "websocket": true,
-  "pollInterval": 3600
-}
-```
+The server must negotiate `managed-key-targets-v1`. Host-scoped bind endpoints
+require the registered host identity and `config:read`, without administrative
+`api_key:read`. Own agent credentials, application secret-reader credentials and
+KMS credentials remain separate. ACKs follow successful atomic replacement;
+public revision/deadline metadata is stored separately from target material.
 
-**Benefits:**
-- **Instant updates**: Receives certificate/secret changes immediately
-- **Lower latency**: No waiting for poll interval
-- **Efficient**: Single persistent connection vs repeated HTTP requests
-- **Disconnect alerts**: Server monitors connection health and can alert on disconnect
-
-**When WebSocket is unavailable**, the agent falls back to polling automatically.
-
-### Polling Mode
-
-Polling periodically checks for updates via HTTP requests:
-
-```json
-{
-  "pollInterval": 3600
-}
-```
-
-Use polling when:
-- WebSocket connections are blocked by firewall
-- Updates are infrequent and immediate sync isn't critical
-- Minimizing persistent connections is required
-
-### Recommended Configuration
-
-For most deployments, enable both WebSocket and polling as fallback:
-
-```json
-{
-  "vaultUrl": "https://vault.example.com",
-  "tenantId": "my-tenant",
-  "auth": {
-    "apiKey": "znv_abc123..."
-  },
-  "websocket": true,
-  "pollInterval": 3600,
-  "targets": [...]
-}
-```
+On revocation, files are removed only when custody matches the configured target.
+A rejected own identity is blocked and requires explicit reenrollment. Rotation of
+material does not extend the absolute lifetime of its identity. `pollInterval` in
+legacy configuration is ignored by this daemon.
 
 ## Configuration
 

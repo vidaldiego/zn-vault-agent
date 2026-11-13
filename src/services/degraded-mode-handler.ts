@@ -50,7 +50,6 @@ interface DegradedState {
   agentId?: string;
   reprovisionAvailable: boolean;
   reprovisionExpiresAt?: string;
-  pollTimer?: NodeJS.Timeout;
 }
 
 // Module state
@@ -64,7 +63,6 @@ let onCredentialsUpdated: ((newKey: string) => void) | null = null;
 let onStateChanged: ((isDegraded: boolean, reason?: DegradedReason) => void) | null = null;
 
 // Constants
-const REPROVISION_POLL_INTERVAL = 30000; // Poll every 30 seconds
 
 /**
  * Initialize degraded mode handler
@@ -96,10 +94,7 @@ export function handleDegradedConnection(info: DegradedConnectionInfo): void {
   // Notify callback
   onStateChanged?.(true, info.reason);
 
-  // Start polling for reprovision status if we can receive it
-  if (info.canReceiveReprovision && !state.pollTimer) {
-    startReprovisionPolling();
-  }
+
 }
 
 /**
@@ -227,52 +222,6 @@ export async function claimReprovisionToken(token: string): Promise<boolean> {
  * polling the API, since API calls require valid authentication.
  * This function is kept for potential future use with degraded auth support.
  */
-function pollReprovisionStatus(): void {
-  if (!state.isDegraded || !state.agentId) {
-    return;
-  }
-
-  // In degraded mode, we can't poll the API because our credentials are invalid.
-  // Instead, we rely on WebSocket reconnection which supports degraded auth.
-  // The server will send us reprovision_available messages when a token is ready.
-  log.debug({
-    agentId: state.agentId,
-    reprovisionAvailable: state.reprovisionAvailable,
-  }, 'Degraded mode - waiting for reprovision notification via WebSocket');
-}
-
-/**
- * Start polling for reprovision status
- */
-function startReprovisionPolling(): void {
-  if (state.pollTimer) {
-    clearInterval(state.pollTimer);
-  }
-
-  // Initial poll
-  pollReprovisionStatus();
-
-  // Set up interval
-  state.pollTimer = setInterval(() => {
-    pollReprovisionStatus();
-  }, REPROVISION_POLL_INTERVAL);
-
-  log.debug({ interval: REPROVISION_POLL_INTERVAL }, 'Started reprovision status polling');
-}
-
-/**
- * Stop polling for reprovision status
- */
-function stopReprovisionPolling(): void {
-  if (state.pollTimer) {
-    clearInterval(state.pollTimer);
-    state.pollTimer = undefined;
-  }
-}
-
-/**
- * Update credentials after successful reprovision
- */
 function updateCredentials(newKey: string): void {
   try {
     // Update API key in config file and environment
@@ -289,7 +238,6 @@ function updateCredentials(newKey: string): void {
  * Clear degraded state after successful reprovision
  */
 function clearDegradedState(): void {
-  stopReprovisionPolling();
 
   state = {
     isDegraded: false,
@@ -339,7 +287,6 @@ export function setAgentId(agentId: string): void {
  * Cleanup handler
  */
 export function cleanupDegradedModeHandler(): void {
-  stopReprovisionPolling();
   state = {
     isDegraded: false,
     reprovisionAvailable: false,

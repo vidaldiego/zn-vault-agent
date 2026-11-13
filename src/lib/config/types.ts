@@ -1,3 +1,4 @@
+import type { ManagedKeyTarget } from '../../types/managed-key-targets.js';
 // Path: src/lib/config/types.ts
 // Configuration type definitions
 
@@ -116,6 +117,9 @@ export type { ExecSecret } from '../secret-env.js';
  * Managed API key configuration for automatic rotation
  */
 export interface ManagedKeyConfig {
+  keyId?: string;
+  rotationCount?: number;
+  expiresAt?: string;
   /** Managed key name in vault */
   name: string;
   /** File path to write the API key to (for apps that read from file) */
@@ -205,6 +209,7 @@ export interface AgentConfig {
   targets: CertTarget[];
   /** Secret targets */
   secretTargets?: SecretTarget[];
+  managedKeyTargets?: ManagedKeyTarget[];
   /** Exec mode configuration (run child process with secrets as env vars) */
   exec?: ExecConfig;
   /** Global reload command (if not set per-target) */

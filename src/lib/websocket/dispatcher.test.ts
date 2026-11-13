@@ -207,3 +207,17 @@ describe('MessageDispatcher update-available', () => {
     expect(updateCalls[0].channel).toBe('beta');
   });
 });
+
+describe('host managed target negotiation', () => {
+  it('retains capability until registered.data identity and subscribes before ready', () => {
+    const dispatcher = new MessageDispatcher({ managedKeyNames: [], onPongReceived: () => {} });
+    const order: string[] = [];
+    const socket = { readyState: 1, OPEN: 1, send: (value: string) => { const message = JSON.parse(value) as { type: string }; order.push(message.type); } };
+    dispatcher.onReady((agentId, capabilities) => { order.push(`ready:${agentId}:${capabilities.join(',')}`); });
+    dispatcher.handleMessage(socket as never, { type: 'connection_established', capabilities: ['managed-key-targets-v1'] });
+    dispatcher.handleMessage(socket as never, { type: 'registered', data: { agentId: 'agent-a' } } as unknown as UnifiedAgentEvent);
+    expect(order).toEqual(['register', 'subscribe']);
+    dispatcher.handleMessage(socket as never, { type: 'subscribed', subscriptions: { certificates: [], secrets: [], managedKeys: [], updates: null, managedKeyTargets: true } } as unknown as UnifiedAgentEvent);
+    expect(order).toEqual(['register', 'subscribe', 'ready:agent-a:managed-key-targets-v1']);
+  });
+});

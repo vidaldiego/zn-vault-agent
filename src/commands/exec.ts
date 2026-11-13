@@ -20,7 +20,6 @@ import {
   type EnvFileMapping,
 } from '../lib/secret-env.js';
 import { createKeyRotationPropagator } from '../lib/key-rotation-propagation.js';
-import { TrackedKeyPoller } from '../services/managed-key/tracked-keys-poller.js';
 import { createUnifiedWebSocketClient, type ApiKeyRotationEvent, type SecretEvent } from '../lib/websocket.js';
 import { bindManagedApiKey, getSecret } from '../lib/api.js';
 import { execLogger as log } from '../lib/logger.js';
@@ -293,16 +292,6 @@ async function startWatchMode(
     }
   }
 
-  // Polling rail for tracked keys BEYOND the agent's own auth key: the
-  // renewal service above covers only config.managedKey.name; other
-  // `api-key:` mappings would otherwise depend solely on WebSocket events.
-  const trackedKeyPoller = new TrackedKeyPoller({
-    keyNames: apiKeyNames.filter((name) => name !== loadConfig().managedKey?.name),
-    propagate: (newKey, meta, opts) => keyRotationPropagator.propagate(newKey, meta, opts),
-    isShuttingDown: () => isShuttingDown,
-  });
-  trackedKeyPoller.start();
-
   // Create WebSocket client with subscriptions
   const wsClient = createUnifiedWebSocketClient(secretIds, apiKeyNames);
 
@@ -465,7 +454,6 @@ async function startWatchMode(
     console.log(chalk.blue('\nℹ') + ` Received ${signal}, shutting down...`);
 
     wsClient.disconnect();
-    trackedKeyPoller.stop();
 
     if (isManagedKeyMode()) {
       stopManagedKeyRenewal();

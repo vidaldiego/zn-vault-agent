@@ -40,7 +40,7 @@ Examples:
           tenantId: config.tenantId,
           authMethod: config.auth.apiKey ? 'apiKey' : (config.auth.username ? 'password' : 'none'),
           insecure: config.insecure,
-          pollInterval: config.pollInterval ?? 3600,
+          updateDelivery: 'websocket',
           targets: targets.map(t => ({
             name: t.name,
             certId: t.certId,
@@ -77,7 +77,7 @@ Examples:
       console.log(`  Tenant ID:    ${config.tenantId}`);
       console.log(`  Auth Method:  ${config.auth.apiKey ? 'API Key' : 'Username/Password'}`);
       console.log(`  TLS Verify:   ${config.insecure ? chalk.yellow('disabled') : chalk.green('enabled')}`);
-      console.log(`  Poll Interval: ${config.pollInterval ?? 3600}s`);
+      console.log('  Update Delivery: WebSocket (no polling)');
       console.log();
 
       console.log(chalk.bold('Certificate Targets'));

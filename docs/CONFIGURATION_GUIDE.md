@@ -1,3 +1,5 @@
+> Update delivery is event-driven. Legacy `pollInterval` fields below are ignored; no fallback polling is enabled. Native managed-key targets require the scoped host protocol described in README.md.
+
 # ZnVault Agent Configuration Guide
 
 This guide helps you choose the right configuration approach and understand the key concepts.
@@ -63,7 +65,7 @@ Before diving into the paths, understand these core concepts:
 │                                                                             │
 │  3. OPERATION MODE     How does the agent run?                              │
 │     ──────────────                                                          │
-│     • Daemon           → Continuous sync with WebSocket/polling             │
+│     • Daemon           → Continuous sync with WebSocket events             │
 │     • Exec             → Run command once with secrets injected             │
 │     • Combined         → Daemon + managed child process                     │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -254,7 +256,7 @@ When you update the host template, all connected agents receive the new config:
 # Edit the template
 znvault host config haproxy-prod --edit
 
-# Or sync immediately (doesn't wait for poll)
+# Or request an explicit sync
 znvault host sync haproxy-prod
 ```
 

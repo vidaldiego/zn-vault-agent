@@ -33,3 +33,6 @@ coverage/
 
 # Claude
 .claude/
+
+# Local implementation ledger and verification artifacts
+.superpowers/

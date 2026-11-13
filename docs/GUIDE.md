@@ -1,3 +1,5 @@
+> Update delivery is event-driven. Legacy `pollInterval` fields below are ignored; no fallback polling is enabled. Native managed-key targets require the scoped host protocol described in README.md.
+
 # ZnVault Agent Guide
 
 Comprehensive documentation for the ZnVault Certificate Agent.
@@ -660,7 +662,7 @@ The agent checks for system config first, then falls back to user config.
 | `insecure` | `false` | Skip TLS certificate verification |
 | `targets` | `[]` | List of certificates to sync |
 | `globalReloadCmd` | - | Command to run after any certificate update |
-| `pollInterval` | `3600` | Seconds between polling (WebSocket fallback) |
+| `pollInterval` | ignored | Legacy field; periodic refresh is disabled |
 | `verbose` | `false` | Enable verbose logging |
 
 ### Target Options

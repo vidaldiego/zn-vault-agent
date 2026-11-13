@@ -1,3 +1,4 @@
+import type { ManagedKeyTarget } from '../../types/managed-key-targets.js';
 // Path: src/lib/config/vault-loader.ts
 // Load agent configuration from vault server (config-from-vault mode)
 
@@ -17,6 +18,7 @@ interface VaultConfigResponse {
   config: {
     targets?: CertTarget[];
     secretTargets?: SecretTarget[];
+    managedKeyTargets?: ManagedKeyTarget[];
     plugins?: PluginConfig[];
     exec?: ExecConfig;
     globalReloadCmd?: string;
@@ -187,6 +189,7 @@ export async function fetchConfigFromVault(options: FetchConfigOptions): Promise
             insecure,
             targets: response.config.targets ?? [],
             secretTargets: response.config.secretTargets ?? [],
+            managedKeyTargets: response.config.managedKeyTargets ?? [],
             exec: response.config.exec,
             globalReloadCmd: response.config.globalReloadCmd,
             pollInterval: response.config.pollInterval ?? 3600,

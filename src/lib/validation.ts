@@ -235,15 +235,23 @@ export function validateConfig(config: Partial<AgentConfig>): ValidationResult {
     }
   }
 
-  // Poll interval
-  if (config.pollInterval !== undefined) {
-    if (typeof config.pollInterval !== 'number' || config.pollInterval < 60) {
-      warnings.push({
-        field: 'pollInterval',
-        message: 'Poll interval is less than 60 seconds',
-        suggestion: 'Consider using at least 300 seconds (5 minutes) to reduce load',
-      });
-    }
+  const outputs = new Set<string>([
+    ...(config.secretTargets ?? []).flatMap(target => target.output ? [path.resolve(target.output)] : []),
+    ...(config.targets ?? []).flatMap(target => Object.values(target.outputs).filter((output): output is string => !!output).map(output => path.resolve(output))),
+    ...(config.exec?.envFile ? [path.resolve(config.exec.envFile)] : []),
+    ...(config.exec?.secrets ?? []).filter(secret => secret.outputToFile).map(secret => path.resolve(process.env.ZNVAULT_SECRETS_DIR ?? '/run/zn-vault-agent/secrets', secret.env)),
+    ...(config.managedKey?.filePath ? [path.resolve(config.managedKey.filePath)] : []),
+  ]);
+  const ids = new Set<string>();
+  if ((config.managedKeyTargets?.length ?? 0) > 32) errors.push({ field: 'managedKeyTargets', message: 'At most 32 managed key targets are allowed' });
+  for (const [index, target] of (config.managedKeyTargets ?? []).entries()) {
+    const field = `managedKeyTargets[${index}]`;
+    if (!config.hostConfigId || !config.agentId || !config.auth?.apiKey) errors.push({ field, message: 'Registered host API-key identity required' });
+    if (!/^[a-zA-Z0-9_-]+$/.test(target.id) || !target.keyId || ids.has(target.id)) errors.push({ field, message: 'Unique target ID and exact key ID required' });
+    ids.add(target.id);
+    if (!target.output || path.dirname(target.output) !== '/run/zn-vault-agent/secrets' || path.resolve(target.output) !== target.output || outputs.has(path.resolve(target.output))) errors.push({ field, message: 'Target requires an exclusive output in the agent tmpfs directory' });
+    outputs.add(path.resolve(target.output || '/'));
+    if (!/^0[46][04]0$/.test(target.mode) || !/^[a-zA-Z0-9_-]+:[a-zA-Z0-9_-]+$/.test(target.owner)) errors.push({ field, message: 'Restricted mode and explicit user:group required' });
   }
 
   const result = {

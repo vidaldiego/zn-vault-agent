@@ -364,7 +364,7 @@ describe('createKeyRotationPropagator', () => {
     expect(ctx.config.auth.apiKey).toBe(KEY_A);
   });
 
-  it('should log an explicit rotation-pickup line with source and prefixes', async () => {
+  it('logs rotation metadata without key material or derived fragments', async () => {
     const { deps, ctx } = makeDeps();
     const propagator = createKeyRotationPropagator(deps);
 
@@ -376,9 +376,10 @@ describe('createKeyRotationPropagator', () => {
     expect(pickupCall?.[0]).toMatchObject({
       keyName: KEY_NAME,
       source: 'reconnect',
-      oldPrefix: KEY_A.substring(0, 8),
-      newPrefix: KEY_B.substring(0, 8),
     });
+    const logged = JSON.stringify(infoCalls);
+    expect(logged).not.toContain(KEY_A.substring(0, 8));
+    expect(logged).not.toContain(KEY_B.substring(0, 8));
   });
 
   it('should work without a plugin loader (no plugins configured)', async () => {

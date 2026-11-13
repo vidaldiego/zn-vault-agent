@@ -3,6 +3,7 @@
 // Re-exports from modular implementation for backward compatibility
 
 export {
+  acceptHostManagedKey,
   startManagedKeyRenewal,
   stopManagedKeyRenewal,
   forceRefresh,

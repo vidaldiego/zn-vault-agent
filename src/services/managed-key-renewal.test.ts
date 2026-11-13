@@ -17,6 +17,7 @@ vi.mock('../lib/config.js', () => ({
 
 vi.mock('../lib/api.js', () => ({
   bindManagedApiKey: vi.fn(),
+  bindHostManagedKey: vi.fn(),
 }));
 
 vi.mock('../lib/logger.js', () => ({
@@ -30,7 +31,7 @@ vi.mock('../lib/logger.js', () => ({
 
 // Import mocked modules
 import { loadConfig, updateManagedKey, isManagedKeyMode } from '../lib/config.js';
-import { bindManagedApiKey } from '../lib/api.js';
+import { bindManagedApiKey, bindHostManagedKey } from '../lib/api.js';
 import type { ManagedApiKeyBindResponse } from '../lib/api.js';
 
 // Import the module under test after mocks
@@ -134,6 +135,12 @@ describe('Managed Key Renewal Service', () => {
     });
   });
 
+  it('defers an enrolled own key bind until authenticated revision reconciliation', async () => {
+    vi.mocked(loadConfig).mockReturnValue({ ...mockConfig, hostConfigId: 'host', agentId: 'agent' } as ReturnType<typeof loadConfig>);
+    await startManagedKeyRenewal();
+    expect(bindHostManagedKey).not.toHaveBeenCalled(); expect(bindManagedApiKey).not.toHaveBeenCalled();
+  });
+
   describe('stopManagedKeyRenewal', () => {
     it('should stop the service and clear timers', async () => {
       await startManagedKeyRenewal();
@@ -181,7 +188,7 @@ describe('Managed Key Renewal Service', () => {
 
       expect(status.isRunning).toBe(true);
       expect(status.isManagedMode).toBe(true);
-      expect(status.currentKeyPrefix).toBe('znv_new_...');
+      expect(status.currentKeyPrefix).toBeUndefined();
     });
   });
 
@@ -231,72 +238,11 @@ describe('Managed Key Renewal Service', () => {
     });
   });
 
-  describe('refresh scheduling', () => {
-    it('should schedule refresh based on nextRotationAt', async () => {
-      // Set rotation time to 1 hour from now
-      const nextRotation = new Date(Date.now() + 3600000);
-      vi.mocked(loadConfig).mockReturnValue({
-        ...mockConfig,
-        managedKey: {
-          ...mockConfig.managedKey!,
-          nextRotationAt: nextRotation.toISOString(),
-        },
-      } as ReturnType<typeof loadConfig>);
-
-      // Mock bind response WITHOUT graceExpiresAt to avoid grace period poll
-      // interfering with refresh scheduling test
-      vi.mocked(bindManagedApiKey).mockResolvedValue({
-        ...mockBindResponse,
-        graceExpiresAt: undefined, // Disable grace period poll for this test
-        nextRotationAt: nextRotation.toISOString(),
-      });
-
-      await startManagedKeyRenewal();
-
-      // Clear the initial bind call
-      vi.mocked(bindManagedApiKey).mockClear();
-
-      // Advance time to just before refresh (30 seconds before rotation)
-      // Refresh should happen 30 seconds before rotation by default
-      vi.advanceTimersByTime(3600000 - 30000 - 1000); // 1 second before refresh
-
-      expect(bindManagedApiKey).not.toHaveBeenCalled();
-
-      // Advance past refresh time
-      vi.advanceTimersByTime(2000);
-
-      // Should have refreshed
-      expect(bindManagedApiKey).toHaveBeenCalled();
-    });
-
-    it('should use fallback interval when no rotation time available', async () => {
-      vi.mocked(loadConfig).mockReturnValue({
-        ...mockConfig,
-        managedKey: {
-          name: 'test-managed-key',
-          // No nextRotationAt or graceExpiresAt
-        },
-      } as ReturnType<typeof loadConfig>);
-
-      vi.mocked(bindManagedApiKey).mockResolvedValue({
-        ...mockBindResponse,
-        nextRotationAt: undefined,
-        graceExpiresAt: undefined,
-      });
-
-      await startManagedKeyRenewal();
-
-      // Clear initial bind
-      vi.mocked(bindManagedApiKey).mockClear();
-
-      // Fallback interval is 5 minutes (300000ms)
-      vi.advanceTimersByTime(300000 - 1000);
-
-      expect(bindManagedApiKey).not.toHaveBeenCalled();
-
-      vi.advanceTimersByTime(2000);
-
-      expect(bindManagedApiKey).toHaveBeenCalled();
-    });
+  it('does not discover rotation by periodic bind while no event arrives', async () => {
+    await startManagedKeyRenewal();
+    const initialCalls = vi.mocked(bindManagedApiKey).mock.calls.length;
+    await vi.advanceTimersByTimeAsync(7200000);
+    expect(bindManagedApiKey).toHaveBeenCalledTimes(initialCalls);
   });
+
 });

@@ -1,3 +1,4 @@
+import type { ManagedKeyMaterial, ManagedKeyTargetsReconcileRequest, ManagedKeyTargetsReconcileResponse, ManagedKeyTargetBindRequest, ManagedKeyTargetBindResponse } from '../types/managed-key-targets.js';
 // Path: src/lib/api.ts
 // Vault API client with retry logic and observability
 
@@ -17,7 +18,12 @@ interface RequestOptions {
   noRetry?: boolean;
 }
 
+export class VaultHttpError extends Error {
+  constructor(message: string, readonly statusCode: number, readonly code?: string) { super(message); this.name = 'VaultHttpError'; }
+}
+
 interface ApiError {
+  code?: string;
   error: string;
   message: string;
   statusCode: number;
@@ -80,6 +86,8 @@ export interface DecryptedSecret {
 }
 
 export interface ManagedApiKeyBindResponse {
+  rotationCount?: number;
+  authorizedUntil?: string;
   id: string;
   key: string;
   prefix: string;
@@ -215,7 +223,7 @@ async function request<T>(options: RequestOptions): Promise<T> {
         const errorMessage = error?.message ?? `Request failed with status ${result.statusCode}`;
 
         lastStatusCode = result.statusCode;
-        lastError = new Error(errorMessage);
+        lastError = new VaultHttpError(errorMessage, result.statusCode, typeof error?.code === 'string' ? error.code : undefined);
 
         // Don't retry auth errors
         if (result.statusCode === 401 || result.statusCode === 403) {
@@ -735,4 +743,15 @@ export async function getAgentTLSCA(): Promise<AgentTLSCAResponse> {
     method: 'GET',
     path: '/v1/agents/tls/ca',
   });
+}
+
+/** Host identity guards replace administrative api_key:read for enrolled agents. */
+export async function bindHostManagedKey(hostConfigId: string, agentId: string): Promise<ManagedKeyMaterial> {
+  return await request({ method: 'POST', path: `/v1/hosts/${encodeURIComponent(hostConfigId)}/managed-key/bind`, body: { agentId }, noRetry: true });
+}
+export async function reconcileManagedKeyTargets(hostConfigId: string, body: ManagedKeyTargetsReconcileRequest): Promise<ManagedKeyTargetsReconcileResponse> {
+  return await request({ method: 'POST', path: `/v1/hosts/${encodeURIComponent(hostConfigId)}/managed-key-targets/reconcile`, body, noRetry: true });
+}
+export async function bindManagedKeyTarget(hostConfigId: string, targetId: string, body: ManagedKeyTargetBindRequest): Promise<ManagedKeyTargetBindResponse> {
+  return await request({ method: 'POST', path: `/v1/hosts/${encodeURIComponent(hostConfigId)}/managed-key-targets/${encodeURIComponent(targetId)}/bind`, body, noRetry: true });
 }

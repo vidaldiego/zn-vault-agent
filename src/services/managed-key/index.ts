@@ -3,6 +3,7 @@
 
 // Main service functions
 export {
+  acceptHostManagedKey,
   startManagedKeyRenewal,
   stopManagedKeyRenewal,
   forceRefresh,

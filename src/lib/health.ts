@@ -1,3 +1,4 @@
+import type { ManagedKeyTargetStatus } from '../types/managed-key-targets.js';
 // Path: src/lib/health.ts
 // HTTP and HTTPS health and metrics endpoint for zn-vault-agent using Fastify
 
@@ -31,6 +32,7 @@ try {
 }
 
 export interface HealthStatus {
+  managedKeyTargets?: ManagedKeyTargetStatus[];
   status: 'healthy' | 'degraded' | 'unhealthy';
   timestamp: string;
   uptime: number;
@@ -56,6 +58,9 @@ export interface HealthStatus {
   childProcess?: ChildProcessState;
   plugins?: PluginHealthStatus[];
 }
+
+let managedKeyTargetsHealth: () => ManagedKeyTargetStatus[] = () => [];
+export function setManagedKeyTargetsHealth(getStatus: () => ManagedKeyTargetStatus[]): void { managedKeyTargetsHealth = getStatus; }
 
 // Track health state
 let certWsConnected = false;
@@ -204,7 +209,11 @@ export async function getHealthStatus(): Promise<HealthStatus> {
     }
   }
 
+  const keyTargets = managedKeyTargetsHealth();
+  if (keyTargets.some(target => ['failed', 'revoked', 'reenrollment_required'].includes(target.state))) status = 'unhealthy';
+  else if (keyTargets.some(target => target.state !== 'current')) status = 'degraded';
   const result: HealthStatus = {
+    managedKeyTargets: keyTargets,
     status,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
