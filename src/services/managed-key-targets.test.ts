@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';
 import { ManagedKeyTargets, type ManagedKeyTargetState } from './managed-key-targets.js';
 import { ManagedKeyTargetWriter } from '../lib/managed-key-target-writer.js';
-import type { ManagedKeyTargetEvent, ManagedKeyTargetAck, ManagedKeyMaterial } from '../types/managed-key-targets.js';
+import type { ManagedKeyTargetEvent, ManagedKeyTargetAck, ManagedKeyMaterial, ManagedKeyTargetsReconcileRequest, ManagedKeyTargetsReconcileResponse } from '../types/managed-key-targets.js';
 
 let root: string;
 beforeEach(() => { vi.useFakeTimers(); root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'managed-key-flow-'))); });
@@ -15,16 +15,20 @@ function setup(initial?: ManagedKeyTargetState) {
   const ownKeys: string[] = [];
   const ownMaterial: ManagedKeyMaterial = { tenantId: 'tenant', keyId: 'key-agent', name: 'agent', key: 'synthetic-own-new', rotationCount: 2, expiresAt: expiry() };
   let bind = async () => ({ hostConfigId: 'host', targetId: 'reader', targetConfigVersion: 14, material });
+  let reconcile = async (request: ManagedKeyTargetsReconcileRequest): Promise<ManagedKeyTargetsReconcileResponse> => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [], changed: request.applied.length ? [] : [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 1, reason: 'initial' }] });
+  const saved: ManagedKeyTargetState[] = [];
   const service = new ManagedKeyTargets({
     initial,
     config: { tenantId: 'tenant', hostConfigId: 'host', agentId: 'agent', configVersion: 14, managedKeyTargets: [target] },
     writer: new ManagedKeyTargetWriter(root),
-    reconcile: async request => { reads++; return { tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [], changed: request.applied.length ? [] : [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 1, reason: 'initial' as const }] }; },
+    reconcile: async request => { reads++; return await reconcile(request); },
+    persist: state => { saved.push(structuredClone(state)); },
+    configChanged: async () => {},
     ownBind: async () => ownMaterial, ownMaterial: async material => { ownKeys.push(material.key); },
     bind: async () => { reads++; return await bind(); }, acknowledge: ack => { acks.push(ack); return true; },
   });
   const event = (rotationCount = 2): ManagedKeyTargetEvent => ({ event: 'managed-key-target.changed', deliveryId: `delivery-${rotationCount}`, tenantId: 'tenant', hostConfigId: 'host', targetId: 'reader', targetConfigVersion: 14, keyId: 'key-reader', rotationCount });
-  return { target, service, acks, event, ownKeys, reads: () => reads, setMaterial: (value: ManagedKeyMaterial) => { material = value; }, setBind: (value: typeof bind) => { bind = value; } };
+  return { target, service, acks, event, ownKeys, saved, setReconcile: (value: typeof reconcile) => { reconcile = value; }, reads: () => reads, setMaterial: (value: ManagedKeyMaterial) => { material = value; }, setBind: (value: typeof bind) => { bind = value; } };
 }
 
 describe('event-driven target delivery', () => {
@@ -149,6 +153,61 @@ describe('event-driven target delivery', () => {
     await f.service.connected(['managed-key-targets-v1']);
     await f.service.handleEvent({ ...f.event(1), targetId: '$self', keyId: 'key-agent', expiresAt: new Date(Date.now() + 1000).toISOString() });
     await vi.advanceTimersByTimeAsync(1001); expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
+  });
+
+  it('review 1: captures equal pending revision deadline before the stale bind resolves', async () => {
+    const f = setup(); await f.service.connected(['managed-key-targets-v1']);
+    let finish!: (value: Awaited<ReturnType<Parameters<typeof f.setBind>[0]>>) => void;
+    f.setBind(() => new Promise(resolve => { finish = resolve; }));
+    const first = f.service.handleEvent(f.event(2)); await Promise.resolve();
+    const deadline = new Date(Date.now() + 1000).toISOString();
+    const second = f.service.handleEvent({ ...f.event(2), deliveryId: 'deadline-rev2', expiresAt: deadline, authorizedUntil: deadline });
+    finish({ hostConfigId: 'host', targetId: 'reader', targetConfigVersion: 14, material: { tenantId: 'tenant', keyId: 'key-reader', name: 'reader', key: 'synthetic-stale-bind', rotationCount: 2, expiresAt: new Date(Date.now() + 100000).toISOString() } });
+    await Promise.all([first, second]); await vi.advanceTimersByTimeAsync(1001);
+    expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
+  });
+  it('review 2: predecessor grace cannot extend an earlier installed identity expiry', async () => {
+    const f = setup(); const deadline = new Date(Date.now() + 1000).toISOString();
+    f.setMaterial({ tenantId: 'tenant', keyId: 'key-reader', name: 'reader', key: 'synthetic-first', rotationCount: 1, expiresAt: deadline });
+    await f.service.connected(['managed-key-targets-v1']);
+    f.setBind(async () => { throw new Error('Unavailable'); });
+    await f.service.handleEvent({ ...f.event(2), graceExpiresAt: new Date(Date.now() + 10000).toISOString() });
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(fs.existsSync(f.target.output)).toBe(false);
+    expect(f.saved.at(-1)?.applied.every(item => !item.expiresAt || Date.parse(item.expiresAt) <= Date.parse(deadline))).toBe(true); f.service.stop();
+  });
+  it('review 3: reconnect retires an expired predecessor even when current material bind fails', async () => {
+    const f = setup(); await f.service.connected(['managed-key-targets-v1']);
+    f.setBind(async () => { throw new Error('Unavailable'); });
+    f.setReconcile(async () => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [], changed: [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 2, reason: 'rotated', graceExpiresAt: new Date(Date.now() - 1).toISOString() }] }));
+    await f.service.connected(['managed-key-targets-v1']);
+    expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
+  });
+  it('review 4: future config reconciliation revokes before a no-op reload and fences pending writes', async () => {
+    const f = setup(); await f.service.connected(['managed-key-targets-v1']);
+    let finish!: (value: Awaited<ReturnType<Parameters<typeof f.setBind>[0]>>) => void;
+    f.setBind(() => new Promise(resolve => { finish = resolve; }));
+    const pending = f.service.handleEvent(f.event(2)); await Promise.resolve();
+    f.setReconcile(async () => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 15, configChanged: true, changed: [], removed: [{ targetId: 'reader', keyId: 'key-reader', reason: 'removed' }] }));
+    await f.service.connected(['managed-key-targets-v1']);
+    expect(fs.existsSync(f.target.output)).toBe(false);
+    finish({ hostConfigId: 'host', targetId: 'reader', targetConfigVersion: 14, material: { tenantId: 'tenant', keyId: 'key-reader', name: 'reader', key: 'synthetic-late', rotationCount: 2, expiresAt: expiry() } });
+    await pending; expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
+  });
+  it('review 4b: config mismatch with no completed reload cannot admit an old config write', async () => {
+    const f = setup(); await f.service.connected(['managed-key-targets-v1']);
+    f.setReconcile(async () => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 15, configChanged: true, changed: [], removed: [] }));
+    await f.service.connected(['managed-key-targets-v1']); const reads = f.reads();
+    expect(f.service.status()[0].state).toBe('stale');
+    await f.service.handleEvent(f.event(2)); expect(f.reads()).toBe(reads); f.service.stop();
+  });
+
+  it('review 3 own: reconnect blocks a missing own predecessor instead of binding past its grace', async () => {
+    const f = setup({ applied: [], own: { keyId: 'key-agent', rotationCount: 0, expiresAt: expiry() } });
+    await f.service.connected(['managed-key-targets-v1']);
+    f.setReconcile(async () => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, changed: [], removed: [], ownChanged: { keyId: 'key-agent', rotationCount: 2, reason: 'rotated' } }));
+    await f.service.connected(['managed-key-targets-v1']);
+    expect(f.ownKeys).toEqual([]); expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
   });
 
 });

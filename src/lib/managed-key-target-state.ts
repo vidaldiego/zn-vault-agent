@@ -20,8 +20,8 @@ export function loadManagedKeyTargetState(hostConfigId: string): ManagedKeyTarge
 export function saveManagedKeyTargetState(hostConfigId: string, state: ManagedKeyTargetState): void {
   const file = statePath(hostConfigId); const temporary = `${file}.${randomUUID()}.tmp`;
   // Project public metadata explicitly; a material DTO can never be serialized by accident.
-  const publicState: ManagedKeyTargetState = { applied: state.applied.map(item => ({ targetId: item.targetId, keyId: item.keyId, rotationCount: item.rotationCount, expiresAt: item.expiresAt, target: item.target ? { id: item.target.id, keyId: item.target.keyId, output: item.target.output, owner: item.target.owner, mode: item.target.mode } : undefined })),
-    own: state.own ? { keyId: state.own.keyId, rotationCount: state.own.rotationCount, expiresAt: state.own.expiresAt } : undefined };
+  const publicState: ManagedKeyTargetState = { applied: state.applied.map(item => ({ targetId: item.targetId, keyId: item.keyId, rotationCount: item.rotationCount, expiresAt: item.expiresAt, predecessorExpiresAt: item.predecessorExpiresAt, target: item.target ? { id: item.target.id, keyId: item.target.keyId, output: item.target.output, owner: item.target.owner, mode: item.target.mode } : undefined })),
+    own: state.own ? { keyId: state.own.keyId, rotationCount: state.own.rotationCount, expiresAt: state.own.expiresAt, predecessorExpiresAt: state.own.predecessorExpiresAt } : undefined };
   const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
   try { fs.writeFileSync(fd, JSON.stringify(publicState)); fs.fsyncSync(fd); fs.renameSync(temporary, file); }
   finally { fs.closeSync(fd); try { fs.unlinkSync(temporary); } catch { /* already renamed */ } }

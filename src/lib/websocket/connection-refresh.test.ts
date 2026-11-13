@@ -40,4 +40,9 @@ describe('referenced secret subscriptions', () => {
       '00000000-0000-4000-8000-000000000001',
     ]);
   });
+  it('advertises scoped target delivery before registration so upgrade replay is fenced', () => {
+    const url = new URL(buildWebSocketUrl());
+    expect(url.searchParams.get('capabilities')?.split(',')).toContain('managed-key-targets-v1');
+  });
+
 });

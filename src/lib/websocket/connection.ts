@@ -1,3 +1,4 @@
+import { MANAGED_KEY_TARGET_CAPABILITY } from '../../types/managed-key-targets.js';
 // Path: src/lib/websocket/connection.ts
 // WebSocket connection URL building and sensitive data masking
 
@@ -70,7 +71,7 @@ export function buildWebSocketUrl(
   url.searchParams.set('platform', process.platform);
 
   // Add capabilities (including dynamic-secrets if enabled)
-  const capabilities = ['secrets', 'certificates', ...getDynamicSecretsCapabilities()];
+  const capabilities = [MANAGED_KEY_TARGET_CAPABILITY, 'secrets', 'certificates', ...getDynamicSecretsCapabilities()];
   url.searchParams.set('capabilities', capabilities.join(','));
 
   return url.toString();
