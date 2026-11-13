@@ -1,7 +1,7 @@
 import type { ManagedKeyTargetWriter } from '../lib/managed-key-target-writer.js';
 import {
   MANAGED_KEY_TARGET_CAPABILITY,
-  type ManagedKeyTarget, type ManagedKeyRevision, type ManagedKeyMaterial,
+  type ManagedKeyTarget, type ManagedKeyRevision, type ManagedKeyMaterial, type ManagedKeyDeadlineSnapshot,
   type ManagedKeyTargetEvent, type ManagedKeyTargetAck, type ManagedKeyTargetStatus,
   type ManagedKeyTargetsReconcileRequest, type ManagedKeyTargetsReconcileResponse,
   type ManagedKeyTargetBindRequest, type ManagedKeyTargetBindResponse,
@@ -11,9 +11,11 @@ interface TargetConfig {
   tenantId?: string; hostConfigId?: string; agentId?: string; configVersion?: number;
   managedKeyTargets?: ManagedKeyTarget[];
 }
+export interface ManagedKeyServerSnapshot extends ManagedKeyDeadlineSnapshot { rotationCount: number }
 export interface ManagedKeyTargetState {
+  ownSnapshot?: ManagedKeyServerSnapshot;
   ownLimit?: { keyId: string; expiresAt: string };
-  applied: (ManagedKeyRevision & { expiresAt?: string; predecessorExpiresAt?: string; target?: ManagedKeyTarget })[];
+  applied: (ManagedKeyRevision & { expiresAt?: string; predecessorExpiresAt?: string; serverSnapshot?: ManagedKeyServerSnapshot; target?: ManagedKeyTarget })[];
   own?: { keyId: string; rotationCount: number; expiresAt?: string; predecessorExpiresAt?: string };
 }
 interface Dependencies {
@@ -29,7 +31,7 @@ interface Dependencies {
   configChanged?(): Promise<void>;
 }
 interface State {
-  target: ManagedKeyTarget; generation: number; rotationCount?: number; expiresAt?: string; predecessorExpiresAt?: string;
+  target: ManagedKeyTarget; generation: number; serverSnapshot?: ManagedKeyServerSnapshot; rotationCount?: number; expiresAt?: string; predecessorExpiresAt?: string;
   revoked?: boolean;
   state: ManagedKeyTargetStatus['state']; chain: Promise<void>; deadline?: ReturnType<typeof setTimeout>;
 }
@@ -50,6 +52,7 @@ export class ManagedKeyTargets {
   private configRefreshRequired = false;
   private own?: ManagedKeyTargetState['own'];
   private ownLimit?: ManagedKeyTargetState['ownLimit'];
+  private ownSnapshot?: ManagedKeyServerSnapshot;
   private ownRevoked = false;
   private ownChain: Promise<void> = Promise.resolve();
   private ownDeadline?: ReturnType<typeof setTimeout>;
@@ -61,11 +64,12 @@ export class ManagedKeyTargets {
     for (const target of this.config.managedKeyTargets ?? []) {
       const applied = deps.initial?.applied.find(item => item.targetId === target.id && item.keyId === target.keyId);
       const sameSpec = applied?.target && sameTarget(applied.target, target);
-      const state: State = { target, generation: 0, rotationCount: sameSpec ? applied.rotationCount : undefined, expiresAt: sameSpec ? applied.expiresAt : undefined, predecessorExpiresAt: sameSpec ? applied.predecessorExpiresAt : undefined, state: 'initializing', chain: Promise.resolve() };
+      const state: State = { target, generation: 0, rotationCount: sameSpec ? applied.rotationCount : undefined, expiresAt: sameSpec ? applied.expiresAt : undefined, predecessorExpiresAt: sameSpec ? applied.predecessorExpiresAt : undefined, serverSnapshot: sameSpec ? applied.serverSnapshot : undefined, state: 'initializing', chain: Promise.resolve() };
       this.states.set(target.id, state);
       if (state.expiresAt && state.rotationCount !== undefined) this.armDeadline(state, state.expiresAt, state.rotationCount);
     }
     this.own = deps.initial?.own;
+    this.ownSnapshot = deps.initial?.ownSnapshot;
     this.ownLimit = deps.initial?.ownLimit;
     if (this.ownLimit) this.setOwnAuthorization(this.ownLimit.expiresAt);
     if (this.own?.expiresAt || this.own?.predecessorExpiresAt) this.setOwnAuthorization(this.own.predecessorExpiresAt ?? this.own.expiresAt as string);
@@ -75,9 +79,10 @@ export class ManagedKeyTargets {
   }
   private save(): void {
     this.deps.persist?.({
-      applied: [...this.states.values()].filter(state => state.rotationCount !== undefined && state.state !== 'revoked').map(state => ({ targetId: state.target.id, keyId: state.target.keyId, rotationCount: state.rotationCount ?? 0, expiresAt: state.expiresAt, predecessorExpiresAt: state.predecessorExpiresAt, target: state.target })),
+      applied: [...this.states.values()].filter(state => state.rotationCount !== undefined && state.state !== 'revoked').map(state => ({ targetId: state.target.id, keyId: state.target.keyId, rotationCount: state.rotationCount ?? 0, expiresAt: state.expiresAt, predecessorExpiresAt: state.predecessorExpiresAt, serverSnapshot: state.serverSnapshot, target: state.target })),
       own: this.own,
       ownLimit: this.ownLimit,
+      ownSnapshot: this.ownSnapshot,
     });
   }
   private identity(): { agentId: string; hostConfigId: string; version: number } {
@@ -93,8 +98,8 @@ export class ManagedKeyTargets {
     try {
       const identity = this.identity();
       const response = await this.deps.reconcile({ agentId: identity.agentId, targetConfigVersion: identity.version,
-        applied: [...this.states.values()].filter(state => state.rotationCount !== undefined && this.deps.writer.isValid(state.target)).map(state => ({ targetId: state.target.id, keyId: state.target.keyId, rotationCount: state.rotationCount ?? 0 })),
-        ...(this.own ? { own: { keyId: this.own.keyId, rotationCount: this.own.rotationCount } } : {}),
+        applied: [...this.states.values()].filter(state => state.rotationCount !== undefined && this.deps.writer.isValid(state.target)).map(state => ({ targetId: state.target.id, keyId: state.target.keyId, rotationCount: state.rotationCount ?? 0, ...this.requestSnapshot(state.serverSnapshot, state.rotationCount) })),
+        ...(this.own ? { own: { keyId: this.own.keyId, rotationCount: this.own.rotationCount, ...this.requestSnapshot(this.ownSnapshot, this.own.rotationCount) } } : {}),
       });
       if (epoch !== this.epoch || this.stopped) return;
       if (response.tenantId !== this.config.tenantId || response.hostConfigId !== identity.hostConfigId) throw new Error('Reconciliation identity mismatch');
@@ -102,21 +107,30 @@ export class ManagedKeyTargets {
         const state = this.states.get(removed.targetId);
         if (state?.target.keyId === removed.keyId) this.revoke(state);
       }
+      // Own authority metadata fences all target work before any asynchronous reload/bind.
+      if (response.ownChanged && this.own && response.ownChanged.keyId !== this.own.keyId) { this.setOwnAuthorization(new Date(0).toISOString()); return; }
+      if (response.ownChanged && !this.observeOwnRevision(response.ownChanged)) return;
       if (response.configChanged || response.targetConfigVersion !== identity.version) {
         this.requireConfiguration(response.targetConfigVersion); await this.deps.configChanged?.(); return;
       }
       if (!this.configurationCurrent()) return;
-      if (response.ownChanged && this.deps.ownBind && this.deps.ownMaterial) {
+      // Admit all target limits now, before a possible asynchronous own material refresh.
+      const admitted = response.changed.filter(change => {
+        const state = this.states.get(change.targetId);
+        return state?.target.keyId === change.keyId && this.observeRevision(state, change.rotationCount, change);
+      });
+      if (response.ownChanged && (!this.own || response.ownChanged.rotationCount > this.own.rotationCount) && this.deps.ownBind && this.deps.ownMaterial) {
         if (this.own && (this.own.keyId !== response.ownChanged.keyId || this.own.rotationCount < response.ownChanged.rotationCount - 1)) { this.setOwnAuthorization(new Date(0).toISOString()); return; }
         const material = await this.deps.ownBind();
         if (epoch !== this.epoch || material.tenantId !== this.config.tenantId || material.keyId !== response.ownChanged.keyId || material.rotationCount < response.ownChanged.rotationCount) throw new Error('Own identity mismatch');
-        if (!this.observeOwnRevision({ keyId: material.keyId, rotationCount: material.rotationCount, expiresAt: material.expiresAt, authorizedUntil: material.authorizedUntil }) || !this.ownAuthorityCurrent(material.keyId)) return;
+        if (!this.observeOwnRevision({ keyId: material.keyId, rotationCount: material.rotationCount, expiresAt: material.expiresAt, authorizedUntil: material.authorizedUntil, graceExpiresAt: material.graceExpiresAt }) || !this.ownAuthorityCurrent(material.keyId)) return;
         await this.deps.ownMaterial(material);
         this.ownApplied({ keyId: material.keyId, rotationCount: material.rotationCount, expiresAt: material.authorizedUntil ?? material.expiresAt });
       }
-      await Promise.all(response.changed.map(change => {
+      await Promise.all(admitted.map(change => {
         const state = this.states.get(change.targetId);
         if (!state || state.target.keyId !== change.keyId || !this.observeRevision(state, change.rotationCount, change)) return Promise.resolve();
+        if (change.reason === 'metadata_changed' && state.rotationCount === change.rotationCount) return Promise.resolve();
         return this.enqueue(state, change.rotationCount);
       }));
       for (const state of this.states.values()) if (state.state === 'stale' && this.deps.writer.isValid(state.target)) state.state = 'current';
@@ -189,7 +203,7 @@ export class ManagedKeyTargets {
         const material = await this.deps.ownBind?.();
         if (!material || epoch !== this.epoch || this.ownRevoked || this.stopped) return;
         if (material.tenantId !== this.config.tenantId || material.keyId !== event.keyId || material.rotationCount < event.rotationCount) throw new Error('Own identity mismatch');
-        if (!this.observeOwnRevision({ keyId: material.keyId, rotationCount: material.rotationCount, expiresAt: material.expiresAt, authorizedUntil: material.authorizedUntil }) || !this.ownAuthorityCurrent(material.keyId)) return;
+        if (!this.observeOwnRevision({ keyId: material.keyId, rotationCount: material.rotationCount, expiresAt: material.expiresAt, authorizedUntil: material.authorizedUntil, graceExpiresAt: material.graceExpiresAt }) || !this.ownAuthorityCurrent(material.keyId)) return;
         await this.deps.ownMaterial?.(material);
         if (epoch !== this.epoch || this.ownRevoked || this.stopped || !this.ownAuthorityCurrent(material.keyId)) return;
         this.ownApplied({ keyId: material.keyId, rotationCount: material.rotationCount, expiresAt: material.authorizedUntil ?? material.expiresAt });
@@ -202,12 +216,25 @@ export class ManagedKeyTargets {
     };
     this.ownChain = this.ownChain.then(run, run); await this.ownChain;
   }
+  private serverSnapshot(rotationCount: number, limits: Partial<ManagedKeyDeadlineSnapshot>): ManagedKeyServerSnapshot | undefined {
+    if (!limits.expiresAt || !limits.authorizedUntil || !Number.isFinite(Date.parse(limits.expiresAt)) || !Number.isFinite(Date.parse(limits.authorizedUntil))) return undefined;
+    return { rotationCount, expiresAt: limits.expiresAt, authorizedUntil: limits.authorizedUntil, ...(limits.graceExpiresAt !== undefined ? { graceExpiresAt: limits.graceExpiresAt } : {}) };
+  }
+  private requestSnapshot(snapshot: ManagedKeyServerSnapshot | undefined, rotationCount: number | undefined): Partial<ManagedKeyDeadlineSnapshot> {
+    if (!snapshot || snapshot.rotationCount !== rotationCount) return {};
+    return { expiresAt: snapshot.expiresAt, authorizedUntil: snapshot.authorizedUntil, ...(snapshot.graceExpiresAt !== undefined ? { graceExpiresAt: snapshot.graceExpiresAt } : {}) };
+  }
   /** Own limits are admitted on receipt, independently of the serialized material callback. */
   private observeOwnRevision(event: { keyId: string; rotationCount: number; expiresAt?: string; authorizedUntil?: string; graceExpiresAt?: string }): boolean {
     if ((this.own && event.keyId !== this.own.keyId) || (this.ownLimit && event.keyId !== this.ownLimit.keyId)) return false;
     if (this.own && event.rotationCount < this.own.rotationCount) return this.ownAuthorityCurrent(event.keyId);
     const supplied = [event.expiresAt, event.authorizedUntil].filter((value): value is string => value !== undefined).map(value => Date.parse(value));
     if (supplied.some(value => !Number.isFinite(value))) { this.setOwnAuthorization(new Date(0).toISOString()); return false; }
+    const snapshot = this.serverSnapshot(event.rotationCount, event);
+    if (snapshot && (!this.ownSnapshot || snapshot.rotationCount >= this.ownSnapshot.rotationCount)) {
+      this.ownSnapshot = snapshot;
+      try { this.save(); } catch { this.setOwnAuthorization(new Date(0).toISOString()); return false; }
+    }
     if (supplied.length) {
       const deadline = Math.min(this.own?.expiresAt ? Date.parse(this.own.expiresAt) : Infinity, this.ownLimit ? Date.parse(this.ownLimit.expiresAt) : Infinity, ...supplied);
       this.ownLimit = { keyId: event.keyId, expiresAt: new Date(deadline).toISOString() };
@@ -215,6 +242,7 @@ export class ManagedKeyTargets {
       this.setOwnAuthorization(this.ownLimit.expiresAt);
       try { this.save(); } catch { this.setOwnAuthorization(new Date(0).toISOString()); return false; }
     }
+    if (snapshot && this.own?.rotationCount === event.rotationCount - 1 && !snapshot.graceExpiresAt) { this.setOwnAuthorization(new Date(0).toISOString()); return false; }
     if (this.own && this.own.rotationCount < event.rotationCount - 1) { this.setOwnAuthorization(new Date(0).toISOString()); return false; }
     if (event.graceExpiresAt && this.own?.rotationCount === event.rotationCount - 1) this.armOwnPredecessor(event.graceExpiresAt);
     return this.ownAuthorityCurrent(event.keyId);
@@ -236,7 +264,10 @@ export class ManagedKeyTargets {
   private observeRevision(state: State, rotationCount: number, limits: { expiresAt?: string; authorizedUntil?: string; graceExpiresAt?: string }): boolean {
     if (!Number.isSafeInteger(rotationCount) || rotationCount < 0 || state.revoked) return false;
     if (state.rotationCount !== undefined && rotationCount < state.rotationCount) return true;
+    const snapshot = this.serverSnapshot(rotationCount, limits);
+    if (snapshot && (!state.serverSnapshot || rotationCount >= state.serverSnapshot.rotationCount)) state.serverSnapshot = snapshot;
     if (!this.tightenTargetDeadline(state, limits) || state.revoked) return false;
+    if (snapshot && state.rotationCount === rotationCount - 1 && !snapshot.graceExpiresAt) this.retirePredecessor(state);
     if (state.rotationCount !== undefined && state.rotationCount < rotationCount - 1) this.retirePredecessor(state);
     else if (limits.graceExpiresAt && state.rotationCount === rotationCount - 1) this.armDeadline(state, limits.graceExpiresAt, state.rotationCount, true);
     return !state.revoked;
@@ -270,6 +301,7 @@ export class ManagedKeyTargets {
         if (!Number.isFinite(deadline) || deadline <= Date.now()) throw new Error('Material authorization expired');
         this.deps.writer.write(state.target, material.key, current);
         if (!current()) return;
+        if (state.serverSnapshot?.rotationCount !== material.rotationCount) state.serverSnapshot = this.serverSnapshot(material.rotationCount, material);
         state.rotationCount = material.rotationCount; state.predecessorExpiresAt = undefined; state.expiresAt = new Date(deadline).toISOString(); state.state = this.connectedNow ? 'current' : 'stale';
         this.armDeadline(state, state.expiresAt, material.rotationCount);
         try { this.save(); } catch { this.revoke(state); throw new Error('Applied revision metadata unavailable'); }

@@ -16,7 +16,7 @@ function setup(initial?: ManagedKeyTargetState) {
   const ownMaterial: ManagedKeyMaterial = { tenantId: 'tenant', keyId: 'key-agent', name: 'agent', key: 'synthetic-own-new', rotationCount: 2, expiresAt: expiry() };
   let ownBind = async (): Promise<ManagedKeyMaterial> => ownMaterial;
   let bind = async () => ({ hostConfigId: 'host', targetId: 'reader', targetConfigVersion: 14, material });
-  let reconcile = async (request: ManagedKeyTargetsReconcileRequest): Promise<ManagedKeyTargetsReconcileResponse> => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [], changed: request.applied.length ? [] : [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 1, reason: 'initial' }] });
+  let reconcile = async (request: ManagedKeyTargetsReconcileRequest): Promise<ManagedKeyTargetsReconcileResponse> => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [], changed: request.applied.length ? [] : [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 1, reason: 'initial', expiresAt: material.expiresAt, authorizedUntil: material.authorizedUntil ?? material.expiresAt }] });
   const saved: ManagedKeyTargetState[] = [];
   const service = new ManagedKeyTargets({
     initial,
@@ -180,7 +180,7 @@ describe('event-driven target delivery', () => {
   it('review 3: reconnect retires an expired predecessor even when current material bind fails', async () => {
     const f = setup(); await f.service.connected(['managed-key-targets-v1']);
     f.setBind(async () => { throw new Error('Unavailable'); });
-    f.setReconcile(async () => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [], changed: [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 2, reason: 'rotated', graceExpiresAt: new Date(Date.now() - 1).toISOString() }] }));
+    f.setReconcile(async () => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [], changed: [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 2, reason: 'rotated', expiresAt: expiry(), authorizedUntil: expiry(), graceExpiresAt: new Date(Date.now() - 1).toISOString() }] }));
     await f.service.connected(['managed-key-targets-v1']);
     expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
   });
@@ -206,7 +206,7 @@ describe('event-driven target delivery', () => {
   it('review 3 own: reconnect blocks a missing own predecessor instead of binding past its grace', async () => {
     const f = setup({ applied: [], own: { keyId: 'key-agent', rotationCount: 0, expiresAt: expiry() } });
     await f.service.connected(['managed-key-targets-v1']);
-    f.setReconcile(async () => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, changed: [], removed: [], ownChanged: { keyId: 'key-agent', rotationCount: 2, reason: 'rotated' } }));
+    f.setReconcile(async () => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, changed: [], removed: [], ownChanged: { keyId: 'key-agent', rotationCount: 2, reason: 'rotated', expiresAt: expiry(), authorizedUntil: expiry() } }));
     await f.service.connected(['managed-key-targets-v1']);
     expect(f.ownKeys).toEqual([]); expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
   });
@@ -219,7 +219,7 @@ describe('event-driven target delivery', () => {
     const first = f.service.handleEvent({ ...f.event(2), targetId: '$self', keyId: 'key-agent' });
     await Promise.resolve();
     const deadline = new Date(Date.now() + 1000).toISOString();
-    const second = f.service.handleEvent({ ...f.event(2), deliveryId: 'own-deadline', targetId: '$self', keyId: 'key-agent', expiresAt: deadline, authorizedUntil: deadline });
+    const second = f.service.handleEvent({ ...f.event(2), deliveryId: 'own-deadline', targetId: '$self', keyId: 'key-agent', expiresAt: deadline, authorizedUntil: deadline, graceExpiresAt: expiry() });
     await vi.advanceTimersByTimeAsync(1001);
     const remainedAfterDeadline = fs.existsSync(f.target.output);
     finish({ tenantId: 'tenant', keyId: 'key-agent', name: 'agent', key: 'synthetic-stale-own', rotationCount: 2, expiresAt: new Date(Date.now() + 100000).toISOString() });
@@ -231,4 +231,100 @@ describe('event-driven target delivery', () => {
     f.service.stop();
   });
 
+});
+
+describe('reconnect deadline snapshots', () => {
+  it('learns a missed target deadline at the same revision without bind, rewrite or ACK, then sends its exact snapshot', async () => {
+    const f = setup(); await f.service.connected(['managed-key-targets-v1']);
+    const inode = fs.statSync(f.target.output).ino; const reads = f.reads();
+    const deadline = new Date(Date.now() + 1000).toISOString(); const requests: ManagedKeyTargetsReconcileRequest[] = [];
+    f.setReconcile(async request => {
+      requests.push(structuredClone(request));
+      const known = request.applied[0] as typeof request.applied[0] & { expiresAt?: string; authorizedUntil?: string };
+      return { tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [], changed: known?.expiresAt === deadline && known.authorizedUntil === deadline ? [] : [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 1, reason: 'metadata_changed', expiresAt: deadline, authorizedUntil: deadline }] };
+    });
+    f.service.disconnected(); await f.service.connected(['managed-key-targets-v1']);
+    expect(fs.statSync(f.target.output).ino).toBe(inode); expect(f.reads()).toBe(reads + 1); expect(f.acks).toEqual([]);
+    f.service.disconnected(); await f.service.connected(['managed-key-targets-v1']);
+    expect(requests[1].applied[0]).toMatchObject({ expiresAt: deadline, authorizedUntil: deadline });
+    await vi.advanceTimersByTimeAsync(1001); expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
+  });
+  it('learns a missed own deadline at the same revision without self-bind and fences a pending target bind immediately', async () => {
+    const f = setup(); await f.service.connected(['managed-key-targets-v1']);
+    f.service.ownApplied({ keyId: 'key-agent', rotationCount: 1, expiresAt: expiry() });
+    let ownBinds = 0; f.setOwnBind(async () => { ownBinds++; return { tenantId: 'tenant', keyId: 'key-agent', name: 'agent', key: 'synthetic-own', rotationCount: 1, expiresAt: expiry() }; });
+    let finish!: (value: Awaited<ReturnType<Parameters<typeof f.setBind>[0]>>) => void;
+    f.setBind(() => new Promise(resolve => { finish = resolve; }));
+    const deadline = new Date(Date.now() + 1000).toISOString();
+    f.setReconcile(async () => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [],
+      ownChanged: { keyId: 'key-agent', rotationCount: 1, reason: 'metadata_changed', expiresAt: deadline, authorizedUntil: deadline },
+      changed: [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 2, reason: 'rotated', expiresAt: expiry(), authorizedUntil: deadline, graceExpiresAt: expiry() }] }));
+    f.service.disconnected(); const pending = f.service.connected(['managed-key-targets-v1']);
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function')); await vi.advanceTimersByTimeAsync(1001);
+    expect.soft(ownBinds).toBe(0); expect.soft(f.ownKeys).toEqual([]); expect.soft(fs.existsSync(f.target.output)).toBe(false);
+    finish({ hostConfigId: 'host', targetId: 'reader', targetConfigVersion: 14, material: { tenantId: 'tenant', keyId: 'key-reader', name: 'reader', key: 'synthetic-late', rotationCount: 2, expiresAt: expiry() } });
+    await pending; expect(f.acks).toEqual([]); expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
+  });
+  it('remembers the exact extended server snapshot while retaining the earlier enforced minimum', async () => {
+    const f = setup(); const early = new Date(Date.now() + 1000).toISOString(); const extended = expiry();
+    f.setMaterial({ tenantId: 'tenant', keyId: 'key-reader', name: 'reader', key: 'synthetic-first', rotationCount: 1, expiresAt: early, authorizedUntil: early });
+    await f.service.connected(['managed-key-targets-v1']); const requests: ManagedKeyTargetsReconcileRequest[] = [];
+    let metadataResponses = 0;
+    f.setReconcile(async request => {
+      requests.push(structuredClone(request)); const known = request.applied[0] as typeof request.applied[0] & { expiresAt?: string; authorizedUntil?: string };
+      const changed = known?.expiresAt === extended && known.authorizedUntil === extended ? [] : [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 1, reason: 'metadata_changed' as const, expiresAt: extended, authorizedUntil: extended }];
+      if (changed.length) metadataResponses++;
+      return { tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [], changed };
+    });
+    f.service.disconnected(); await f.service.connected(['managed-key-targets-v1']);
+    f.service.disconnected(); await f.service.connected(['managed-key-targets-v1']);
+    expect(metadataResponses).toBe(1); expect(requests[1].applied[0]).toMatchObject({ expiresAt: extended, authorizedUntil: extended });
+    expect(f.saved.at(-1)?.applied[0].expiresAt).toBe(early);
+    await vi.advanceTimersByTimeAsync(1001); expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
+  });
+});
+
+it('sends an exact own snapshot once learned without extending its enforced deadline or self-binding', async () => {
+  const f = setup(); await f.service.connected(['managed-key-targets-v1']);
+  const early = new Date(Date.now() + 1000).toISOString(); const extended = expiry();
+  f.service.ownApplied({ keyId: 'key-agent', rotationCount: 1, expiresAt: early });
+  const requests: ManagedKeyTargetsReconcileRequest[] = []; let changes = 0;
+  f.setOwnBind(async () => { throw new Error('Unexpected self-bind'); });
+  f.setReconcile(async request => {
+    requests.push(structuredClone(request));
+    const ownChanged = request.own?.expiresAt === extended && request.own.authorizedUntil === extended ? undefined : { keyId: 'key-agent', rotationCount: 1, reason: 'metadata_changed' as const, expiresAt: extended, authorizedUntil: extended };
+    if (ownChanged) changes++;
+    return { tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, changed: [], removed: [], ownChanged };
+  });
+  f.service.disconnected(); await f.service.connected(['managed-key-targets-v1']);
+  f.service.disconnected(); await f.service.connected(['managed-key-targets-v1']);
+  expect(changes).toBe(1); expect(requests[1].own).toMatchObject({ expiresAt: extended, authorizedUntil: extended });
+  expect(f.saved.at(-1)?.own?.expiresAt).toBe(early); expect(f.ownKeys).toEqual([]); expect(f.acks).toEqual([]);
+  await vi.advanceTimersByTimeAsync(1001); expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
+});
+
+it('a full snapshot without grace retires a target predecessor before a failed bind', async () => {
+  const f = setup(); await f.service.connected(['managed-key-targets-v1']);
+  f.setBind(async () => { throw new Error('Unavailable'); });
+  await f.service.handleEvent({ ...f.event(2), expiresAt: expiry(), authorizedUntil: expiry() });
+  expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
+});
+
+it('a full own snapshot without grace blocks the predecessor without self-bind', async () => {
+  const f = setup(); await f.service.connected(['managed-key-targets-v1']);
+  f.service.ownApplied({ keyId: 'key-agent', rotationCount: 1, expiresAt: expiry() });
+  let binds=0; f.setOwnBind(async () => { binds++; throw new Error('Unexpected'); });
+  f.setReconcile(async () => ({ tenantId:'tenant',hostConfigId:'host',targetConfigVersion:14,configChanged:false,changed:[],removed:[],ownChanged:{keyId:'key-agent',rotationCount:2,reason:'rotated',expiresAt:expiry(),authorizedUntil:expiry()} }));
+  f.service.disconnected(); await f.service.connected(['managed-key-targets-v1']);
+  expect(binds).toBe(0); expect(fs.existsSync(f.target.output)).toBe(false); expect(f.service.status()[0].state).toBe('reenrollment_required'); f.service.stop();
+});
+
+it('binds a full own DTO within predecessor grace and never applies that grace to the new current material', async () => {
+  const f = setup(); await f.service.connected(['managed-key-targets-v1']);
+  f.service.ownApplied({ keyId:'key-agent',rotationCount:1,expiresAt:expiry() });
+  const grace = new Date(Date.now()+1000).toISOString();
+  f.setOwnBind(async () => ({ tenantId:'tenant',keyId:'key-agent',name:'agent',key:'synthetic-full-own',rotationCount:2,expiresAt:expiry(),authorizedUntil:expiry(),graceExpiresAt:grace }));
+  await f.service.handleEvent({ ...f.event(2),targetId:'$self',keyId:'key-agent',expiresAt:expiry(),authorizedUntil:expiry(),graceExpiresAt:grace });
+  expect(f.ownKeys).toEqual(['synthetic-full-own']);
+  await vi.advanceTimersByTimeAsync(1001); expect(fs.existsSync(f.target.output)).toBe(true); f.service.stop();
 });

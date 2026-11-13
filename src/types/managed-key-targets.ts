@@ -1,20 +1,21 @@
 /** Host-scoped managed-key wire contract. Material DTOs must never reach logs or health. */
 export const MANAGED_KEY_TARGET_CAPABILITY = 'managed-key-targets-v1';
 export interface ManagedKeyTarget { id: string; keyId: string; output: string; owner: string; mode: string }
-export interface ManagedKeyRevision { targetId: string; keyId: string; rotationCount: number }
+export interface ManagedKeyDeadlineSnapshot { expiresAt: string; authorizedUntil: string; graceExpiresAt?: string }
+export interface ManagedKeyRevision extends Partial<ManagedKeyDeadlineSnapshot> { targetId: string; keyId: string; rotationCount: number }
 export interface ManagedKeyMaterial {
   tenantId: string; keyId: string; name: string; key: string; rotationCount: number;
   expiresAt: string; graceExpiresAt?: string; nextRotationAt?: string; authorizedUntil?: string;
 }
 export interface ManagedKeyTargetsReconcileRequest {
   agentId: string; targetConfigVersion?: number; applied: ManagedKeyRevision[];
-  own?: { keyId: string; rotationCount: number };
+  own?: { keyId: string; rotationCount: number } & Partial<ManagedKeyDeadlineSnapshot>;
 }
 export interface ManagedKeyTargetsReconcileResponse {
   tenantId: string; hostConfigId: string; targetConfigVersion: number; configChanged: boolean;
-  changed: (ManagedKeyRevision & { reason: 'initial' | 'rotated' | 'target_changed'; graceExpiresAt?: string })[];
+  changed: (ManagedKeyRevision & ManagedKeyDeadlineSnapshot & { reason: 'initial' | 'rotated' | 'target_changed' | 'metadata_changed' })[];
   removed: { targetId: string; keyId: string; reason: 'removed' | 'revoked' }[];
-  ownChanged?: { keyId: string; rotationCount: number; reason: 'initial' | 'rotated' };
+  ownChanged?: { keyId: string; rotationCount: number; reason: 'initial' | 'rotated' | 'metadata_changed' } & ManagedKeyDeadlineSnapshot;
 }
 export interface ManagedKeyTargetBindRequest {
   agentId: string; targetConfigVersion: number; keyId: string; minimumRotationCount?: number;

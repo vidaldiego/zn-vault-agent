@@ -19,3 +19,14 @@ describe('public applied revision storage', () => {
     expect(loadManagedKeyTargetState('host')).toBeUndefined();
   });
 });
+
+it('persists exact server snapshots separately from enforced minima without excess material', () => {
+  const snapshot = { rotationCount: 3, expiresAt: '2027-01-01T00:00:00Z', authorizedUntil: '2026-12-01T00:00:00Z', graceExpiresAt: '2026-11-20T00:00:00Z', key: 'synthetic-never-persist-snapshot' };
+  const minimum = '2026-11-15T00:00:00Z';
+  saveManagedKeyTargetState('host', { own: { keyId:'key-agent',rotationCount:3,expiresAt:minimum }, ownSnapshot:snapshot, applied:[{ targetId:'reader',keyId:'key-reader',rotationCount:3,expiresAt:minimum,serverSnapshot:snapshot }] });
+  const serialized = fs.readFileSync(path.join(directory,'managed-key-targets-host.json'),'utf8');
+  expect(serialized).not.toContain('synthetic-never-persist-snapshot');
+  const restored = loadManagedKeyTargetState('host'); const { key: _key, ...publicSnapshot } = snapshot;
+  expect(restored?.ownSnapshot).toEqual(publicSnapshot); expect(restored?.applied[0].serverSnapshot).toEqual(publicSnapshot);
+  expect(restored?.applied[0].expiresAt).toBe(minimum); expect(restored?.own?.expiresAt).toBe(minimum);
+});
