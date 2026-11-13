@@ -14,6 +14,7 @@ function setup(initial?: ManagedKeyTargetState) {
   const acks: ManagedKeyTargetAck[] = []; let reads = 0;
   const ownKeys: string[] = [];
   const ownMaterial: ManagedKeyMaterial = { tenantId: 'tenant', keyId: 'key-agent', name: 'agent', key: 'synthetic-own-new', rotationCount: 2, expiresAt: expiry() };
+  let ownBind = async (): Promise<ManagedKeyMaterial> => ownMaterial;
   let bind = async () => ({ hostConfigId: 'host', targetId: 'reader', targetConfigVersion: 14, material });
   let reconcile = async (request: ManagedKeyTargetsReconcileRequest): Promise<ManagedKeyTargetsReconcileResponse> => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, removed: [], changed: request.applied.length ? [] : [{ targetId: 'reader', keyId: 'key-reader', rotationCount: 1, reason: 'initial' }] });
   const saved: ManagedKeyTargetState[] = [];
@@ -24,11 +25,11 @@ function setup(initial?: ManagedKeyTargetState) {
     reconcile: async request => { reads++; return await reconcile(request); },
     persist: state => { saved.push(structuredClone(state)); },
     configChanged: async () => {},
-    ownBind: async () => ownMaterial, ownMaterial: async material => { ownKeys.push(material.key); },
+    ownBind: async () => await ownBind(), ownMaterial: async material => { ownKeys.push(material.key); },
     bind: async () => { reads++; return await bind(); }, acknowledge: ack => { acks.push(ack); return true; },
   });
   const event = (rotationCount = 2): ManagedKeyTargetEvent => ({ event: 'managed-key-target.changed', deliveryId: `delivery-${rotationCount}`, tenantId: 'tenant', hostConfigId: 'host', targetId: 'reader', targetConfigVersion: 14, keyId: 'key-reader', rotationCount });
-  return { target, service, acks, event, ownKeys, saved, setReconcile: (value: typeof reconcile) => { reconcile = value; }, reads: () => reads, setMaterial: (value: ManagedKeyMaterial) => { material = value; }, setBind: (value: typeof bind) => { bind = value; } };
+  return { target, service, acks, event, ownKeys, saved, setOwnBind: (value: typeof ownBind) => { ownBind = value; }, setReconcile: (value: typeof reconcile) => { reconcile = value; }, reads: () => reads, setMaterial: (value: ManagedKeyMaterial) => { material = value; }, setBind: (value: typeof bind) => { bind = value; } };
 }
 
 describe('event-driven target delivery', () => {
@@ -208,6 +209,26 @@ describe('event-driven target delivery', () => {
     f.setReconcile(async () => ({ tenantId: 'tenant', hostConfigId: 'host', targetConfigVersion: 14, configChanged: false, changed: [], removed: [], ownChanged: { keyId: 'key-agent', rotationCount: 2, reason: 'rotated' } }));
     await f.service.connected(['managed-key-targets-v1']);
     expect(f.ownKeys).toEqual([]); expect(fs.existsSync(f.target.output)).toBe(false); f.service.stop();
+  });
+
+  it('review own pending: expires authority before a queued same-revision deadline and fences the late own callback', async () => {
+    const f = setup(); await f.service.connected(['managed-key-targets-v1']);
+    f.service.ownApplied({ keyId: 'key-agent', rotationCount: 1, expiresAt: expiry() });
+    let finish!: (material: ManagedKeyMaterial) => void;
+    f.setOwnBind(() => new Promise(resolve => { finish = resolve; }));
+    const first = f.service.handleEvent({ ...f.event(2), targetId: '$self', keyId: 'key-agent' });
+    await Promise.resolve();
+    const deadline = new Date(Date.now() + 1000).toISOString();
+    const second = f.service.handleEvent({ ...f.event(2), deliveryId: 'own-deadline', targetId: '$self', keyId: 'key-agent', expiresAt: deadline, authorizedUntil: deadline });
+    await vi.advanceTimersByTimeAsync(1001);
+    const remainedAfterDeadline = fs.existsSync(f.target.output);
+    finish({ tenantId: 'tenant', keyId: 'key-agent', name: 'agent', key: 'synthetic-stale-own', rotationCount: 2, expiresAt: new Date(Date.now() + 100000).toISOString() });
+    await Promise.all([first, second]);
+    expect.soft(remainedAfterDeadline).toBe(false);
+    expect.soft(f.saved.at(-1)?.ownLimit).toEqual({ keyId: 'key-agent', expiresAt: deadline });
+    expect.soft(f.ownKeys).toEqual([]);
+    expect.soft(f.acks.filter(ack => ack.targetId === '$self' && ack.outcome === 'applied')).toEqual([]);
+    f.service.stop();
   });
 
 });
