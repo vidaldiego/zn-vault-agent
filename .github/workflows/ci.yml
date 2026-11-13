@@ -4,7 +4,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, fix/archon-managed-key-targets-20261113]
   pull_request:
     branches: [main, master]
 
